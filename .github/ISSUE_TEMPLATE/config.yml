@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: "Something broke: troubleshooting"
+    url: https://github.com/noon-at-cgn/geforce-sriov/blob/main/docs/troubleshooting.md
+    about: Symptoms and fixes, messages that look like errors but are expected, and where the logs are.

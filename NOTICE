@@ -1,0 +1,147 @@
+geforce-sriov
+Copyright (c) 2026 noon-at-cgn
+
+Licensing of this repository
+----------------------------
+
+- Everything except kernel/ and include/gs_devices.h is licensed under the MIT
+  License (LICENSE, SPDX-License-Identifier: MIT).
+- The kernel module under kernel/ and the device table include/gs_devices.h it
+  shares with the user-space tools are offered under the choice of the GNU
+  General Public License version 2 only or the MIT License
+  (SPDX-License-Identifier: GPL-2.0-only OR MIT; MODULE_LICENSE("Dual MIT/GPL")).
+  Full texts: LICENSES/GPL-2.0 and LICENSES/MIT, copied unmodified from the
+  Linux kernel's LICENSES/preferred/ directory.
+- Each source file carries its own SPDX-License-Identifier line, which is
+  authoritative for that file.
+
+The kernel module and its MSI-X unhide step are adapted from earlier,
+unpublished GPL-2.0-only code (a livepatch and an MSI-X helper module) written
+for the same copyright holder, who offers the adapted code here under
+GPL-2.0-only OR MIT.
+No Linux kernel source files are vendored. The module's replacement functions
+are written for this project on top of exported Linux kernel interfaces. Its
+replacements for pci_read_config_word() and pci_write_config_word() repeat the
+few lines of the kernel functions they replace (a disconnect check and the
+bus-level config access), as the livepatch mechanism requires. Its structure
+follows the kernel's samples/livepatch/livepatch-sample.c. This notice states
+the authors' licensing intent; it is not legal advice.
+
+No NVIDIA software is included
+------------------------------
+
+This repository contains no NVIDIA binaries, driver objects, firmware,
+vgpuConfig.xml files, or decompiled NVIDIA code. The user supplies the NVIDIA
+vGPU-KVM host driver package, guest drivers and any NVIDIA license under
+NVIDIA's own terms. NVIDIA, GeForce, RTX and related marks are trademarks of
+NVIDIA Corporation. This project is not affiliated with or endorsed by NVIDIA.
+
+The driver patcher (driver/) modifies a copy of the user's own
+nv-kernel.o_binary on the user's machine; the patched file is never part of this
+repository.
+
+Third-party notices
+-------------------
+
+1. NVIDIA open-gpu-kernel-modules
+   https://github.com/NVIDIA/open-gpu-kernel-modules
+
+   include/gs_hook.h transcribes ioctl numbers, control command values and
+   structure layouts from these MIT-licensed headers (tags 580.159.03,
+   580.178.04, 595.91.07):
+
+     src/common/sdk/nvidia/inc/nvos.h
+       Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bus.h
+       Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h
+       Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     src/common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gpu.h
+       Copyright (c) 2004-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h
+       Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     src/nvidia/arch/nvalloc/unix/include/nv_escape.h
+       Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+     kernel-open/common/inc/nv-ioctl-numbers.h
+       Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+   Permission is hereby granted, free of charge, to any person obtaining a
+   copy of this software and associated documentation files (the "Software"),
+   to deal in the Software without restriction, including without limitation
+   the rights to use, copy, modify, merge, publish, distribute, sublicense,
+   and/or sell copies of the Software, and to permit persons to whom the
+   Software is furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+   THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+2. vgpu_unlock-rs
+   https://github.com/mbilker/vgpu_unlock-rs
+
+   The identity hook (hook/gs_hook.c) is a C adaptation of the vgpu-toolkit
+   hook (Rust, MIT, Copyright (c) 2026 vgpu-toolkit contributors), which was trimmed from a fork of
+   vgpu_unlock-rs 2.5.0: an LD_PRELOAD ioctl wrapper that rewrites the PCI
+   device identity the NVIDIA vGPU daemon reads. hook/LICENSE carries the same
+   notices for the hook on its own.
+
+   MIT License
+
+   Copyright (c) 2021 Jonathan Johansson
+   Copyright (c) 2021 Matt Bilker
+   Copyright (c) 2026 vgpu-toolkit contributors
+   Copyright (c) 2026 geforce-sriov contributors
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+3. vgpu_unlock
+   https://github.com/DualCoder/vgpu_unlock
+
+   The original vgpu_unlock project established presenting a consumer GPU to
+   the vGPU software under a datacenter device ID. vgpu_unlock-rs is its Rust
+   rewrite.
+
+   MIT License
+
+   Copyright (c) 2021 Jonathan Johansson
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.

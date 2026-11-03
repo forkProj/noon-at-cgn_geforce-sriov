@@ -1,0 +1,28 @@
+# Build outputs
+/geforce-sriov
+/driver/geforce-sriov-patch
+/hook/libgeforce_sriov.so
+/hook/build/
+/tests/test_*
+!/tests/test_*.c
+!/tests/test_*.h
+*.o
+*.so
+*.a
+
+# Kernel module build products (kernel/)
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+.cache.mk
+
+# Staging and NVIDIA artifacts that must never be committed
+/stage/
+*.run
+nv-kernel.o_binary
+vgpuConfig.xml

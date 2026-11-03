@@ -1,0 +1,64 @@
+# geforce-sriov configuration: /etc/geforce-sriov/config ($GEFORCE_SRIOV_CONFIG overrides the path).
+#
+# Format (shared by the CLI and the identity hook): at most 65536 bytes; one
+# key=value per line; a line whose first byte is '#' is a comment; empty lines
+# are ignored; no spaces, tabs or '\r' anywhere in a line; values are never
+# empty; a duplicate or unknown key makes the whole file invalid.
+#
+# `geforce-sriov install --device BDF` writes this file with bdfs= set,
+# identity=on and identity_force_host=on (the measured configuration). This
+# example lists every key with its default; it selects no GPU, so
+# nothing would be prepared with it as is.
+#
+# bdfs: the GPUs (physical function, canonical lowercase dddd:bb:ss.0, comma
+# separated, at most 8) that prepare/enable act on and the hook may rewrite.
+# Absent: no GPU is selected and the boot unit does nothing.
+#bdfs=0000:03:00.0
+#
+# boot_display_release: boot display GPUs (boot_vga 1), each also in bdfs,
+# whose Linux console `geforce-sriov prepare --release-console=BDF` may release
+# for the rest of a boot. Absent: the boot display GPU is refused. With it the
+# boot unit prepares none of the selected GPUs and holds nvidia-vgpud back;
+# prepare them by hand after each boot (docs/boot-display.md).
+# install --device ... --boot-display-release BDF writes it.
+#boot_display_release=0000:04:00.0
+#
+# ari: enable ARI in software: present the hidden ARI capability and turn on ARI
+# forwarding in the bridge above (on|off). ARI decoding in the GPU hardware does
+# not work for now, which is why vfs defaults to 4 either way. Set off
+# if VF enable or VM start does not complete; pci=noari on the kernel command
+# line also forces it off.
+ari=on
+#
+# msix: unhide MSI-X where the die's mechanism is known (Ampere) (on|off).
+msix=on
+#
+# experimental_vfs: on Ada/Blackwell, where the card reports 1 VF, present up
+# to 4 (vfs) (not verified end to end); off keeps 1 (on|off).
+experimental_vfs=on
+#
+# vfs: VFs presented per selected GPU, 1 up to the card's hardware default
+# (`geforce-sriov devices` lists it). Default 4: ARI decoding in the GPU does
+# not work for now, so more than 4 VFs are expected not to work.
+# `install --vfs N` writes it. Takes effect at the next boot.
+#vfs=4
+#
+# identity: let the hook in nvidia-vgpud present each selected GPU as its vGPU
+# target (on|off). Off here; install --device turns it on. Each reply is tied to
+# one GPU by its PCI address through read-only driver queries (measured on
+# 580.159.01 only). If they fail, the PCI-info reply falls back to
+# the device ID only when a fresh scan finds every NVIDIA GPU with that ID
+# selected; otherwise it stays unchanged. `geforce-sriov doctor` reports such a
+# shared ID.
+identity=off
+#
+# identity_force_host: the hook also answers the virtualization-mode query with
+# HOST (on|off), only for a reply the driver queries tie to a selected GPU; a
+# reply it cannot tie to one is left unchanged (HOST never uses the device-ID
+# fallback). Off unless set; install --device turns it on because the
+# measured configuration forces HOST. Whether the driver already answers
+# HOST on its own (making this a no-op) has not been determined.
+identity_force_host=off
+#
+# sriov_manage: NVIDIA's tool used by `geforce-sriov enable`.
+#sriov_manage=/usr/lib/nvidia/sriov-manage

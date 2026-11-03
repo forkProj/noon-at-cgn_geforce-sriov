@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# geforce-sriov @VERSION@: load the identity hook into nvidia-vgpud only.
+# The hook acts only when /etc/geforce-sriov/config says identity=on, only in a
+# process named nvidia-vgpud, and only for the GPUs listed in bdfs=. It is never
+# loaded into nvidia-vgpu-mgr.
+#
+# While the boot unit has deferred preparation (boot_display_release=), the
+# start of nvidia-vgpud fails, and so does that of every unit that requires it
+# (nvidia-vgpu-mgr): no vGPU type is registered before the selected GPUs are
+# prepared by hand. `geforce-sriov prepare` removes the record once every
+# selected GPU is prepared; then load NVIDIA's driver, run `geforce-sriov
+# enable`, and start nvidia-vgpud.
+[Unit]
+After=geforce-sriov-prepare.service
+AssertPathExists=!/run/geforce-sriov/deferred
+
+[Service]
+Environment=LD_PRELOAD=@HOOK@

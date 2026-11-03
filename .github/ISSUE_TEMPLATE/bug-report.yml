@@ -1,0 +1,47 @@
+name: Bug report
+description: A bug in geforce-sriov's own tools or documentation that does not depend on your hardware. Whether your hardware works or not goes in a compatibility report.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for software bugs only, for example a wrong message, a wrong exit status or a
+        documentation error. If your setup does not work on your hardware, please submit a
+        [compatibility report](https://github.com/noon-at-cgn/geforce-sriov/issues/new?template=compatibility-report.yml)
+        instead.
+
+        **This issue is public.** Remove IP and MAC addresses, serial numbers, GPU UUIDs, host and
+        user names and licence details before you paste anything.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran and what it did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: textarea
+    id: output
+    attributes:
+      label: Output of geforce-sriov doctor and status
+      description: "`sudo geforce-sriov doctor` and `sudo geforce-sriov status`, if they relate to the bug."
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "`geforce-sriov --version`, `uname -r`, `modinfo -F version nvidia`"
+      placeholder: "geforce-sriov 0.1.0, kernel 7.0.14-16-pve, NVIDIA 580.159.01"
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Private details
+      options:
+        - label: I removed IP and MAC addresses, serial numbers, GPU UUIDs, host and user names and licence details from this report.
+          required: true

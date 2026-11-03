@@ -1,0 +1,210 @@
+name: Compatibility report
+description: Tell us whether geforce-sriov works on your hardware, whether it worked or not.
+title: "[Compatibility] "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing geforce-sriov. Reports are voluntary. **A setup that does not work is as
+        useful as one that works**: choose *Does not work* or *Partially* under Result and tell us
+        where it stopped. Software bugs that do not depend on your hardware go in a bug report.
+
+        The commands for each field are in
+        [docs/compatibility.md](https://github.com/noon-at-cgn/geforce-sriov/blob/main/docs/compatibility.md).
+        Only the fields marked as required must be filled in.
+
+        **This issue is public.** Before you paste anything, remove IP and MAC addresses, serial
+        numbers, GPU UUIDs, host and user names, and everything about your NVIDIA licence (licence
+        server, client configuration token). Never paste secrets.
+  - type: markdown
+    attributes:
+      value: "### GPU"
+  - type: input
+    id: gpu-model
+    attributes:
+      label: GPU model and memory
+      description: Product name, board maker and VRAM size.
+      placeholder: "RTX 3080 20GB, memory-modded"
+    validations:
+      required: true
+  - type: input
+    id: pci-ids
+    attributes:
+      label: PCI ID and subsystem ID
+      description: "From `lspci -nnv -s <address>`: the `[10de:....]` at the end of the first line and the ID on the `Subsystem:` line."
+      placeholder: "10de:2206, subsystem 10de:146d"
+    validations:
+      required: true
+  - type: dropdown
+    id: board
+    attributes:
+      label: Board
+      options:
+        - Stock board and memory
+        - Memory-modded (more VRAM than stock)
+        - Otherwise modified (describe under notes)
+    validations:
+      required: true
+  - type: dropdown
+    id: generation
+    attributes:
+      label: Generation
+      options:
+        - Ampere (RTX 30)
+        - Ada (RTX 40)
+        - Blackwell (RTX 50)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: gpu-count
+    attributes:
+      label: GPUs in the host
+      description: The boot display is the GPU that shows the firmware screen and the text console (`boot_vga` is `1`).
+      options:
+        - One NVIDIA GPU, not the boot display
+        - One NVIDIA GPU, which is the boot display
+        - Two or more NVIDIA GPUs, none is the boot display
+        - Two or more NVIDIA GPUs, one is the boot display
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: "### Host"
+  - type: input
+    id: host-os
+    attributes:
+      label: Host OS or hypervisor and version
+      placeholder: "Proxmox VE 9.0, Debian 13, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Host kernel
+      description: "`uname -r`"
+      placeholder: "7.0.14-16-pve"
+    validations:
+      required: true
+  - type: dropdown
+    id: topology
+    attributes:
+      label: PCIe path to the GPU
+      description: "`lspci -tv` shows it."
+      options:
+        - Directly on a CPU root port
+        - Through the chipset
+        - Behind a PCIe switch
+        - Not sure
+  - type: textarea
+    id: firmware
+    attributes:
+      label: IOMMU, ARI and Above 4G settings
+      description: Firmware (BIOS/UEFI) settings and kernel command line options that matter here.
+      placeholder: "IOMMU on (intel_iommu=on), Above 4G decoding on, no pci=realloc"
+  - type: markdown
+    attributes:
+      value: "### Software"
+  - type: input
+    id: host-driver
+    attributes:
+      label: NVIDIA vGPU host driver version
+      description: "`modinfo -F version nvidia`"
+      placeholder: "580.159.01"
+    validations:
+      required: true
+  - type: dropdown
+    id: driver-patch
+    attributes:
+      label: Driver patch
+      options:
+        - Patched nvidia.ko (rebuilt from geforce-sriov-patch output)
+        - Stock nvidia.ko
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: gs-version
+    attributes:
+      label: geforce-sriov version or commit
+      description: "`geforce-sriov --version`, and `git rev-parse --short HEAD` if you built from a checkout."
+      placeholder: "0.1.0, commit 723f471"
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Changed settings
+      description: "Only settings you changed from the defaults: `vfs`, `ari`, `msix`, `experimental_vfs`, a boot-display grant."
+      placeholder: "vfs=2, ari=off"
+  - type: textarea
+    id: guests
+    attributes:
+      label: Guests
+      description: One line per guest OS you tried, with its vGPU type and NVIDIA guest driver version.
+      placeholder: |
+        Windows 11, RTXA6000-4Q, guest driver <version>
+        Debian 12, RTXA6000-4Q, guest driver <version>
+  - type: markdown
+    attributes:
+      value: "### Result"
+  - type: checkboxes
+    id: steps
+    attributes:
+      label: What worked
+      description: Tick each step that worked and leave the others empty.
+      options:
+        - label: "geforce-sriov doctor: no FAIL"
+        - label: prepare succeeded
+        - label: enable created VFs
+        - label: VMs started with a vGPU
+        - label: A CUDA or graphics program ran in a guest
+        - label: A VM was restarted while other VMs kept running
+  - type: input
+    id: vf-count
+    attributes:
+      label: VFs per card after enable
+      placeholder: "4"
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      description: A setup that does not work is as useful a report as one that works.
+      options:
+        - Works
+        - Works with caveats
+        - Does not work
+        - "Partially: only some steps worked"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of geforce-sriov doctor
+      description: "`sudo geforce-sriov doctor`"
+      render: text
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of geforce-sriov status
+      description: "`sudo geforce-sriov status`"
+      render: text
+  - type: textarea
+    id: kernel-log
+    attributes:
+      label: Kernel log lines
+      description: "Only the relevant lines, not the whole log: `journalctl -k -b --no-hostname | grep -E 'geforce_sriov|NVRM|AER'`"
+      render: text
+  - type: textarea
+    id: notes
+    attributes:
+      label: What failed, what you tried, other notes
+      description: If something did not work, name the step, the message you got and what you tried.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Private details
+      options:
+        - label: I removed IP and MAC addresses, serial numbers, GPU UUIDs, host and user names and licence details from this report.
+          required: true

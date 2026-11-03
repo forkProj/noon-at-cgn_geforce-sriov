@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+obj-m := geforce_sriov.o
+
+# gs_devices.h is in include/ of the DKMS tree, or in ../include of the repository.
+ccflags-y += -I$(if $(wildcard $(src)/include/gs_devices.h),$(src)/include,$(src)/../include)
+
+# pci_dev_is_disconnected() is public in <linux/pci.h> from 6.9 and in stable
+# backports below it that LINUX_VERSION_CODE cannot see: probe the target
+# kernel's header. The parenthesis goes through a variable so make does not
+# count it.
+gs_lparen := (
+gs_public_disconnected := $(shell grep -qs 'bool pci_dev_is_disconnected$(gs_lparen)' \
+	$(srctree)/include/linux/pci.h && echo y)
+ccflags-$(gs_public_disconnected) += -DGS_HAVE_PUBLIC_DISCONNECTED
