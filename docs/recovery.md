@@ -67,7 +67,8 @@ Each switch lives in `/etc/geforce-sriov/config` and is read by the next `prepar
 | `pci=noari` is on the kernel command line | nothing: `prepare` notices it and loads the module with `ari=0` |
 | The kernel scans every slot below the port (`pci=pcie_scan_all`, or an x86 platform quirk) | nothing: ARI stays off automatically; SR-IOV and the VF count are unaffected |
 | PF interrupts misbehave, or after any PF reset / AER recovery | `msix=off`; a PF reset re-hides MSI-X and silently stops its interrupts until the next cold boot |
-| Ada or Blackwell card misbehaves with more than 1 VF | `experimental_vfs=off` keeps the hardware's own count (1) |
+| Ada or Blackwell card misbehaves with more than 1 VF | `experimental_vfs=off` (the default) presents the hardware's own count (1) |
+| RTX 5090 with `twin_id=on`: NVIDIA's driver cannot start the GPU firmware, or the module does not load (`twin_id refused: the GPU is behind a hotplug-capable port`, or `twin_id refused: nvidia (or another driver) is bound to the GPU`) | `twin_id=off` (the default), then a cold boot |
 | Stop the identity rewrite | `identity=off`; every ioctl then passes through unchanged |
 | A selected card already shows `sriov_totalvfs` (patched kernel, or another livepatch) | nothing to do: `prepare` refuses and does not stack on it. If that other change already gives the VFs you need, skip preparation for that boot |
 | VF enable fails after a vendor livepatch service (for example Ubuntu Livepatch) applied a cumulative "replace" livepatch | Such a patch silently disables `geforce_sriov`; VF enable then fails without harming the card. Disable the vendor livepatch service and reboot |
@@ -79,10 +80,10 @@ Each switch lives in `/etc/geforce-sriov/config` and is read by the next `prepar
 | One of several selected cards is refused, so nothing is prepared | `prepare` checks every selected card first and changes nothing when one fails. Fix that card, or remove it from `bdfs` to prepare the others |
 | `status` exits 1 and shows `SR-IOV: not presented` after install | Nothing is wrong: this is expected until the first boot that prepares the card. Follow the next step `status` prints (usually `doctor`, then reboot) |
 
-The same three kernel switches can be given once on the command line as
-`geforce-sriov prepare --ari=off --msix=off --experimental-vfs=off`, or recorded at install time
-with the same options on `geforce-sriov install` (which also takes `--vfs N`). The module's
-parameters are fixed at load time; to change them, reboot.
+The same four kernel switches can be given once on the command line as
+`geforce-sriov prepare --ari=off --msix=off --experimental-vfs=off --twin-id=off`, or recorded at
+install time with the same options on `geforce-sriov install` (which also takes `--vfs N`). The
+module's parameters are fixed at load time; to change them, reboot.
 
 ## Remove the package
 
@@ -108,6 +109,8 @@ Steps, in this order:
 ## What not to do
 
 - Do not unload `nvidia`, `nvidia_vgpu_vfio` or `geforce_sriov` while VFs exist.
+- With `twin_id=on`, do not unload `geforce_sriov` while `nvidia` is bound to the card: after a
+  reset the driver compares the card's ID with the one it read when it started the GPU.
 - Do not write `sriov_numvfs` by hand: NVIDIA requires its `sriov-manage` script, and the VF count
   must stay within the presented count.
 - Do not reset the PF (`/sys/bus/pci/devices/<PF>/reset`) with MSI-X in use.

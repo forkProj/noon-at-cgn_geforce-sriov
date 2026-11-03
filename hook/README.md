@@ -36,6 +36,12 @@ The hook does **not** touch `SET_TYPES_INFO`, SR-IOV caps, type info, licensing,
 are the target's own entries from the stock file. The hook neither changes nor filters them, so
 a profile can be larger than the card's memory.
 
+**With `twin_id=on` (RTX 5090 only).** The kernel module then makes NVIDIA's driver itself report
+`10de:2bb5` with subsystem `10de:204e` for the card ([twin_id](../docs/devices.md#twin_id-rtx-5090-only)).
+No selected card has that device word, so the hook sends no query, leaves the reply unchanged and
+logs `GET_PCI_INFO: device word 2bb510de is not a selected card; unchanged` once; `nvidia-vgpud`
+sees the same IDs either way. This follows from the code and is not tested.
+
 ## Gates
 
 The library makes its decision once per process, on its first call or at load. Any failure

@@ -26,13 +26,14 @@ static void usage(FILE *f)
 		"Changing the system (root; the live /sys only):\n"
 		"  install [--prefix PATH] [--device BDF]... [--boot-display-release BDF]... [--vfs N]\n"
 		"          [--destdir PATH] [--source DIR] [--ari=on|off] [--msix=on|off] [--experimental-vfs=on|off]\n"
+		"          [--twin-id=on|off]\n"
 		"                             install the built tree; with DESTDIR (env or --destdir)\n"
 		"                             only stage files below it. --device selects the GPUs\n"
 		"                             (physical function dddd:bb:ss.0) and turns identity on;\n"
 		"                             --boot-display-release grants a console release for the\n"
 		"                             boot display GPU among them (the boot unit then defers);\n"
 		"                             --vfs records the VF count per GPU (vfs=N in the config)\n"
-		"  prepare [--ari=on|off] [--msix=on|off] [--experimental-vfs=on|off]\n"
+		"  prepare [--ari=on|off] [--msix=on|off] [--experimental-vfs=on|off] [--twin-id=on|off]\n"
 		"          [--release-console=BDF]... [--boot]\n"
 		"                             load the geforce_sriov livepatch and remove+rescan the\n"
 		"                             selected GPUs before NVIDIA binds them. --release-console\n"
@@ -49,8 +50,8 @@ static void usage(FILE *f)
 		"                             (the module refuses to load if the card's VF layout check\n"
 		"                             fails). Takes effect at the next boot; `enable` enables the\n"
 		"                             count the card presents\n"
-		"  --experimental-vfs=on|off  on (default): on Ada/Blackwell, where the card reports 1 VF,\n"
-		"                             present up to %u (not verified end to end); off keeps 1\n"
+		"  --experimental-vfs=on|off  " GS_EXPVFS_OPT_MSG "\n"
+		"  --twin-id=on|off           " GS_TWIN_ID_OPT_MSG "\n"
 		"\n"
 		"  --version, --help\n"
 		"\n"
@@ -58,7 +59,7 @@ static void usage(FILE *f)
 		"prepared boot), 2 usage, 3 refused (nothing changed; doctor: prepare would refuse), 4 locked,\n"
 		"5 guard set: a cold power cycle is needed.\n"
 		"Config: %s (override with $%s).\n",
-		GS_DEFAULT_VFS, GS_DEFAULT_VFS, GS_DEFAULT_VFS, GS_CONFIG_PATH, GS_CONFIG_ENV);
+		GS_DEFAULT_VFS, GS_DEFAULT_VFS, GS_CONFIG_PATH, GS_CONFIG_ENV);
 }
 
 static int bad(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -93,6 +94,8 @@ static int unknown_opt(const char *a, int install)
 {
 	if (strncmp(a, "--experimental_vfs", 18) == 0 && (a[18] == '\0' || a[18] == '='))
 		return bad("unknown option '%s'; use --experimental-vfs=on|off", a);
+	if (strncmp(a, "--twin_id", 9) == 0 && (a[9] == '\0' || a[9] == '='))
+		return bad("unknown option '%s'; use --twin-id=on|off", a);
 	if (!is_vf_count_opt(a))
 		return bad("unknown option '%s'", a);
 	if (install)
@@ -150,11 +153,11 @@ static int parse_release(const char *opt, const char *v, struct gs_addr *list, u
 
 static int parse_switch_opt(int argc, char **argv, int *i, struct gs_overrides *ov, int *matched)
 {
-	static const char *const names[] = { "--ari", "--msix", "--experimental-vfs" };
-	int *dst[] = { &ov->ari, &ov->msix, &ov->experimental_vfs };
+	static const char *const names[] = { "--ari", "--msix", "--experimental-vfs", "--twin-id" };
+	int *dst[] = { &ov->ari, &ov->msix, &ov->experimental_vfs, &ov->twin_id };
 
 	*matched = 0;
-	for (size_t k = 0; k < 3; k++) {
+	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
 		const char *v = opt_value(argc, argv, i, names[k]);
 
 		if (!v)
@@ -260,7 +263,7 @@ int main(int argc, char **argv)
 		const char *env = getenv("DESTDIR");
 
 		memset(&o, 0, sizeof(o));
-		o.ov.ari = o.ov.msix = o.ov.experimental_vfs = GS_SW_UNSET;
+		o.ov.ari = o.ov.msix = o.ov.experimental_vfs = o.ov.twin_id = GS_SW_UNSET;
 		o.destdir = env && env[0] ? env : NULL;
 		for (i = 2; i < argc; i++) {
 			const char *v;
@@ -309,7 +312,7 @@ int main(int argc, char **argv)
 		return gs_cmd_install(&o);
 	}
 	if (strcmp(cmd, "prepare") == 0) {
-		struct gs_overrides ov = { GS_SW_UNSET, GS_SW_UNSET, GS_SW_UNSET };
+		struct gs_overrides ov = { GS_SW_UNSET, GS_SW_UNSET, GS_SW_UNSET, GS_SW_UNSET };
 		struct gs_prepare_opts po;
 		int clear = 0;
 
@@ -333,7 +336,7 @@ int main(int argc, char **argv)
 			}
 		}
 		if (clear && (ov.ari != GS_SW_UNSET || ov.msix != GS_SW_UNSET || ov.experimental_vfs != GS_SW_UNSET ||
-			      po.boot || po.nrelease))
+			      ov.twin_id != GS_SW_UNSET || po.boot || po.nrelease))
 			return bad("%s takes no other option", "--clear-guard");
 		if (po.boot && po.nrelease)
 			return bad("--boot is the boot unit's mode and does not release a console; run --release-console by hand, without --boot");

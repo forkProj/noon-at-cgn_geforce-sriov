@@ -136,7 +136,7 @@ body:
     id: settings
     attributes:
       label: Changed settings
-      description: "Only settings you changed from the defaults: `vfs`, `ari`, `msix`, `experimental_vfs`, a boot-display grant."
+      description: "Only settings you changed from the defaults: `vfs`, `ari`, `msix`, `experimental_vfs`, `twin_id`, a boot-display grant."
       placeholder: "vfs=2, ari=off"
   - type: textarea
     id: guests

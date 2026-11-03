@@ -93,16 +93,17 @@ This is the command `prepare` runs, with the config's switches as `0`/`1` (and `
 config sets a VF count):
 
 ```sh
-modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 bdfs=0000:03:00.0
+modprobe geforce_sriov ari=1 msix=1 experimental_vfs=0 twin_id=0 bdfs=0000:03:00.0
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `bdfs` | none (required) | Comma-separated card addresses, at most 8. Only these are changed; empty refuses to load |
-| `vfs` | `4` | VFs presented per listed card, 1–16, never more than the card's hardware TotalVFs. Every VF must land on a free function 1–7 of the card's slot or the module refuses to load. The default is 4 because ARI decoding in the GPU hardware does not work for now |
+| `vfs` | `4` | VFs presented per listed card, 1–16, never more than the card's hardware TotalVFs (on Ada and Blackwell 1, unless `experimental_vfs=1`). Every VF must land on a free function 1–7 of the card's slot or the module refuses to load. The default is 4 because ARI decoding in the GPU hardware does not work for now |
 | `ari` | `1` | Enable ARI in software: present the hidden ARI capability and turn on ARI Forwarding in the bridge above. ARI decoding in the GPU hardware does not work for now, which is why `vfs` defaults to 4 either way. The module cannot see `pci=noari`: if your kernel command line has it, pass `ari=0` (`prepare` does this for you) |
 | `msix` | `1` | On Ampere, reveal the card's hidden MSI-X at load |
-| `experimental_vfs` | `1` | Ada/Blackwell only: where the card reports 1 VF, present up to 4 (`vfs`) (not verified end to end); `0` keeps 1 |
+| `experimental_vfs` | `0` | Ada/Blackwell only, untested: where the card reports 1 VF, present up to 4 (`vfs`) instead of 1. On Blackwell NVIDIA's driver also sees the raised count, and the GPU firmware may still refuse more than 1 VF; on Ada only Linux sees it ([Ada and Blackwell](devices.md#ada-and-blackwell)) |
+| `twin_id` | `0` | RTX 5090 only, experimental and untested: show NVIDIA's driver the vGPU target's ID when it starts the GPU. It may make the GPU firmware fail to start. Refused when none of the listed cards is an RTX 5090, or when a listed RTX 5090 is behind a hotplug-capable port or has a driver bound; on other listed cards it has no effect ([twin_id](devices.md#twin_id-rtx-5090-only)) |
 
 The parameters cannot be changed while the module is loaded; to change them, reboot. Then wait
 until the livepatch is active (the CLI waits up to 15 seconds):

@@ -23,9 +23,14 @@
  *   not the device ID: any other 10de:2206 board has never been run, and no
  *   entry, 2206 included, certifies a user's card. Every other entry has
  *   never run. This package was hardware-tested on those two cards only.
- * - Ada and Blackwell GeForce report TotalVFs = 1. Advertising more VFs there
- *   (gs_vf_limit with experimental_vfs) is untested; the GSP firmware and
- *   driver gates for VFs on those generations are unknown.
+ * - Ada and Blackwell GeForce report TotalVFs = 1, and NVIDIA's driver reads
+ *   that count from the hardware itself (its maxGfid). geforce-sriov
+ *   therefore presents 1 VF there by default. experimental_vfs (default off)
+ *   raises it to at most GS_DEFAULT_VFS: on Blackwell the module also raises
+ *   the driver's own 32-bit read of TotalVFs; on Ada the driver reads it
+ *   through a BAR0 mirror that no config accessor sees, so only Linux sees
+ *   more. Untested either way; the GPU firmware may still refuse more than
+ *   1 VF (gs_expvfs_msg()).
  * - target is the vGPU device ID presented to nvidia-vgpud. same_die = 1 means
  *   a professional SKU of the same die has a <pgpu> entry in the stock
  *   vgpuConfig.xml (checked in the 595.91.04 file; 580.159.01 has the same IDs
@@ -56,6 +61,16 @@
  *                   Tools describe 0 as "supported" (device path implemented,
  *                   method demonstrated on those cards only) and 1 as
  *                   "experimental".
+ * twin_device       \ with twin_id, every in-kernel 32-bit read of config
+ * twin_subdevice    / dwords 0x00 and 0x2C returns this device ID and subsystem
+ *                   device ID (vendor 10de) (gs_twin_id_dword()): NVIDIA's
+ *                   driver, the PCI core and the hotplug driver all see them.
+ *                   0 = none. Only GB202: NVIDIA's driver sizes the GSP heap
+ *                   and partitions from those dwords.
+ * vf_dword          1 = NVIDIA's driver reads TotalVFs with a 32-bit config
+ *                   read (GB20x), so experimental_vfs also raises what the
+ *                   driver sees (gs_vf_dword()). 0 = it reads a BAR0 mirror
+ *                   (Ada) or the count is not raised (Ampere).
  * die, name, target_name   display strings
  */
 #ifndef GS_DEVICES_H
@@ -112,6 +127,45 @@
 #define GS_NO_SAME_DIE_MSG \
 	"No vGPU target on the same die; support is experimental."
 
+/*
+ * Exact caveat text every tool shows for experimental_vfs on Ada and
+ * Blackwell (gs_expvfs_msg()) and for twin_id.
+ */
+#define GS_EXPVFS_DRIVER_MSG \
+	"Untested: raises the VF count NVIDIA's driver sees; the GPU firmware may still refuse more than 1 VF."
+#define GS_EXPVFS_LINUX_MSG \
+	"Untested: raises only the VF count Linux shows; NVIDIA's driver still reads 1 VF from the GPU."
+#define GS_TWIN_ID_MSG \
+	"Experimental and untested: NVIDIA's driver sees the vGPU target ID when it starts the GPU; this may make the GPU firmware fail to start."
+#define GS_TWIN_ID_ONLY_MSG \
+	"twin_id applies only to the GeForce RTX 5090 (GB202, 10de:2b85)."
+#define GS_TWIN_ID_HOTPLUG_MSG \
+	"twin_id refused: the GPU is behind a hotplug-capable port"
+#define GS_TWIN_ID_BOUND_MSG \
+	"twin_id refused: nvidia (or another driver) is bound to the GPU"
+
+/*
+ * The one sentence each tool uses to describe the experimental_vfs and
+ * twin_id options, after "<name> (default <off value>): ".
+ */
+#define GS_EXPVFS_BODY \
+	"untested. Raises the VF count of Ada/Blackwell cards that report 1 up to vfs (max 4). " \
+	"On Blackwell the raised count also reaches NVIDIA's driver, and the GPU firmware may still " \
+	"refuse more than 1 VF; on Ada the driver still sees 1."
+#define GS_TWIN_ID_BODY \
+	"EXPERIMENTAL and untested. On GB202 (RTX 5090) the driver is shown the professional twin's " \
+	"PCI ID when it first opens the GPU; the GPU firmware may fail to start. No effect on other cards."
+
+/*
+ * Config offsets the module's 32-bit read hook answers (PCI and SR-IOV
+ * specs): the vendor/device dword, the subsystem vendor/subsystem dword,
+ * and, relative to the SR-IOV capability, the InitialVFs (bits 15:0) /
+ * TotalVFs (bits 31:16) dword.
+ */
+#define GS_TWIN_ID_DEVICE_WHERE	0x00
+#define GS_TWIN_ID_SUBSYS_WHERE	0x2c
+#define GS_SRIOV_VFS_DWORD	0x0c
+
 /* PCIe extended capability IDs used by the table (PCIe base spec). */
 #define GS_EXT_CAP_ID_ARI	0x000eu
 #define GS_EXT_CAP_ID_SRIOV	0x0010u
@@ -133,6 +187,9 @@ struct gs_device {
 	unsigned char generation;
 	unsigned char same_die;
 	unsigned char experimental;
+	unsigned short twin_device;
+	unsigned short twin_subdevice;
+	unsigned char vf_dword;
 	const char *die;
 	const char *name;
 	const char *target_name;
@@ -150,27 +207,33 @@ struct gs_device {
  */
 #define GS_AMPERE_ENTRY(dev, dname, pname, tgt, tsv, tsd, tname, same, exp) \
 	{ (dev), (tgt), (tsv), (tsd), 0xbccu, 0xc14u, 0xc8u, 0x41cu, 16u,      \
-	  GS_AMPERE, (same), (exp), (dname), (pname), (tname) }
+	  GS_AMPERE, (same), (exp), 0u, 0u, 0u, (dname), (pname), (tname) }
 
 /*
  * Ada (AD10x): the same hidden SR-IOV (0xBCC) and ARI (0xC14) headers as
  * Ampere in every Ada GeForce dump checked, but TotalVFs = InitialVFs = 1.
- * MSI-X is expected at 0xC8, but no Ada dump records 0x41C, so its hide
- * mechanism is unknown: msix_hide_pos = 0 and the module never writes it.
+ * MSI-X is expected at 0xC8. The public config-space dumps used for the
+ * device table record 0x41C bit 29 set on every Ada GeForce row, as on
+ * Ampere, but only NVIDIA's GA102 manual names that bit "hide MSI-X", so its
+ * meaning on AD10x is unconfirmed: msix_hide_pos = 0 and the module never
+ * writes it. NVIDIA's driver reads the ID and TotalVFs of these chips
+ * through a BAR0 mirror, not config reads: no twin dwords, no vf_dword.
  */
 #define GS_ADA_ENTRY(dev, dname, pname, tgt, tname, same) \
 	{ (dev), (tgt), 0u, 0u, 0xbccu, 0xc14u, 0xc8u, 0u, 1u, \
-	  GS_ADA, (same), 1u, (dname), (pname), (tname) }
+	  GS_ADA, (same), 1u, 0u, 0u, 0u, (dname), (pname), (tname) }
 
 /*
  * Blackwell (GB20x) desktop GeForce: SR-IOV is linked natively in the chain at
  * 0x250 (header 2a410010 or 29010010), TotalVFs 1. ARI and MSI-X are left to
  * the kernel's own discovery; no hidden offsets are assumed. Blackwell laptop
- * dies have no SR-IOV capability and are not listed.
+ * dies have no SR-IOV capability and are not listed. NVIDIA's driver reads
+ * the ID (0x00, 0x2C) and TotalVFs (0x25C) with 32-bit config reads. Public
+ * reports give each VF a 256 KiB, a 256 MiB and a 32 MiB BAR.
  */
-#define GS_BLACKWELL_ENTRY(dev, dname, pname, tgt, tsd, tname, same) \
-	{ (dev), (tgt), GS_VENDOR_NVIDIA, (tsd), 0x250u, 0u, 0u, 0u, 1u, \
-	  GS_BLACKWELL, (same), 1u, (dname), (pname), (tname) }
+#define GS_BLACKWELL_ENTRY(dev, dname, pname, tgt, tsd, tname, same, twdev, twsub) \
+	{ (dev), (tgt), GS_VENDOR_NVIDIA, (tsd), 0x250u, 0u, 0u, 0u, 1u,           \
+	  GS_BLACKWELL, (same), 1u, (twdev), (twsub), 1u, (dname), (pname), (tname) }
 
 /*
  * Cross-die choices (same_die = 0). No professional SKU of GA103/GA104/GA106,
@@ -256,25 +319,30 @@ static const struct gs_device gs_devices[] = {
 	GS_ADA_ENTRY(0x2805, "AD106", "GeForce RTX 4060 Ti 16GB", 0x27b8, "L4", 0),
 	GS_ADA_ENTRY(0x2882, "AD107", "GeForce RTX 4060", 0x27b8, "L4", 0),
 
-	/* GB202 -> RTX PRO 6000 Blackwell Server Edition, same die. */
+	/*
+	 * GB202 -> RTX PRO 6000 Blackwell Server Edition, same die. The only
+	 * twin_id entry: NVIDIA's driver picks a larger GSP heap and 48
+	 * partitions for 10de:2bb5 subsystem 10de:204e (580.159.01; 595 also
+	 * 10de:220b) and the defaults for every other ID.
+	 */
 	GS_BLACKWELL_ENTRY(0x2b85, "GB202", "GeForce RTX 5090", 0x2bb5, 0x204e,
-			   "RTX PRO 6000 Blackwell Server Edition", 1),
+			   "RTX PRO 6000 Blackwell Server Edition", 1, 0x2bb5, 0x204e),
 
 	/* GB203 -> RTX PRO 4500 Blackwell Server Edition, same die. */
 	GS_BLACKWELL_ENTRY(0x2c02, "GB203", "GeForce RTX 5080", 0x2c3a, 0x21f4,
-			   "RTX PRO 4500 Blackwell Server Edition", 1),
+			   "RTX PRO 4500 Blackwell Server Edition", 1, 0, 0),
 	GS_BLACKWELL_ENTRY(0x2c05, "GB203", "GeForce RTX 5070 Ti", 0x2c3a, 0x21f4,
-			   "RTX PRO 4500 Blackwell Server Edition", 1),
+			   "RTX PRO 4500 Blackwell Server Edition", 1, 0, 0),
 
 	/* GB206 -> RTX PRO 4500 (GB203), cross-die. */
 	GS_BLACKWELL_ENTRY(0x2d04, "GB206", "GeForce RTX 5060 Ti", 0x2c3a, 0x21f4,
-			   "RTX PRO 4500 Blackwell Server Edition", 0),
+			   "RTX PRO 4500 Blackwell Server Edition", 0, 0, 0),
 	GS_BLACKWELL_ENTRY(0x2d05, "GB206", "GeForce RTX 5060", 0x2c3a, 0x21f4,
-			   "RTX PRO 4500 Blackwell Server Edition", 0),
+			   "RTX PRO 4500 Blackwell Server Edition", 0, 0, 0),
 
 	/* GB205 -> RTX PRO 4500 (GB203), cross-die. */
 	GS_BLACKWELL_ENTRY(0x2f04, "GB205", "GeForce RTX 5070", 0x2c3a, 0x21f4,
-			   "RTX PRO 4500 Blackwell Server Edition", 0),
+			   "RTX PRO 4500 Blackwell Server Edition", 0, 0, 0),
 };
 
 #define GS_DEVICE_COUNT (sizeof(gs_devices) / sizeof(gs_devices[0]))
@@ -350,6 +418,160 @@ static inline unsigned int gs_vf_limit(const struct gs_device *d,
 	unsigned int ceiling = gs_vf_ceiling(d, raw, experimental_vfs);
 
 	return vfs < ceiling ? vfs : ceiling;
+}
+
+/*
+ * 1 if experimental_vfs also raises what NVIDIA's driver reads: the entry's
+ * driver reads TotalVFs with a 32-bit config read, which the module answers
+ * (gs_vf_dword()). 0 on Ada (the driver reads a BAR0 mirror) and Ampere.
+ */
+static inline int gs_expvfs_reaches_driver(const struct gs_device *d)
+{
+	return d->vf_dword != 0;
+}
+
+/* 1 if the entry has twin dwords (twin_id has an effect on it). */
+static inline int gs_has_twin_dwords(const struct gs_device *d)
+{
+	return d->twin_device != 0;
+}
+
+/* The experimental_vfs caveat for @d, or 0 (NULL) where it changes nothing. */
+static inline const char *gs_expvfs_msg(const struct gs_device *d)
+{
+	switch (d->generation) {
+	case GS_ADA:
+		return GS_EXPVFS_LINUX_MSG;
+	case GS_BLACKWELL:
+		return GS_EXPVFS_DRIVER_MSG;
+	}
+	return 0;
+}
+
+/*
+ * The InitialVFs (bits 15:0) / TotalVFs (bits 31:16) dword at sriov_pos +
+ * GS_SRIOV_VFS_DWORD that a 32-bit read returns, from the hardware value
+ * @raw: for an entry with vf_dword and @experimental_vfs, each 16-bit half
+ * as the 16-bit reads show it (gs_vf_limit()); otherwise, and for an
+ * all-ones read (no device), @raw.
+ */
+static inline unsigned int gs_vf_dword(const struct gs_device *d,
+				       unsigned int raw, int experimental_vfs,
+				       unsigned int vfs)
+{
+	if (!experimental_vfs || !gs_expvfs_reaches_driver(d) ||
+	    raw == 0xffffffffu)
+		return raw;
+	return gs_vf_limit(d, raw >> 16, 1, vfs) << 16 |
+	       gs_vf_limit(d, raw & 0xffffu, 1, vfs);
+}
+
+/*
+ * twin_id: the dword a 32-bit read at config offset @where returns for an
+ * entry with twin dwords, from the hardware value @hw. Returns 1 with
+ * *@out = 10de:twin_device at GS_TWIN_ID_DEVICE_WHERE, only while @hw is the
+ * card's own 10de:device (a reset's all-ones read stays visible), or
+ * *@out = 10de:twin_subdevice at GS_TWIN_ID_SUBSYS_WHERE, unless @hw is all
+ * ones. Returns 0 (keep @hw) for every other offset and for entries
+ * without twin dwords.
+ */
+static inline int gs_twin_id_dword(const struct gs_device *d,
+				   unsigned int where, unsigned int hw,
+				   unsigned int *out)
+{
+	if (!gs_has_twin_dwords(d))
+		return 0;
+	if (where == GS_TWIN_ID_DEVICE_WHERE &&
+	    hw == ((unsigned int)d->device << 16 | GS_VENDOR_NVIDIA)) {
+		*out = (unsigned int)d->twin_device << 16 | GS_VENDOR_NVIDIA;
+		return 1;
+	}
+	if (where == GS_TWIN_ID_SUBSYS_WHERE && hw != 0xffffffffu) {
+		*out = (unsigned int)d->twin_subdevice << 16 | GS_VENDOR_NVIDIA;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Why twin_id is refused for one listed PF (gs_twin_id_refusal()). The
+ * hotplug driver compares config dwords 0x00 and 0x2C with the ID it
+ * enumerated and would treat the card as replaced; NVIDIA's driver caches the
+ * ID at its first open and checks dword 0 after a reset.
+ */
+enum gs_twin_refusal {
+	GS_TWIN_OK = 0,		/* allowed, or twin_id has no effect on the card */
+	GS_TWIN_HOTPLUG_PORT,	/* the port above the PF is hotplug-capable */
+	GS_TWIN_DRIVER_BOUND,	/* a driver is bound to the PF */
+};
+
+static inline enum gs_twin_refusal
+gs_twin_id_refusal(const struct gs_device *d, int twin_id, int hotplug_port,
+		   int driver_bound)
+{
+	if (!twin_id || !gs_has_twin_dwords(d))
+		return GS_TWIN_OK;
+	if (hotplug_port)
+		return GS_TWIN_HOTPLUG_PORT;
+	if (driver_bound)
+		return GS_TWIN_DRIVER_BOUND;
+	return GS_TWIN_OK;
+}
+
+static inline const char *gs_twin_refusal_text(enum gs_twin_refusal r)
+{
+	switch (r) {
+	case GS_TWIN_OK:
+		return "";
+	case GS_TWIN_HOTPLUG_PORT:
+		return GS_TWIN_ID_HOTPLUG_MSG;
+	case GS_TWIN_DRIVER_BOUND:
+		return GS_TWIN_ID_BOUND_MSG;
+	}
+	return "";
+}
+
+/*
+ * Does the 32-bit read hook rewrite config offset @where of entry @d with
+ * these options? The twin dwords with twin_id, the InitialVFs/TotalVFs dword
+ * at sriov_pos + GS_SRIOV_VFS_DWORD with experimental_vfs.
+ */
+static inline int gs_dword_offset_watched(const struct gs_device *d, int where,
+					  int twin_id, int experimental_vfs)
+{
+	if (twin_id && gs_has_twin_dwords(d) &&
+	    (where == GS_TWIN_ID_DEVICE_WHERE || where == GS_TWIN_ID_SUBSYS_WHERE))
+		return 1;
+	return experimental_vfs && gs_expvfs_reaches_driver(d) &&
+	       where == (int)d->sriov_pos + GS_SRIOV_VFS_DWORD;
+}
+
+/*
+ * Whether the module replaces pci_read_config_dword() for the listed
+ * entries @listed[0..@n-1]: only when one of them has something to rewrite
+ * with the given options. twin_id without any listed entry that has twin
+ * dwords is an error (GS_DWORD_HOOK_NO_TWIN_PF).
+ */
+enum gs_dword_hook {
+	GS_DWORD_HOOK_OFF = 0,
+	GS_DWORD_HOOK_ON,
+	GS_DWORD_HOOK_NO_TWIN_PF,
+};
+
+static inline enum gs_dword_hook
+gs_dword_hook_decide(const struct gs_device *const *listed, unsigned int n,
+		     int twin_id, int experimental_vfs)
+{
+	unsigned int i, twins = 0, vfdw = 0;
+
+	for (i = 0; i < n; i++) {
+		twins += gs_has_twin_dwords(listed[i]);
+		vfdw += gs_expvfs_reaches_driver(listed[i]);
+	}
+	if (twin_id && !twins)
+		return GS_DWORD_HOOK_NO_TWIN_PF;
+	return (twin_id && twins) || (experimental_vfs && vfdw) ?
+	       GS_DWORD_HOOK_ON : GS_DWORD_HOOK_OFF;
 }
 
 /*

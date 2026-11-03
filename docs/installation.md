@@ -46,7 +46,7 @@ each boot ([details](boot-display.md)).
 | ☐ | Kernel headers for the running kernel, `dkms`, a C compiler, `make` | `dkms status`; `cc --version`. On Proxmox, `pve-nvidia-vgpu-helper setup` installs headers and DKMS |
 | ☐ | `systemd` and `pciutils` (`lspci`, `setpci`; NVIDIA's `sriov-manage` needs them) | `lspci --version` |
 | ☐ | IOMMU on in firmware (VT-d / AMD-Vi) and kernel. In firmware also enable *Above 4G decoding*, and SR-IOV and ARI if offered | `dmesg \| grep -i -e DMAR -e IOMMU`; `ls /sys/kernel/iommu_groups` is not empty |
-| ☐ | Your own NVIDIA vGPU host package for Linux KVM, proprietary flavour, installed with DKMS. Measured version: 580.159.01 | `modinfo -F version nvidia` prints the installed version without loading the module. (`/proc/driver/nvidia/version` exists only while `nvidia` is loaded) |
+| ☐ | Your own NVIDIA vGPU host package for Linux KVM, proprietary flavour, installed with DKMS. Measured version: 580.159.01. Blackwell needs the open flavour, which geforce-sriov does not support yet ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)) | `modinfo -F version nvidia` prints the installed version without loading the module. (`/proc/driver/nvidia/version` exists only while `nvidia` is loaded) |
 | ☐ | NVIDIA's vGPU daemon units `nvidia-vgpud.service` and `nvidia-vgpu-mgr.service` | `systemctl list-unit-files 'nvidia-vgpu*'` lists both. If not, see [below](#nvidias-vgpu-daemon-units) |
 | ☐ | Guest drivers from the **same** vGPU software release as the host driver | NVIDIA's release notes map host to guest versions |
 | ☐ | A valid NVIDIA vGPU licence setup of your own for the guests (outside this project) | |
@@ -156,8 +156,10 @@ What `install` does, and why:
 It refuses a card that is not in the device table, is the boot display (without
 `--boot-display-release`), shares its bus with another device or has no PCI bridge above it.
 Running it again leaves identical files alone (`unchanged …`). To start more cautiously you can
-record `--ari=off` (and on Ada/Blackwell `--experimental-vfs=off`). Every option and config key is
-listed in [configuration.md](configuration.md).
+record `--ari=off`. On Ada and Blackwell, `--experimental-vfs=on` and (RTX 5090 only)
+`--twin-id=on` are opt-ins for experiments; both are off by default
+([Ada and Blackwell](devices.md#ada-and-blackwell)). Every option and config key is listed in
+[configuration.md](configuration.md).
 
 **Success:** the command exits 0 and its output contains
 `geforce-sriov-prepare.service enabled for the next boot (not started now).`, followed by a few
@@ -195,7 +197,7 @@ geforce-sriov status
 Among other lines, the journal should show these, in this order (addresses differ on your host):
 
 ```text
-modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 bdfs=0000:03:00.0
+modprobe geforce_sriov ari=1 msix=1 experimental_vfs=0 twin_id=0 bdfs=0000:03:00.0
 livepatch geforce_sriov enabled, transition complete
 0000:03:00.0: bridge 0000:00:03.0 power/control auto -> on (held awake)
 0000:03:00.0: remove 0000:03:00.1
@@ -208,7 +210,7 @@ livepatch geforce_sriov enabled, transition complete
 and none enabled yet:
 
 ```text
-module geforce_sriov: loaded (ari=Y msix=Y experimental_vfs=Y vfs=4 bdfs=0000:03:00.0; livepatch enabled=1 transition=0)
+module geforce_sriov: loaded (ari=Y msix=Y experimental_vfs=N twin_id=N vfs=4 bdfs=0000:03:00.0; livepatch enabled=1 transition=0)
 guard: clear
 
 0000:03:00.0: 10de:2206 GeForce RTX 3080 driver nvidia

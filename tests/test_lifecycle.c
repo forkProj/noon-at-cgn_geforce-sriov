@@ -300,15 +300,20 @@ static void test_config(void)
 		"vfs=17\n", "vfs=04\n", "vfs=four\n", "vfs=-1\n", "vfs=2\nvfs=3\n", "num_vfs=2\n", "max_vfs=8\n",
 		"ARI=on\n", "bdfs=0000:03:00.1\n", "bdfs=0000:03:00.0,0000:03:00.0\n", "bdfs=03:00.0\n",
 		"bdfs=0000:03:00.0,\n", "noequals\n", " #comment\n", "sriov_manage=relative/path\n",
-		"sriov_manage=/usr/../bin/x\n",
+		"sriov_manage=/usr/../bin/x\n", "twin_id=yes\n", "twin_id=on\ntwin_id=off\n", "TWIN_ID=on\n",
 		"bdfs=0000:01:00.0,0000:02:00.0,0000:03:00.0,0000:04:00.0,0000:05:00.0,0000:06:00.0,0000:07:00.0,0000:08:00.0,0000:09:00.0\n",
 		NULL,
 	};
 
 	CHECK(gs_config_parse("", 0, &c, err, sizeof(err)) == 0 && c.ari == GS_SW_ON && c.msix == GS_SW_ON &&
-	      c.experimental_vfs == GS_SW_ON && c.identity == GS_SW_OFF && c.nbdfs == 0, "defaults");
+	      c.experimental_vfs == GS_SW_OFF && c.twin_id == GS_SW_OFF && c.identity == GS_SW_OFF && c.nbdfs == 0,
+	      "defaults");
 	/* A config without vfs (every config written before the key existed) keeps 4. */
 	CHECK(c.vfs == 0 && gs_config_vfs(&c) == GS_DEFAULT_VFS, "default VF count");
+	CHECK(gs_config_parse("twin_id=on\nexperimental_vfs=on\n", 31, &c, err, sizeof(err)) == 0 &&
+	      c.twin_id == GS_SW_ON && c.experimental_vfs == GS_SW_ON, "twin_id=on, experimental_vfs=on: %s", err);
+	CHECK(gs_config_parse("twin_id=maybe\n", 14, &c, err, sizeof(err)) != 0 && strstr(err, "twin_id must be on or off"),
+	      "twin_id value named: %s", err);
 	CHECK(gs_config_parse("vfs=2\n", 6, &c, err, sizeof(err)) == 0 && gs_config_vfs(&c) == 2, "vfs=2: %s", err);
 	CHECK(gs_config_parse("vfs=16", 6, &c, err, sizeof(err)) == 0 && gs_config_vfs(&c) == 16, "vfs=16: %s", err);
 	CHECK(gs_config_parse("num_vfs=2\n", 10, &c, err, sizeof(err)) != 0 && strstr(err, "vfs="),
@@ -326,14 +331,17 @@ static void test_config(void)
 	c.nbdfs = 1;
 	c.identity = GS_SW_ON;
 	c.experimental_vfs = GS_SW_OFF;
+	c.twin_id = GS_SW_ON;
 	n = gs_config_render(&c, text, sizeof(text));
 	CHECK(n > 0, "render");
 	{
 		struct gs_config back;
 
 		CHECK(gs_config_parse(text, (size_t)n, &back, err, sizeof(err)) == 0 && back.nbdfs == 1 &&
-		      back.identity == GS_SW_ON && back.experimental_vfs == GS_SW_OFF && back.ari == GS_SW_ON &&
-		      back.vfs == 0, "roundtrip: %s", err);
+		      back.identity == GS_SW_ON && back.experimental_vfs == GS_SW_OFF && back.twin_id == GS_SW_ON &&
+		      back.ari == GS_SW_ON && back.vfs == 0, "roundtrip: %s", err);
+		CHECK(strstr(text, "\nexperimental_vfs=off\n") && strstr(text, "\ntwin_id=on\n"),
+		      "both switches are written: %s", text);
 		CHECK(!strstr(text, "\nvfs="), "an unset VF count is not written: %s", text);
 		c.vfs = 2;
 		n = gs_config_render(&c, text, sizeof(text));
@@ -450,6 +458,8 @@ static void test_cli_readonly(void)
 		CHECK(contains(out, "HW VFS") && contains(line, " 16 "), "devices lists the hardware default: %s", line);
 	}
 	CHECK(!contains(out, "10de:1e07"), "devices excludes Turing");
+	CHECK(contains(out, GS_EXPVFS_OPT_MSG) && contains(out, GS_TWIN_ID_OPT_MSG) &&
+	      !contains(out, "experimental_vfs=on (default)"), "devices describes experimental_vfs and twin_id:\n%s", out);
 	free(out);
 
 	fixture("cli-ok", gpu_with_audio, 0, NULL, root, sizeof(root));
@@ -713,12 +723,14 @@ static void tally_of(const char *out, int *fail, int *warn)
 /* A loaded geforce_sriov with a complete livepatch transition, acting on bdfs. */
 static void fake_module(const char *root, const char *bdfs)
 {
-	static const char *const yes[] = { "ari", "msix", "experimental_vfs" };
+	static const char *const param[][2] = {
+		{ "ari", "Y" }, { "msix", "Y" }, { "experimental_vfs", "N" }, { "twin_id", "N" },
+	};
 	char p[GS_PATH_MAX];
 
-	for (size_t i = 0; i < 3; i++) {
-		gs_pathf(p, sizeof(p), "%s/module/%s/parameters/%s", root, GS_MODULE_NAME, yes[i]);
-		writef(p, "Y\n");
+	for (size_t i = 0; i < sizeof(param) / sizeof(param[0]); i++) {
+		gs_pathf(p, sizeof(p), "%s/module/%s/parameters/%s", root, GS_MODULE_NAME, param[i][0]);
+		writef(p, "%s\n", param[i][1]);
 	}
 	gs_pathf(p, sizeof(p), "%s/module/%s/parameters/bdfs", root, GS_MODULE_NAME);
 	writef(p, "%s\n", bdfs);
@@ -741,14 +753,44 @@ static void write_resource(const char *root, int bar0_assigned, int vf_assigned)
 	writef(p, "%s", text);
 }
 
+/*
+ * <pf>/resource of a default-fixture Blackwell card with 1 VF: VF BAR 0 of 256 KiB (line 7) and the
+ * 64-bit VF BARs 1 of 256 MiB (line 8) and 3 of 32 MiB (line 10).
+ */
+static void write_blackwell_resource(const char *root)
+{
+	static const char *const line[13] = {
+		[0] = "0x00000000f0000000 0x00000000f3ffffff 0x0000000000040200\n",
+		[7] = "0x00000000f4000000 0x00000000f403ffff 0x0000000000040200\n",
+		[8] = "0x0000004000000000 0x000000400fffffff 0x000000000014220c\n",
+		[10] = "0x0000004010000000 0x0000004011ffffff 0x000000000014220c\n",
+	};
+	char p[GS_PATH_MAX], text[1024] = "";
+
+	for (int i = 0; i <= 12; i++)
+		strcat(text, line[i] ? line[i] : "0x0000000000000000 0x0000000000000000 0x0000000000000000\n");
+	gs_pathf(p, sizeof(p), "%s/devices/%s/%s/resource", root, topo_default.bridge_path, topo_default.pf);
+	writef(p, "%s", text);
+}
+
 static const struct fx_fn turing_gpu[] = {
 	{ "0000:03:00.0", "1e07", "030000", NULL },
 	{ NULL, NULL, NULL, NULL },
 };
 
-/* AD103: experimental, cross-die, and one hardware VF raised to four by experimental_vfs. */
+/* AD103: experimental, cross-die, 1 hardware VF (4 with experimental_vfs=on). */
 static const struct fx_fn ada_cross_die_gpu[] = {
 	{ "0000:03:00.0", "2702", "030000", NULL },
+	{ NULL, NULL, NULL, NULL },
+};
+
+/* GB202 (RTX 5090, the twin_id card) and GB203 (RTX 5080): native SR-IOV, 1 hardware VF. */
+static const struct fx_fn gb202_gpu[] = {
+	{ "0000:03:00.0", "2b85", "030000", NULL },
+	{ NULL, NULL, NULL, NULL },
+};
+static const struct fx_fn gb203_gpu[] = {
+	{ "0000:03:00.0", "2c02", "030000", NULL },
 	{ NULL, NULL, NULL, NULL },
 };
 
@@ -760,6 +802,7 @@ static const struct fx_fn pf_bound_gpu[] = {
 static void test_doctor_scope(void)
 {
 	char root[GS_PATH_MAX], cfg[GS_PATH_MAX], p[GS_PATH_MAX], *out;
+	const char *note;
 	int rc, f1, w1, f2, w2;
 	static const struct fx_topo twin_topo = { "pci0000:00/0000:00:03.0", "0000:04:00.0" };
 	static const struct fx_fn twin_bound[] = {
@@ -779,15 +822,51 @@ static void test_doctor_scope(void)
 	fixture("ux-ada", ada_cross_die_gpu, 0, NULL, root, sizeof(root));
 	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--device", "0000:03:00.0", NULL });
 	tally_of(out, &f1, &w1);
-	CHECK(rc == 0 && f1 == 0 && w1 >= 3, "experimental cross-die Ada is ready but warned: %d\n%s", rc, out);
+	CHECK(rc == 0 && f1 == 0 && w1 >= 2 && contains(out, "hardware default 1, geforce-sriov presents 1 (default)") &&
+	      contains(out, "[INFO] 0000:03:00.0: experimental_vfs=off: the card presents its hardware count, 1 VF") &&
+	      !contains(out, "open kernel module"),
+	      "experimental cross-die Ada: ready, warned, 1 VF by default, no Blackwell note: %d\n%s", rc, out);
 	free(out);
-	writef(cfg, "experimental_vfs=off\n");
+	writef(cfg, "experimental_vfs=on\n");
 	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--config", cfg, "--device",
 							 "0000:03:00.0", NULL });
 	tally_of(out, &f2, &w2);
-	CHECK(rc == 0 && w2 == w1 - 1, "experimental_vfs=off drops only the VF-override warning: %d->%d\n%s", w1, w2, out);
+	CHECK(rc == 0 && w2 == w1 + 1 && contains(out, "presents 4 (default, experimental_vfs=on)") &&
+	      contains(out, "[WARN] 0000:03:00.0: experimental_vfs=on: geforce-sriov presents up to 4 VFs. " GS_EXPVFS_LINUX_MSG),
+	      "experimental_vfs=on adds only the VF-override warning: %d->%d\n%s", w1, w2, out);
 	/* Host prerequisites (dkms, pciutils) are live-system checks; a fixture never fails on them. */
 	CHECK(!contains(out, "dkms") && !contains(out, "lspci"), "fixture doctor runs no host prerequisite check");
+	free(out);
+
+	/* Blackwell: 1 VF by default and the driver note once; twin_id warns on GB202 only. */
+	fixture("ux-gb202", gb202_gpu, 0, "0/1", root, sizeof(root));
+	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--device", "0000:03:00.0", NULL });
+	tally_of(out, &f1, &w1);
+	note = out ? strstr(out, "open kernel module") : NULL;
+	CHECK(rc == 0 && f1 == 0 && note && !strstr(note + 1, "open kernel module") &&
+	      contains(out, "[INFO] 0000:03:00.0: the closed 580.159.01 driver does not support this GPU; ") &&
+	      contains(out, "hardware default 1, geforce-sriov presents 1 (default)") && !contains(out, "twin_id=on"),
+	      "GB202 default: 1 VF, one driver note, no twin_id line: %d\n%s", rc, out);
+	free(out);
+	writef(cfg, "twin_id=on\n");
+	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--config", cfg, "--device",
+							 "0000:03:00.0", NULL });
+	tally_of(out, &f2, &w2);
+	CHECK(rc == 0 && w2 == w1 + 1 && contains(out, "[WARN] 0000:03:00.0: twin_id=on: " GS_TWIN_ID_MSG) &&
+	      contains(out, "experimental_vfs=off twin_id=on vfs=4 (default)"),
+	      "GB202 twin_id=on: one more warning, config line names it: %d->%d\n%s", w1, w2, out);
+	free(out);
+	fixture("ux-gb203", gb203_gpu, 0, "0/1", root, sizeof(root));
+	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--device", "0000:03:00.0", NULL });
+	tally_of(out, &f1, &w1);
+	free(out);
+	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--config", cfg, "--device",
+							 "0000:03:00.0", NULL });
+	tally_of(out, &f2, &w2);
+	CHECK(rc == GS_EXIT_REFUSED && f2 == f1 + 1 && w2 == w1 &&
+	      contains(out, "[INFO] 0000:03:00.0: twin_id=on: " GS_TWIN_ID_ONLY_MSG) &&
+	      contains(out, "[FAIL] twin_id=on, but no selected GPU is a GB202, so the module refuses to load; prepare refuses it") &&
+	      contains(out, "open kernel module"), "GB203 alone with twin_id=on: refused: %d->%d\n%s", f1, f2, out);
 	free(out);
 
 	/* Before install: --device alone is judged with the identity settings `install --device` writes. */
@@ -902,7 +981,7 @@ static void test_status_guidance(void)
 	struct gs_card card;
 	struct gs_plan plan;
 	struct gs_addr pf;
-	int rc;
+	int rc, f1, w1;
 
 	gs_pathf(cfg, sizeof(cfg), "%s/ux-status-config", tmp);
 	writef(cfg, "bdfs=0000:03:00.0\n");
@@ -937,6 +1016,24 @@ static void test_status_guidance(void)
 	write_resource(root, 0, 1);
 	rc = run_cli(&out, NULL, (const char *const[]){ "status", "--sysfs-root", root, "--config", cfg, NULL });
 	CHECK(rc == GS_EXIT_FAIL, "no BAR0: not ready: %d\n%s", rc, out);
+	free(out);
+	/* Blackwell's larger VF BARs (256 KiB, 256 MiB, 32 MiB per VF) are an assigned layout, not an error. */
+	fixture("ux-gb202-bars", gb202_gpu, 0, "0/1", root, sizeof(root));
+	write_blackwell_resource(root);
+	fake_module(root, "0000:03:00.0");
+	gs_card_inspect(root, &pf, &card);
+	CHECK(card.bar0_assigned == 1 && card.vf_bars_assigned == 1, "Blackwell resource read: %d %d", card.bar0_assigned,
+	      card.vf_bars_assigned);
+	rc = run_cli(&out, NULL, (const char *const[]){ "status", "--sysfs-root", root, "--config", cfg, NULL });
+	CHECK(rc == 0 && contains(out, "experimental_vfs=N twin_id=N vfs=(none)") &&
+	      contains(out, "hardware default 1, geforce-sriov presents 1 (default)") &&
+	      contains(out, "sriov_totalvfs=1 sriov_numvfs=0") && !contains(out, "BAR"),
+	      "Blackwell VF BARs: ready, module twin_id shown: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--sysfs-root", root, "--config", cfg, NULL });
+	tally_of(out, &f1, &w1);
+	CHECK(rc == 0 && f1 == 0 && !contains(out, "BAR0") && !contains(out, "VF BAR") &&
+	      contains(out, "experimental_vfs=N twin_id=N"), "Blackwell VF BARs: doctor accepts them: %d\n%s", rc, out);
 	free(out);
 
 	/* prepare never rescans a card whose BAR0 is unassigned now ... */
@@ -1068,6 +1165,13 @@ static void test_option_guidance(void)
 	free(out);
 	rc = run_cli(&out, NULL, (const char *const[]){ "prepare", "--bogus", NULL });
 	CHECK(rc == GS_EXIT_USAGE && contains(out, "unknown option"), "--bogus: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, NULL, (const char *const[]){ "install", "--twin_id=on", NULL });
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "--twin-id=on|off"), "--twin_id: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, NULL, (const char *const[]){ "prepare", "--clear-guard", "--twin-id=off", NULL });
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "--clear-guard takes no other option"),
+	      "--clear-guard --twin-id: %d\n%s", rc, out);
 	free(out);
 
 	/* Staging records addresses unchecked and sends the user to doctor on the target host. */
@@ -1790,7 +1894,7 @@ static void check_untouched(const char *what)
 
 static void test_prepare_default_and_deferral(void)
 {
-	char root[GS_PATH_MAX], *out, *log, *rec;
+	char root[GS_PATH_MAX], p[GS_PATH_MAX], *out, *log, *rec;
 	struct gs_config cfg;
 	int rc;
 
@@ -1800,7 +1904,7 @@ static void test_prepare_default_and_deferral(void)
 	rc = run_prepare(&cfg, 1, NULL, &out);
 	log = sim_text("sim.log");
 	rec = sim_text("run/" GS_PREPARED_NAME "/0000:03:00.0");
-	CHECK(rc == 0 && contains(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 bdfs=0000:03:00.0") &&
+	CHECK(rc == 0 && contains(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=0 twin_id=0 bdfs=0000:03:00.0") &&
 	      contains(log, "W bus/pci/devices/0000:03:00.1/driver/unbind") &&
 	      contains(log, "W bus/pci/devices/0000:03:00.0/remove 1") && contains(log, "/rescan 1") &&
 	      !contains(log, "platform"), "default boot prepare: %d\n%s\n%s", rc, out, log);
@@ -1809,6 +1913,47 @@ static void test_prepare_default_and_deferral(void)
 	free(out);
 	free(log);
 	free(rec);
+
+	/* experimental_vfs and twin_id reach the module when a selected GPU is a GB202. */
+	two_cards("prep-twin", 0, -1, root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/devices/%s/%s/device", root, topo_default.bridge_path, topo_default.pf);
+	writef(p, "0x2b85\n");
+	cfg_of(&cfg, "bdfs=0000:03:00.0\nexperimental_vfs=on\ntwin_id=on\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == 0 && contains(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 twin_id=1 bdfs=0000:03:00.0"),
+	      "twin_id=on prepare: %d\n%s\n%s", rc, out, log);
+	free(out);
+	free(log);
+
+	/* twin_id=on without a GB202: the module would refuse to load, so prepare refuses first. */
+	two_cards("prep-twin-none", 0, -1, root, sizeof(root));
+	cfg_of(&cfg, "bdfs=0000:03:00.0\ntwin_id=on\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "no selected GPU is a GB202") && contains(out, GS_TWIN_ID_ONLY_MSG),
+	      "twin_id=on without a GB202: refused: %d\n%s", rc, out);
+	check_untouched("twin_id=on without a GB202");
+	free(out);
+
+	/* A module already loaded with another twin_id is refused before any removal; equal values are reused. */
+	two_cards("prep-loaded", 0, -1, root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/devices/%s/%s/device", root, topo_default.bridge_path, topo_default.pf);
+	writef(p, "0x2b85\n");
+	fake_module(root, "0000:03:00.0");
+	cfg_of(&cfg, "bdfs=0000:03:00.0\ntwin_id=on\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "loaded with ari=Y msix=Y experimental_vfs=N twin_id=N vfs=4") &&
+	      contains(out, "requested ari=Y msix=Y experimental_vfs=N twin_id=Y vfs=4") && !contains(log, "R modprobe") &&
+	      !contains(log, "/remove") && !sim_exists("state/" GS_ATTEMPT_NAME),
+	      "loaded twin_id=N, requested on: refused: %d\n%s\n%s", rc, out, log);
+	free(out);
+	free(log);
+	cfg_of(&cfg, "bdfs=0000:03:00.0\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	CHECK(rc == 0 && contains(out, "already loaded with the requested parameters"), "loaded, same values: %d\n%s", rc,
+	      out);
+	free(out);
 
 	/* Default refusal of the boot display: every card is checked first, nothing changes. */
 	two_cards("prep-nogrant", 1, FW_BOUND, root, sizeof(root));
@@ -1869,7 +2014,7 @@ static void test_prepare_release(void)
 	rc = run_prepare(&cfg, 0, "0000:04:00.0", &out);
 	log = sim_text("sim.log");
 	unbind = pos_of(log, "W bus/platform/devices/simple-framebuffer.0/driver/unbind simple-framebuffer.0");
-	load = pos_of(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 bdfs=0000:03:00.0,0000:04:00.0");
+	load = pos_of(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=0 twin_id=0 bdfs=0000:03:00.0,0000:04:00.0");
 	CHECK(rc == 0 && unbind >= 0 && load > unbind && pos_of(log, "W bus/pci/devices/0000:04:00.0/remove") > load &&
 	      !contains(log, "/bind "), "release, one load, both cards, no rebind: %d\n%s\n%s", rc, out, log);
 	CHECK(contains(out, GS_CONSOLE_RELEASE_NOTE), "consent text shown");
@@ -1998,7 +2143,7 @@ static void test_vf_count(void)
 	rc = run_prepare(&cfg, 1, NULL, &out);
 	log = sim_text("sim.log");
 	rec = sim_text("run/" GS_PREPARED_NAME "/0000:03:00.0");
-	CHECK(rc == 0 && contains(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=1 vfs=2 bdfs=0000:03:00.0") &&
+	CHECK(rc == 0 && contains(log, "R modprobe geforce_sriov ari=1 msix=1 experimental_vfs=0 twin_id=0 vfs=2 bdfs=0000:03:00.0") &&
 	      contains(rec, "totalvfs=2"), "vfs=2 prepare: %d\n%s\n%s", rc, out, log);
 	free(out);
 	free(log);
@@ -2016,18 +2161,20 @@ static void test_vf_count(void)
 	free(out);
 	free(log);
 
-	/* Above what the card offers (Ada reports 1): refused before the first change. */
+	/* Above what the card offers (Ada reports 1, kept by default): refused before the first change. */
 	two_cards("vf-ada", 0, -1, root, sizeof(root));
 	gs_pathf(p, sizeof(p), "%s/devices/%s/%s/device", root, topo_default.bridge_path, topo_default.pf);
 	writef(p, "0x2702\n");
-	cfg_of(&cfg, "bdfs=0000:03:00.0\nexperimental_vfs=off\nvfs=2\n");
+	cfg_of(&cfg, "bdfs=0000:03:00.0\nvfs=2\n");
 	rc = run_prepare(&cfg, 1, NULL, &out);
-	CHECK(rc == GS_EXIT_REFUSED && contains(out, "vfs=2"), "vfs above the hardware refused: %d\n%s", rc, out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "vfs=2 is above the hardware default"),
+	      "vfs above the hardware refused: %d\n%s", rc, out);
 	check_untouched("vfs above the hardware");
 	free(out);
-	cfg_of(&cfg, "bdfs=0000:03:00.0\nvfs=8\n");
+	cfg_of(&cfg, "bdfs=0000:03:00.0\nexperimental_vfs=on\nvfs=8\n");
 	rc = run_prepare(&cfg, 1, NULL, &out);
-	CHECK(rc == GS_EXIT_REFUSED, "vfs above the experimental 4 refused: %d\n%s", rc, out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "experimental_vfs=on presents"),
+	      "vfs above the experimental 4 refused: %d\n%s", rc, out);
 	check_untouched("vfs above the experimental count");
 	free(out);
 

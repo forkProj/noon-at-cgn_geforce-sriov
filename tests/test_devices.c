@@ -629,6 +629,303 @@ static void test_vf_geometry_states(void)
 	      sriov_init_keeps(&constant, 0, 4, 0x03));
 }
 
+/*
+ * Default (experimental_vfs off): Ada and Blackwell present their hardware
+ * count of 1 whatever vfs is; Ampere is unchanged. Opt-in: 1 is raised to
+ * vfs, at most 4; Ampere is still unchanged.
+ */
+static void test_default_vf_count(void)
+{
+	unsigned int i, vfs;
+
+	/* The hardware count of every Ada/Blackwell entry is 1, Ampere's is 16. */
+	for (i = 0; i < GS_DEVICE_COUNT; i++) {
+		const struct gs_device *d = &gs_devices[i];
+		int ampere = d->generation == GS_AMPERE;
+
+		CHECK_DEV(d, d->totalvfs == (ampere ? 16 : 1));
+		for (vfs = 1; vfs <= GS_VFS_MAX; vfs++) {
+			unsigned int off = gs_vf_limit(d, d->totalvfs, 0, vfs);
+			unsigned int on = gs_vf_limit(d, d->totalvfs, 1, vfs);
+
+			if (ampere) {
+				CHECK_DEV(d, off == vfs && on == vfs);
+			} else {
+				CHECK_DEV(d, off == 1);
+				CHECK_DEV(d, on == (vfs < GS_DEFAULT_VFS ? vfs : GS_DEFAULT_VFS));
+			}
+		}
+	}
+
+	/* The ceiling behind it: only a raw 1 on Ada/Blackwell is raised, only on request. */
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 1, 0) == 1);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 1, 1) == GS_DEFAULT_VFS);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 1, 0) == 1);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 1, 1) == GS_DEFAULT_VFS);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 0, 1) == 0);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 2, 1) == 2);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 16, 0) == 16);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 16, 1) == 16);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 1, 1) == 1);
+}
+
+/*
+ * Per-entry twin dwords and the TotalVFs-by-dword flag: GB202 only has twin
+ * dwords; every Blackwell entry, and only Blackwell, has vf_dword.
+ */
+static void test_twin_and_dword_flags(void)
+{
+	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
+	unsigned int i, twin = 0;
+
+	CHECK(gb202 != NULL);
+	if (!gb202)
+		return;
+	CHECK(gb202->twin_device == 0x2bb5 && gb202->twin_subdevice == 0x204e);
+	CHECK(gs_has_twin_dwords(gb202));
+	CHECK(strcmp(gb202->die, "GB202") == 0);
+
+	for (i = 0; i < GS_DEVICE_COUNT; i++) {
+		const struct gs_device *d = &gs_devices[i];
+
+		if (gs_has_twin_dwords(d)) {
+			twin++;
+			CHECK_DEV(d, d->device == 0x2b85);
+			/* The twin is the vGPU target of the entry. */
+			CHECK_DEV(d, d->twin_device == d->target);
+			CHECK_DEV(d, d->twin_subdevice == d->target_subdevice);
+			CHECK_DEV(d, d->twin_subdevice != 0);
+		} else {
+			CHECK_DEV(d, d->twin_device == 0 && d->twin_subdevice == 0);
+		}
+		CHECK_DEV(d, d->vf_dword <= 1);
+		CHECK_DEV(d, d->vf_dword == (d->generation == GS_BLACKWELL));
+		CHECK_DEV(d, gs_expvfs_reaches_driver(d) == (d->generation == GS_BLACKWELL));
+		/* Ada: the driver reads a BAR0 mirror, no config dword to answer. */
+		if (d->generation == GS_ADA)
+			CHECK_DEV(d, !d->vf_dword && !gs_has_twin_dwords(d));
+	}
+	CHECK(twin == 1);
+}
+
+/* A dword with InitialVFs in bits 15:0 and TotalVFs in bits 31:16. */
+#define VFS_DWORD(initial, total) ((unsigned int)(total) << 16 | (initial))
+
+static void test_vf_dword(void)
+{
+	const struct gs_device *amp = gs_device_lookup(0x2206);
+	const struct gs_device *ada = gs_device_lookup(0x2783);
+	const struct gs_device *bw = gs_device_lookup(0x2c02);
+	unsigned int i, a, b, vfs;
+
+	CHECK(amp && ada && bw);
+	if (!amp || !ada || !bw)
+		return;
+
+	/* Blackwell, hardware 1/1: raised to the count, at most 4, only on request. */
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(4, 4));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 2) == VFS_DWORD(2, 2));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 1) == VFS_DWORD(1, 1));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 16) == VFS_DWORD(4, 4));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 0, 4) == VFS_DWORD(1, 1));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 0, 16) == VFS_DWORD(1, 1));
+	/* Each half on its own: 0 stays 0, 2 or more is only capped by the count. */
+	CHECK(gs_vf_dword(bw, VFS_DWORD(0, 1), 1, 4) == VFS_DWORD(0, 4));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 0), 1, 4) == VFS_DWORD(4, 0));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(0, 0), 1, 4) == 0);
+	CHECK(gs_vf_dword(bw, VFS_DWORD(2, 3), 1, 4) == VFS_DWORD(2, 3));
+	CHECK(gs_vf_dword(bw, VFS_DWORD(48, 48), 1, 4) == VFS_DWORD(4, 4));
+	/* An all-ones read (no device) is never changed. */
+	CHECK(gs_vf_dword(bw, 0xffffffffu, 1, 4) == 0xffffffffu);
+	/* Ada (BAR0 mirror) and Ampere: the dword is never changed. */
+	CHECK(gs_vf_dword(ada, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(1, 1));
+	CHECK(gs_vf_dword(amp, VFS_DWORD(16, 16), 1, 4) == VFS_DWORD(16, 16));
+	CHECK(gs_vf_dword(amp, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(1, 1));
+
+	/*
+	 * Both halves always equal what the 16-bit reads show (gs_vf_limit()
+	 * with the option on); with the option off, or on any non-Blackwell
+	 * entry, the dword is the hardware value.
+	 */
+	for (i = 0; i < GS_DEVICE_COUNT; i++) {
+		const struct gs_device *d = &gs_devices[i];
+
+		for (vfs = 1; vfs <= GS_VFS_MAX; vfs++)
+			for (a = 0; a <= 70; a++)
+				for (b = 0; b <= 70; b++) {
+					unsigned int raw = VFS_DWORD(a, b);
+					unsigned int want = d->generation == GS_BLACKWELL ?
+						VFS_DWORD(gs_vf_limit(d, a, 1, vfs),
+							  gs_vf_limit(d, b, 1, vfs)) : raw;
+
+					if (gs_vf_dword(d, raw, 1, vfs) != want ||
+					    gs_vf_dword(d, raw, 0, vfs) != raw) {
+						checks++;
+						failures++;
+						fprintf(stderr, "FAIL: 10de:%04x dword %u/%u vfs %u\n",
+							d->device, a, b, vfs);
+						return;
+					}
+				}
+	}
+	checks++;
+}
+
+static void test_twin_id_dword(void)
+{
+	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
+	unsigned int out, where, i;
+
+	CHECK(gb202 != NULL);
+	if (!gb202)
+		return;
+
+	/* Offset 0x00: the card's own ID is shown as the twin's; 10de in the low half. */
+	out = 0x5a5a5a5au;
+	CHECK(gs_twin_id_dword(gb202, 0x00, 0x2b8510deu, &out) == 1 && out == 0x2bb510deu);
+	/* An all-ones read, or an ID that is not the card's own, is left alone. */
+	out = 0x5a5a5a5au;
+	CHECK(gs_twin_id_dword(gb202, 0x00, 0xffffffffu, &out) == 0 && out == 0x5a5a5a5au);
+	CHECK(gs_twin_id_dword(gb202, 0x00, 0x1b8010deu, &out) == 0 && out == 0x5a5a5a5au);
+	CHECK(gs_twin_id_dword(gb202, 0x00, 0x2b851234u, &out) == 0 && out == 0x5a5a5a5au);
+	/* Offset 0x2C: whatever subsystem the board has becomes 10de:204e. */
+	CHECK(gs_twin_id_dword(gb202, 0x2c, 0x53ab1043u, &out) == 1 && out == 0x204e10deu);
+	CHECK(gs_twin_id_dword(gb202, 0x2c, 0x00000000u, &out) == 1 && out == 0x204e10deu);
+	out = 0x5a5a5a5au;
+	CHECK(gs_twin_id_dword(gb202, 0x2c, 0xffffffffu, &out) == 0 && out == 0x5a5a5a5au);
+
+	/* Every other offset, the SR-IOV dwords included, is untouched. */
+	for (where = 0; where < 0x300; where += 4) {
+		if (where == 0x00 || where == 0x2c)
+			continue;
+		out = 0x5a5a5a5au;
+		CHECK(gs_twin_id_dword(gb202, where, 0x2b8510deu, &out) == 0 && out == 0x5a5a5a5au);
+	}
+	out = 0x5a5a5a5au;
+	CHECK(gs_twin_id_dword(gb202, gb202->sriov_pos + GS_SRIOV_VFS_DWORD,
+			       VFS_DWORD(1, 1), &out) == 0 && out == 0x5a5a5a5au);
+
+	/* No other entry has twin dwords: nothing is rewritten at any offset. */
+	for (i = 0; i < GS_DEVICE_COUNT; i++) {
+		const struct gs_device *d = &gs_devices[i];
+
+		if (d == gb202)
+			continue;
+		for (where = 0; where < 0x300; where += 4) {
+			out = 0x5a5a5a5au;
+			CHECK_DEV(d, gs_twin_id_dword(d, where, (unsigned int)d->device << 16 | 0x10de, &out) == 0 &&
+				     out == 0x5a5a5a5au);
+		}
+	}
+}
+
+/* Which offsets the 32-bit read hook rewrites, entry by entry. */
+static void test_dword_offsets(void)
+{
+	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
+	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
+	const struct gs_device *ada = gs_device_lookup(0x2783);
+	const struct gs_device *amp = gs_device_lookup(0x2206);
+	int where;
+
+	CHECK(gb202 && gb203 && ada && amp);
+	if (!gb202 || !gb203 || !ada || !amp)
+		return;
+
+	/* GB202, both options: the two twin dwords and the TotalVFs dword, nothing else. */
+	for (where = 0; where < 0x400; where += 4) {
+		int want = where == 0x00 || where == 0x2c || where == gb202->sriov_pos + 0x0c;
+
+		CHECK(gs_dword_offset_watched(gb202, where, 1, 1) == want);
+		/* Each option alone watches only its own dwords. */
+		CHECK(gs_dword_offset_watched(gb202, where, 1, 0) == (where == 0x00 || where == 0x2c));
+		CHECK(gs_dword_offset_watched(gb202, where, 0, 1) == (where == gb202->sriov_pos + 0x0c));
+		CHECK(gs_dword_offset_watched(gb202, where, 0, 0) == 0);
+		/* GB203: no twin dwords, only the TotalVFs dword. */
+		CHECK(gs_dword_offset_watched(gb203, where, 1, 1) == (where == gb203->sriov_pos + 0x0c));
+		/* Ada and Ampere: nothing, whatever the options. */
+		CHECK(gs_dword_offset_watched(ada, where, 1, 1) == 0);
+		CHECK(gs_dword_offset_watched(amp, where, 1, 1) == 0);
+	}
+}
+
+/* Whether the module replaces pci_read_config_dword() for a list of PFs. */
+static void test_dword_hook_decision(void)
+{
+	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
+	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
+	const struct gs_device *ada = gs_device_lookup(0x2783);
+	const struct gs_device *amp = gs_device_lookup(0x2206);
+	const struct gs_device *l_gb202[] = { gb202 };
+	const struct gs_device *l_gb203[] = { gb203 };
+	const struct gs_device *l_ada[] = { ada };
+	const struct gs_device *l_amp[] = { amp };
+	const struct gs_device *l_mixed[] = { amp, gb203, gb202 };
+	const struct gs_device *l_noTwin[] = { ada, gb203 };
+
+	CHECK(gb202 && gb203 && ada && amp);
+	if (!gb202 || !gb203 || !ada || !amp)
+		return;
+
+	/* Options off: never. */
+	CHECK(gs_dword_hook_decide(l_gb202, 1, 0, 0) == GS_DWORD_HOOK_OFF);
+	CHECK(gs_dword_hook_decide(l_mixed, 3, 0, 0) == GS_DWORD_HOOK_OFF);
+	/* A listed GB202 with either option: the hook. */
+	CHECK(gs_dword_hook_decide(l_gb202, 1, 1, 0) == GS_DWORD_HOOK_ON);
+	CHECK(gs_dword_hook_decide(l_gb202, 1, 0, 1) == GS_DWORD_HOOK_ON);
+	CHECK(gs_dword_hook_decide(l_gb202, 1, 1, 1) == GS_DWORD_HOOK_ON);
+	/* GB203: the TotalVFs dword only, so experimental_vfs yes; twin_id is an error. */
+	CHECK(gs_dword_hook_decide(l_gb203, 1, 0, 1) == GS_DWORD_HOOK_ON);
+	CHECK(gs_dword_hook_decide(l_gb203, 1, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
+	CHECK(gs_dword_hook_decide(l_gb203, 1, 1, 1) == GS_DWORD_HOOK_NO_TWIN_PF);
+	/* Ada and Ampere: no hook (the driver reads a BAR0 mirror, or the count is not raised). */
+	CHECK(gs_dword_hook_decide(l_ada, 1, 0, 1) == GS_DWORD_HOOK_OFF);
+	CHECK(gs_dword_hook_decide(l_amp, 1, 0, 1) == GS_DWORD_HOOK_OFF);
+	CHECK(gs_dword_hook_decide(l_ada, 1, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
+	CHECK(gs_dword_hook_decide(l_amp, 1, 1, 1) == GS_DWORD_HOOK_NO_TWIN_PF);
+	/* One twin PF among others is enough for twin_id. */
+	CHECK(gs_dword_hook_decide(l_mixed, 3, 1, 0) == GS_DWORD_HOOK_ON);
+	CHECK(gs_dword_hook_decide(l_noTwin, 2, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
+	CHECK(gs_dword_hook_decide(l_noTwin, 2, 0, 1) == GS_DWORD_HOOK_ON);
+	/* An empty list needs nothing, except that twin_id has nothing to act on. */
+	CHECK(gs_dword_hook_decide(l_gb202, 0, 0, 1) == GS_DWORD_HOOK_OFF);
+	CHECK(gs_dword_hook_decide(l_gb202, 0, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
+}
+
+/* twin_id refusal reasons per listed PF, and the text a user sees. */
+static void test_twin_refusal(void)
+{
+	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
+	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
+	const struct gs_device *ada = gs_device_lookup(0x2783);
+	int hotplug, bound;
+
+	CHECK(gb202 && gb203 && ada);
+	if (!gb202 || !gb203 || !ada)
+		return;
+
+	/* GB202 with twin_id: refused behind a hotplug port, or with a bound driver. */
+	CHECK(gs_twin_id_refusal(gb202, 1, 0, 0) == GS_TWIN_OK);
+	CHECK(gs_twin_id_refusal(gb202, 1, 1, 0) == GS_TWIN_HOTPLUG_PORT);
+	CHECK(gs_twin_id_refusal(gb202, 1, 0, 1) == GS_TWIN_DRIVER_BOUND);
+	/* Both at once: the port is reported first. */
+	CHECK(gs_twin_id_refusal(gb202, 1, 1, 1) == GS_TWIN_HOTPLUG_PORT);
+	/* Without twin_id, or on a card without twin dwords, nothing is refused. */
+	for (hotplug = 0; hotplug <= 1; hotplug++)
+		for (bound = 0; bound <= 1; bound++) {
+			CHECK(gs_twin_id_refusal(gb202, 0, hotplug, bound) == GS_TWIN_OK);
+			CHECK(gs_twin_id_refusal(gb203, 1, hotplug, bound) == GS_TWIN_OK);
+			CHECK(gs_twin_id_refusal(ada, 1, hotplug, bound) == GS_TWIN_OK);
+		}
+
+	/* The refusal texts docs quote. */
+	CHECK(strcmp(gs_twin_refusal_text(GS_TWIN_HOTPLUG_PORT),
+		     "twin_id refused: the GPU is behind a hotplug-capable port") == 0);
+	CHECK(strcmp(gs_twin_refusal_text(GS_TWIN_DRIVER_BOUND),
+		     "twin_id refused: nvidia (or another driver) is bound to the GPU") == 0);
+	CHECK(gs_twin_refusal_text(GS_TWIN_OK)[0] == '\0');
+}
+
 int main(void)
 {
 	test_constants();
@@ -641,6 +938,13 @@ int main(void)
 	test_vf_geometry();
 	test_vf_setup_check();
 	test_vf_geometry_states();
+	test_default_vf_count();
+	test_twin_and_dword_flags();
+	test_vf_dword();
+	test_twin_id_dword();
+	test_dword_offsets();
+	test_dword_hook_decision();
+	test_twin_refusal();
 
 	if (failures) {
 		fprintf(stderr, "test_devices: %d of %d checks failed\n",

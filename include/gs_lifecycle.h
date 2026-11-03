@@ -85,7 +85,8 @@ struct gs_config {
 	unsigned int nrelease;
 	int ari;                 /* default on */
 	int msix;                /* default on */
-	int experimental_vfs;    /* default on */
+	int experimental_vfs;    /* default off */
+	int twin_id;             /* default off */
 	unsigned int vfs;        /* VFs per card, 1..GS_VFS_MAX; 0: not set, GS_DEFAULT_VFS applies */
 	int identity;            /* hook only, default off */
 	int identity_force_host; /* hook only, default off */
@@ -268,7 +269,7 @@ extern const struct gs_host gs_host_live;
 
 /* Mutating commands: live system only. */
 struct gs_overrides {
-	int ari, msix, experimental_vfs; /* GS_SW_* */
+	int ari, msix, experimental_vfs, twin_id; /* GS_SW_* */
 };
 struct gs_prepare_opts {
 	int boot; /* run by the boot unit: with boot_display_release set, defer and change nothing */
@@ -299,6 +300,10 @@ int gs_cmd_uninstall(int unload);
 	"Console release: the Linux console on that GPU stays detached until the next boot (the kernel\n" \
 	"switches to a dummy console; the monitor may keep the last frame or lose signal). Logs continue\n" \
 	"in the journal and over SSH; starting and stopping guests does not touch the display."
+
+/* What the experimental_vfs and twin_id switches do, wherever an option is described. */
+#define GS_EXPVFS_OPT_MSG "experimental_vfs (default off): " GS_EXPVFS_BODY
+#define GS_TWIN_ID_OPT_MSG "twin_id (default off): " GS_TWIN_ID_BODY
 
 /* Utilities shared by the command implementations. */
 int gs_read_attr(const char *path, char *buf, size_t len);

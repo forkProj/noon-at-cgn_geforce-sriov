@@ -160,7 +160,8 @@ card's hardware default, and `enable` enables every VF the card presents. The de
 reason is ARI: it is enabled in software (the module presents the card's ARI capability and turns on
 ARI forwarding in the bridge directly above the card, on the measured host a CPU root port), but ARI
 decoding in the GPU hardware does not work for now. The default may change if ARI decoding is made
-to work.
+to work. On Ada and Blackwell the default is the card's own count, 1
+([details](docs/devices.md#ada-and-blackwell)).
 
 **SR-IOV virtual functions, not the legacy mdev split.** NVIDIA's documentation distinguishes two
 kinds of vGPU on Linux KVM
@@ -279,6 +280,9 @@ hosts and are experimental only. Other projects with similar goals, and what eac
   RTX 5090 attempt on driver 595.58.03. It reports that the host-side steps work and that the GPU
   firmware then stops on registers that are missing on consumer silicon. Not verified by
   geforce-sriov.
+
+How these two reports relate to geforce-sriov is described in
+[docs/devices.md](docs/devices.md#third-party-reports).
 
 ## License
 

@@ -18,8 +18,9 @@ copy is installed as `/usr/local/share/geforce-sriov/config.example`
 | `boot_display_release` | addresses, each also in `bdfs` | none | Boot display cards whose console `prepare --release-console` may release; the boot unit then defers ([The boot display GPU](boot-display.md)) |
 | `ari` | `on`/`off` | `on` | Enable ARI in software: reveal the card's hidden ARI capability and turn on ARI forwarding in the bridge above it. ARI decoding in the GPU hardware does not work for now, which is why `vfs` defaults to 4 either way. `pci=noari` on the kernel command line forces it off |
 | `msix` | `on`/`off` | `on` | Reveal the card's MSI-X interrupts (Ampere) |
-| `experimental_vfs` | `on`/`off` | `on` | Ada/Blackwell only: where the card reports 1 VF, present up to 4 (`vfs`) (not verified end to end); `off` keeps 1 |
-| `vfs` | 1 up to the card's hardware default (`geforce-sriov devices` lists it) | `4` | VFs presented per selected card; `install --vfs N` writes it. The default is 4 because ARI decoding in the GPU hardware does not work for now |
+| `experimental_vfs` | `on`/`off` | `off` | Ada/Blackwell only, untested: where the card reports 1 VF, present up to `vfs` (at most 4); `off` presents the card's own 1 VF. On Blackwell the raised count also reaches NVIDIA's driver, and the GPU firmware may still refuse more than 1 VF; on Ada the driver still sees 1 ([Ada and Blackwell](devices.md#ada-and-blackwell)) |
+| `twin_id` | `on`/`off` | `off` | RTX 5090 (`10de:2b85`) only, experimental and untested: show NVIDIA's driver the RTX PRO 6000 Blackwell Server Edition ID when it starts the GPU. It may make the GPU firmware fail to start ([twin_id](devices.md#twin_id-rtx-5090-only)). `doctor` fails and `prepare` refuses when no selected card is an RTX 5090; on other cards it has no effect |
+| `vfs` | 1 up to the card's hardware default (`geforce-sriov devices` lists it) | `4` | VFs presented per selected card; `install --vfs N` writes it. The default is 4 because ARI decoding in the GPU hardware does not work for now. Ada and Blackwell present 1 unless `experimental_vfs=on` |
 | `identity` | `on`/`off` | `off` (install sets `on`) | Let the hook present the selected cards as their professional counterpart |
 | `identity_force_host` | `on`/`off` | `off` (install sets `on`) | Hook also reports vGPU host mode for the selected cards |
 | `sriov_manage` | absolute path | `/usr/lib/nvidia/sriov-manage` | NVIDIA's VF tool used by `enable` |
@@ -40,7 +41,7 @@ Which switch to turn off for which symptom is listed in
 | `geforce-sriov devices` | no | Print the device table |
 | `geforce-sriov doctor [--device BDF]...` | no | Checks the host and cards and shows what `prepare` would do; changes nothing |
 | `geforce-sriov status [--device BDF]...` | no | State of each selected card and the next step; exit 1 until all are ready |
-| `geforce-sriov install --device BDF... [--boot-display-release BDF] [--vfs N] [--prefix PATH] [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off]` | yes | Install, select cards, set the VF count, enable the boot unit |
+| `geforce-sriov install --device BDF... [--boot-display-release BDF] [--vfs N] [--prefix PATH] [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off] [--twin-id=on\|off]` | yes | Install, select cards, set the VF count, enable the boot unit |
 | `geforce-sriov prepare [--release-console=BDF]...` | yes | Prepare the selected cards now (normally the boot unit does this) |
 | `geforce-sriov prepare --clear-guard` | yes | Clear the guard of an unfinished preparation, only after a power cycle |
 | `geforce-sriov enable` | yes | Create the VFs with `sriov-manage` |
@@ -74,7 +75,8 @@ and with `vfs=N` when the file sets a VF count. They are read-only once the modu
 | `vfs` | 1–16 | `4` | VFs presented per listed card, at most the card's hardware TotalVFs. ARI decoding in the GPU does not work for now, so more than 4 VFs are expected not to work (the module refuses to load if the card's VF layout check fails). Set from the config key `vfs` |
 | `ari` | `0`/`1` | `1` | Present the card's hidden ARI capability and enable ARI forwarding on its upstream bridge. The kernel's `pci=noari` is not visible to the module; `prepare` passes `ari=0` with it. Set from the config key `ari` |
 | `msix` | `0`/`1` | `1` | At load, relink the card's hidden MSI-X capability where its hide register is known (Ampere). Set from the config key `msix` |
-| `experimental_vfs` | `0`/`1` | `1` | Experimental: on Ada/Blackwell, where the card reports 1 VF, present up to `vfs` (at most 4; not verified end to end). Set from the config key `experimental_vfs` |
+| `experimental_vfs` | `0`/`1` | `0` | Experimental, untested: on Ada/Blackwell, where the card reports 1 VF, present up to `vfs` (at most 4) instead of 1; 0 stays 0. On Blackwell NVIDIA's driver also sees the raised count, and the GPU firmware may still refuse more than 1 VF; on Ada only Linux sees it. Set from the config key `experimental_vfs` |
+| `twin_id` | `0`/`1` | `0` | Experimental, untested: answer in-kernel 32-bit reads of config dwords `0x00` and `0x2C` of the listed RTX 5090 cards with the vGPU target's ID and subsystem. It may make the GPU firmware fail to start. Refused when none of the listed cards is an RTX 5090, or when a listed RTX 5090 is behind a hotplug-capable port or has a driver bound; on other listed cards it has no effect. Set from the config key `twin_id` |
 
 What the module does with each parameter, and when it refuses to load, is described in
 [technical-reference.md](technical-reference.md#the-kernel-module).

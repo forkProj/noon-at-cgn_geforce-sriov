@@ -45,6 +45,12 @@ static const char *const recovery_msg =
 #define CONSENT_NEXT "Next, after boot, as root: `geforce-sriov doctor`, then `geforce-sriov prepare %s`"
 /* What may fix an unassigned BAR; prepare never resizes the bridge windows above the card. */
 #define BAR_REMEDY "enabling Above 4G decoding in the firmware or booting with pci=realloc may help"
+/* Doctor's note for every selected Blackwell card. */
+#define BLACKWELL_DRIVER_NOTE \
+	"the closed 580.159.01 driver does not support this GPU; Blackwell needs NVIDIA's open kernel module, " \
+	"which geforce-sriov does not support yet"
+/* The module refuses to load with twin_id=1 when no listed PF has twin dwords. */
+#define TWIN_ID_NONE "twin_id=on, but no selected GPU is a GB202, so the module refuses to load"
 
 static int cmdline_noari(const char *procroot);
 static const struct gs_display *granted_display(const struct gs_config *cfg, const char *sys, const char *proc,
@@ -60,8 +66,8 @@ int gs_cmd_devices(void)
 {
 	unsigned int i;
 
-	printf("geforce-sriov %s device table (exact IDs only; %u VFs per GPU by default)\n", GS_VERSION,
-	       GS_DEFAULT_VFS);
+	printf("geforce-sriov %s device table (exact IDs only; %u VFs per GPU by default, Ada/Blackwell 1)\n",
+	       GS_VERSION, GS_DEFAULT_VFS);
 	printf("%-9s %-10s %-7s %-40s %-11s %-6s %s\n", "DEVICE", "GEN", "DIE", "NAME", "VGPU TARGET", "HW VFS",
 	       "STATUS");
 	for (i = 0; i < GS_DEVICE_COUNT; i++) {
@@ -73,13 +79,14 @@ int gs_cmd_devices(void)
 		       e->same_die ? "" : "; cross-die target");
 	}
 	printf("\nVGPU TARGET: the professional PCI device ID presented to nvidia-vgpud for that card.\n");
-	printf("HW VFS: the card's hardware default TotalVFs. geforce-sriov presents %u by default; `install --vfs N`\n"
-	       "(vfs=N in the config) sets 1 up to that value. ARI decoding in the GPU does not work for now, so\n"
-	       "more than %u VFs are expected not to work.\n", GS_DEFAULT_VFS, GS_DEFAULT_VFS);
+	printf("HW VFS: the card's hardware default TotalVFs. geforce-sriov presents %u by default (Ada/Blackwell: 1,\n"
+	       "see experimental_vfs); `install --vfs N` (vfs=N in the config) sets 1 up to that value. ARI decoding\n"
+	       "in the GPU does not work for now, so more than %u VFs are expected not to work.\n", GS_DEFAULT_VFS,
+	       GS_DEFAULT_VFS);
 	printf("experimental: this device ID is not verified end to end.\n");
 	printf("Cross-die entries: %s\n", GS_NO_SAME_DIE_MSG);
-	printf("experimental_vfs=on (default): on Ada/Blackwell, where the card reports 1 VF, present up to %u\n"
-	       "(not verified end to end); off keeps 1.\n", GS_DEFAULT_VFS);
+	printf("%s\n", GS_EXPVFS_OPT_MSG);
+	printf("%s\n", GS_TWIN_ID_OPT_MSG);
 	printf("Turing, laptop and professional IDs are excluded. Exposing a capability is not a working vGPU.\n");
 	return GS_EXIT_OK;
 }
@@ -88,7 +95,7 @@ int gs_cmd_devices(void)
 
 struct module_state {
 	int loaded;
-	char ari[8], msix[8], expvfs[8], vfs[8], bdfs[256];
+	char ari[8], msix[8], expvfs[8], twinid[8], vfs[8], bdfs[256];
 	int lp_present;
 	unsigned int lp_enabled, lp_transition;
 	int lp_ok;
@@ -107,6 +114,8 @@ static void read_module_state(const char *sysroot, struct module_state *m)
 		gs_read_attr(p, m->msix, sizeof(m->msix));
 	if (!gs_pathf(p, sizeof(p), "%s/module/%s/parameters/experimental_vfs", sysroot, GS_MODULE_NAME))
 		gs_read_attr(p, m->expvfs, sizeof(m->expvfs));
+	if (!gs_pathf(p, sizeof(p), "%s/module/%s/parameters/twin_id", sysroot, GS_MODULE_NAME))
+		gs_read_attr(p, m->twinid, sizeof(m->twinid));
 	if (!gs_pathf(p, sizeof(p), "%s/module/%s/parameters/vfs", sysroot, GS_MODULE_NAME))
 		gs_read_attr(p, m->vfs, sizeof(m->vfs));
 	if (!gs_pathf(p, sizeof(p), "%s/module/%s/parameters/bdfs", sysroot, GS_MODULE_NAME))
@@ -502,7 +511,7 @@ static void print_indented(const char *indent, const char *text)
 
 /*
  * What the device table says about the card: experimental rows and the VF override are warnings; a
- * VF count above what the card offers fails (prepare refuses it).
+ * VF count above what the card offers fails (prepare refuses it). Blackwell gets the driver note.
  */
 static void entry_checks(struct tally *t, const struct gs_card *c, const struct gs_config *cfg)
 {
@@ -525,14 +534,33 @@ static void entry_checks(struct tally *t, const struct gs_card *c, const struct 
 		check(t, "WARN", "%s: %s", c->pf.str, why);
 		break;
 	}
-	if (e->generation == GS_ADA || e->generation == GS_BLACKWELL) {
-		if (cfg->experimental_vfs != GS_SW_OFF)
-			check(t, "WARN", "%s: experimental_vfs=on: the card reports 1 VF, geforce-sriov presents up to %u (not verified end to end); off keeps 1",
-			      c->pf.str, gs_vf_limit(e, 1, 1, gs_config_vfs(cfg)));
+	if (gs_expvfs_msg(e)) {
+		if (cfg->experimental_vfs == GS_SW_ON)
+			check(t, "WARN", "%s: experimental_vfs=on: geforce-sriov presents up to %u VFs. %s Off keeps 1",
+			      c->pf.str, gs_vf_limit(e, 1, 1, gs_config_vfs(cfg)), gs_expvfs_msg(e));
 		else
-			check(t, "INFO", "%s: experimental_vfs=off: the hardware VF count is kept (at most %u)", c->pf.str,
-			      gs_config_vfs(cfg));
+			check(t, "INFO", "%s: experimental_vfs=off: the card presents its hardware count, %u VF",
+			      c->pf.str, e->totalvfs);
 	}
+	if (e->generation == GS_BLACKWELL)
+		check(t, "INFO", "%s: " BLACKWELL_DRIVER_NOTE, c->pf.str);
+	if (cfg->twin_id == GS_SW_ON && gs_has_twin_dwords(e))
+		check(t, "WARN", "%s: twin_id=on: %s", c->pf.str, GS_TWIN_ID_MSG);
+	else if (cfg->twin_id == GS_SW_ON)
+		check(t, "INFO", "%s: twin_id=on: %s", c->pf.str, GS_TWIN_ID_ONLY_MSG);
+}
+
+/* 1 when a selected card is in the device table with twin dwords (twin_id acts on it). */
+static int selection_has_twin(const char *sysroot, const struct gs_addr *sel, unsigned int n)
+{
+	for (unsigned int i = 0; i < n; i++) {
+		struct gs_card c;
+
+		gs_card_inspect(sysroot, &sel[i], &c);
+		if (c.present && c.entry && gs_has_twin_dwords(c.entry))
+			return 1;
+	}
+	return 0;
 }
 
 /* Enabled VFs (virtfn0..numvfs-1) whose IOMMU group is the PF's; the first goes to first. */
@@ -749,9 +777,9 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 	} else if (!cfg.present) {
 		check(&t, "INFO", "config: %s absent; defaults apply and no device is selected", cfg_path);
 	} else {
-		check(&t, "OK", "config: %s: %u device(s) selected; ari=%s msix=%s experimental_vfs=%s vfs=%u%s identity=%s",
-		      cfg_path, cfg.nbdfs, sw(cfg.ari), sw(cfg.msix), sw(cfg.experimental_vfs), gs_config_vfs(&cfg),
-		      cfg.vfs ? "" : " (default)", cfg.identity == GS_SW_ON ? "on" : "off");
+		check(&t, "OK", "config: %s: %u device(s) selected; ari=%s msix=%s experimental_vfs=%s twin_id=%s vfs=%u%s identity=%s",
+		      cfg_path, cfg.nbdfs, sw(cfg.ari), sw(cfg.msix), sw(cfg.experimental_vfs), sw(cfg.twin_id),
+		      gs_config_vfs(&cfg), cfg.vfs ? "" : " (default)", cfg.identity == GS_SW_ON ? "on" : "off");
 		if (live && config_file_safe(cfg_path, err, sizeof(err)))
 			check(&t, "FAIL", "config: %s; prepare and enable refuse it", err);
 		if (cfg.nrelease) {
@@ -803,8 +831,9 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 		check(&t, "INFO", "module %s not loaded (prepare loads it)", GS_MODULE_NAME);
 	else
 		check(&t, m.lp_ok ? "OK" : "WARN",
-		      "module %s loaded: ari=%s msix=%s experimental_vfs=%s vfs=%s bdfs=%s; livepatch %s", GS_MODULE_NAME,
-		      m.ari, m.msix, m.expvfs, m.vfs[0] ? m.vfs : "(none)", m.bdfs[0] ? m.bdfs : "(none)",
+		      "module %s loaded: ari=%s msix=%s experimental_vfs=%s twin_id=%s vfs=%s bdfs=%s; livepatch %s",
+		      GS_MODULE_NAME, m.ari, m.msix, m.expvfs, m.twinid, m.vfs[0] ? m.vfs : "(none)",
+		      m.bdfs[0] ? m.bdfs : "(none)",
 		      !m.lp_present ? "directory missing" : m.lp_ok ? "enabled, transition complete" :
 		      "not enabled or still in transition");
 	if (m.loaded && module_vfs(&m) != gs_config_vfs(&cfg))
@@ -1014,6 +1043,8 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 			check(&t, "FAIL", "%s", plan.reason);
 		}
 	}
+	if (cfg.twin_id == GS_SW_ON && n && !selection_has_twin(sysroot, devs, n))
+		check(&t, "FAIL", TWIN_ID_NONE "; prepare refuses it. %s", GS_TWIN_ID_ONLY_MSG);
 	if (nisel && !id_on) {
 		check(&t, "INFO", "identity: off (%s): the hook passes every call through, so nvidia-vgpud sees the GeForce IDs and registers no vGPU types for them",
 		      isrc);
@@ -1120,9 +1151,9 @@ int gs_cmd_status(const struct gs_diag_opts *o)
 	read_module_state(sysroot, &m);
 	printf("module %s: %s", GS_MODULE_NAME, m.loaded ? "loaded" : "not loaded");
 	if (m.loaded)
-		printf(" (ari=%s msix=%s experimental_vfs=%s vfs=%s bdfs=%s; livepatch enabled=%u transition=%u)", m.ari,
-		       m.msix, m.expvfs, m.vfs[0] ? m.vfs : "(none)", m.bdfs[0] ? m.bdfs : "(none)", m.lp_enabled,
-		       m.lp_transition);
+		printf(" (ari=%s msix=%s experimental_vfs=%s twin_id=%s vfs=%s bdfs=%s; livepatch enabled=%u transition=%u)",
+		       m.ari, m.msix, m.expvfs, m.twinid, m.vfs[0] ? m.vfs : "(none)", m.bdfs[0] ? m.bdfs : "(none)",
+		       m.lp_enabled, m.lp_transition);
 	putchar('\n');
 	if (live) {
 		printf("guard: %s\n", gs_exists(GS_ATTEMPT_MARKER) ?
@@ -1427,28 +1458,30 @@ static const char *yn(int v)
 static int load_module(const struct gs_host *h, const struct gs_config *cfg, const char *bdfs)
 {
 	struct module_state m;
-	char a[16], x[16], e[32], v[16], b[256];
+	char a[16], x[16], e[32], tw[16], v[16], b[256];
 	int r;
 
 	read_module_state(h->sys, &m);
 	if (m.loaded) {
 		if (strcmp(m.ari, yn(cfg->ari)) || strcmp(m.msix, yn(cfg->msix)) ||
-		    strcmp(m.expvfs, yn(cfg->experimental_vfs)) || module_vfs(&m) != gs_config_vfs(cfg) ||
-		    strcmp(m.bdfs, bdfs)) {
+		    strcmp(m.expvfs, yn(cfg->experimental_vfs)) || strcmp(m.twinid, yn(cfg->twin_id)) ||
+		    module_vfs(&m) != gs_config_vfs(cfg) || strcmp(m.bdfs, bdfs)) {
 			fprintf(stderr,
-				"geforce-sriov: %s is already loaded with ari=%s msix=%s experimental_vfs=%s vfs=%u bdfs=%s, not the requested ari=%s msix=%s experimental_vfs=%s vfs=%u bdfs=%s; reboot to change them\n",
-				GS_MODULE_NAME, m.ari, m.msix, m.expvfs, module_vfs(&m), m.bdfs, yn(cfg->ari), yn(cfg->msix),
-				yn(cfg->experimental_vfs), gs_config_vfs(cfg), bdfs);
+				"geforce-sriov: %s is already loaded with ari=%s msix=%s experimental_vfs=%s twin_id=%s vfs=%u bdfs=%s, not the requested ari=%s msix=%s experimental_vfs=%s twin_id=%s vfs=%u bdfs=%s; reboot to change them\n",
+				GS_MODULE_NAME, m.ari, m.msix, m.expvfs, m.twinid, module_vfs(&m), m.bdfs, yn(cfg->ari),
+				yn(cfg->msix), yn(cfg->experimental_vfs), yn(cfg->twin_id), gs_config_vfs(cfg), bdfs);
 			return GS_EXIT_REFUSED;
 		}
 		printf("%s already loaded with the requested parameters\n", GS_MODULE_NAME);
 	} else {
 		/* vfs=N only when the config sets it; the module's default is GS_DEFAULT_VFS. */
-		const char *argv[] = { "modprobe", GS_MODULE_NAME, a, x, e, cfg->vfs ? v : b, cfg->vfs ? b : NULL, NULL };
+		const char *argv[] = { "modprobe", GS_MODULE_NAME, a, x, e, tw, cfg->vfs ? v : b, cfg->vfs ? b : NULL,
+				       NULL };
 
 		snprintf(a, sizeof(a), "ari=%d", cfg->ari == GS_SW_OFF ? 0 : 1);
 		snprintf(x, sizeof(x), "msix=%d", cfg->msix == GS_SW_OFF ? 0 : 1);
 		snprintf(e, sizeof(e), "experimental_vfs=%d", cfg->experimental_vfs == GS_SW_OFF ? 0 : 1);
+		snprintf(tw, sizeof(tw), "twin_id=%d", cfg->twin_id == GS_SW_OFF ? 0 : 1);
 		snprintf(v, sizeof(v), "vfs=%u", cfg->vfs);
 		if (gs_pathf(b, sizeof(b), "bdfs=%s", bdfs))
 			return GS_EXIT_FAIL;
@@ -1941,6 +1974,10 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 		fprintf(stderr, "geforce-sriov: the kernel has no livepatch support (CONFIG_LIVEPATCH)\n");
 		return GS_EXIT_REFUSED;
 	}
+	if (cfg->twin_id == GS_SW_ON && !selection_has_twin(h->sys, cfg->bdfs, cfg->nbdfs)) {
+		fprintf(stderr, "geforce-sriov: refused, nothing changed: " TWIN_ID_NONE ". %s\n", GS_TWIN_ID_ONLY_MSG);
+		return GS_EXIT_REFUSED;
+	}
 	cons = calloc(GS_CFG_MAX_BDFS, sizeof(*cons));
 	if (!cons)
 		return GS_EXIT_FAIL;
@@ -2081,6 +2118,8 @@ int gs_cmd_prepare(const struct gs_overrides *ov, const struct gs_prepare_opts *
 		cfg.msix = ov->msix;
 	if (ov->experimental_vfs != GS_SW_UNSET)
 		cfg.experimental_vfs = ov->experimental_vfs;
+	if (ov->twin_id != GS_SW_UNSET)
+		cfg.twin_id = ov->twin_id;
 	return gs_prepare(&gs_host_live, &cfg, po);
 }
 

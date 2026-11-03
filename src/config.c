@@ -107,7 +107,8 @@ void gs_config_defaults(struct gs_config *cfg)
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->ari = GS_SW_ON;
 	cfg->msix = GS_SW_ON;
-	cfg->experimental_vfs = GS_SW_ON;
+	cfg->experimental_vfs = GS_SW_OFF;
+	cfg->twin_id = GS_SW_OFF;
 	cfg->identity = GS_SW_OFF;
 	cfg->identity_force_host = GS_SW_OFF;
 	snprintf(cfg->sriov_manage, sizeof(cfg->sriov_manage), "%s", GS_SRIOV_MANAGE_DEFAULT);
@@ -138,7 +139,7 @@ int gs_parse_vfs(const char *value, unsigned int *out)
 
 int gs_vfs_check(const struct gs_device *e, const struct gs_config *cfg, char *why, size_t len)
 {
-	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs, cfg->experimental_vfs != GS_SW_OFF);
+	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs, cfg->experimental_vfs == GS_SW_ON);
 	unsigned int vfs = gs_config_vfs(cfg);
 
 	if (cfg->vfs && cfg->vfs > ceiling) {
@@ -160,7 +161,7 @@ int gs_vfs_check(const struct gs_device *e, const struct gs_config *cfg, char *w
 
 void gs_vfs_describe(const struct gs_device *e, const struct gs_config *cfg, char *buf, size_t len)
 {
-	int exp = cfg->experimental_vfs != GS_SW_OFF;
+	int exp = cfg->experimental_vfs == GS_SW_ON;
 	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs, exp);
 	char how[32];
 
@@ -188,10 +189,10 @@ static int valid_key(const char *k, size_t n)
 	return 1;
 }
 
-enum { K_BDFS, K_RELEASE, K_ARI, K_MSIX, K_EXPVFS, K_VFS, K_IDENTITY, K_FORCE_HOST, K_SRIOV_MANAGE, K_COUNT };
+enum { K_BDFS, K_RELEASE, K_ARI, K_MSIX, K_EXPVFS, K_TWIN_ID, K_VFS, K_IDENTITY, K_FORCE_HOST, K_SRIOV_MANAGE, K_COUNT };
 static const char *const keys[K_COUNT] = {
-	"bdfs", "boot_display_release", "ari", "msix", "experimental_vfs", "vfs", "identity", "identity_force_host",
-	"sriov_manage",
+	"bdfs", "boot_display_release", "ari", "msix", "experimental_vfs", "twin_id", "vfs", "identity",
+	"identity_force_host", "sriov_manage",
 };
 
 int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *err, size_t errlen)
@@ -282,10 +283,11 @@ int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *e
 		case K_ARI:
 		case K_MSIX:
 		case K_EXPVFS:
+		case K_TWIN_ID:
 		case K_IDENTITY:
 		case K_FORCE_HOST: {
 			int *dst = k == K_ARI ? &cfg->ari : k == K_MSIX ? &cfg->msix :
-				   k == K_EXPVFS ? &cfg->experimental_vfs :
+				   k == K_EXPVFS ? &cfg->experimental_vfs : k == K_TWIN_ID ? &cfg->twin_id :
 				   k == K_IDENTITY ? &cfg->identity : &cfg->identity_force_host;
 
 			if (gs_parse_switch(value, dst)) {
@@ -394,7 +396,8 @@ int gs_config_render(const struct gs_config *cfg, char *buf, size_t len)
 	}
 	EMIT("ari=%s\n", cfg->ari == GS_SW_OFF ? "off" : "on");
 	EMIT("msix=%s\n", cfg->msix == GS_SW_OFF ? "off" : "on");
-	EMIT("experimental_vfs=%s\n", cfg->experimental_vfs == GS_SW_OFF ? "off" : "on");
+	EMIT("experimental_vfs=%s\n", cfg->experimental_vfs == GS_SW_ON ? "on" : "off");
+	EMIT("twin_id=%s\n", cfg->twin_id == GS_SW_ON ? "on" : "off");
 	if (cfg->vfs)
 		EMIT("vfs=%u\n", cfg->vfs);
 	EMIT("identity=%s\n", cfg->identity == GS_SW_ON ? "on" : "off");

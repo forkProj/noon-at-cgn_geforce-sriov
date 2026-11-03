@@ -5,7 +5,7 @@
 | **PF** (physical function) | The card itself as the PCI bus sees it, for example `0000:03:00.0` |
 | **BDF** | A PCI address in the form `domain:bus:device.function`, as in `/sys/bus/pci/devices` |
 | **SR-IOV** | A PCIe feature that lets one device appear as several lightweight devices |
-| **VF** (virtual function) | One of those lightweight devices; each can back one vGPU. geforce-sriov presents 4 per card by default (`vfs`), because ARI decoding in the GPU hardware does not work yet |
+| **VF** (virtual function) | One of those lightweight devices; each can back one vGPU. geforce-sriov presents 4 per card by default (`vfs`), because ARI decoding in the GPU hardware does not work yet, and on Ada and Blackwell the card's own 1 ([Ada and Blackwell](devices.md#ada-and-blackwell)) |
 | **ARI** | A PCIe addressing extension that allows more functions per device. The module enables it in software: it reveals the card's hidden ARI and turns on ARI forwarding in the bridge above it (`ari=on`). ARI decoding in the GPU hardware does not work for now |
 | **MSI-X** | A way for a device to send interrupts. The module reveals the card's hidden MSI-X on Ampere (`msix=on`) |
 | **vGPU** | NVIDIA's software that gives each VM a slice of one GPU, with a fixed memory size per type |
@@ -14,3 +14,5 @@
 | **Livepatch** | A kernel feature that changes a running kernel's functions without a reboot; used here only for the listed cards |
 | **DKMS** | Rebuilds out-of-tree kernel modules automatically for each new kernel |
 | **Boot display** | The card the firmware uses for the boot screen (`boot_vga` is `1` in sysfs); see [The boot display GPU](boot-display.md) |
+| **GSP** | The GPU System Processor, a processor on the GPU that runs part of NVIDIA's driver as firmware. NVIDIA's vGPU host driver uses it on Ada and Blackwell, not on Ampere |
+| **Driver flavour** | NVIDIA's Linux kernel module comes as a proprietary and an open flavour; see [NVIDIA driver flavour](devices.md#nvidia-driver-flavour) |

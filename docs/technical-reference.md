@@ -15,9 +15,10 @@ these generations contain SR-IOV, the PCIe feature that lets one card appear as 
 devices. The card's configuration space leaves it out of the list the kernel reads, so Linux never
 sees it. The `geforce_sriov` module is a *livepatch*: a small change to the running kernel, built
 by DKMS, that applies **only to the cards you list**. It makes the kernel find SR-IOV at its hidden
-position and reports 4 virtual functions by default (the count is configurable:
-[configuration.md](configuration.md#configuration-file)). With the defaults it also reveals two
-related features, ARI and (on Ampere) MSI-X; see the [Glossary](glossary.md).
+position and reports 4 virtual functions by default on Ampere, and the card's own 1 on Ada and
+Blackwell (the count is configurable: [configuration.md](configuration.md#configuration-file)).
+With the defaults it also reveals two related features, ARI and (on Ampere) MSI-X; see the
+[Glossary](glossary.md).
 
 **2. The card is re-read before NVIDIA's driver binds it.** The kernel reads every PCI device
 once at boot, before any module loads. So after loading the module, the boot unit removes the
@@ -65,8 +66,21 @@ What the module does, for the PCI functions listed in its required `bdfs` parame
 - returns the hidden SR-IOV capability (Ampere, Ada: config offset `0xBCC`) from
   `pci_find_ext_capability()`; Blackwell's natively linked capability at `0x250` is used as is;
 - reports TotalVFs/InitialVFs to the kernel as the `vfs` parameter (1–16, default **4**; see the ARI
-  item below), never more than the card's hardware TotalVFs; on Ada and Blackwell a hardware value
-  of exactly 1 is shown as `vfs` (at most 4) when `experimental_vfs=1`;
+  item below), never more than the card's hardware TotalVFs. On Ada and Blackwell the hardware
+  value, 1, is kept by default; with `experimental_vfs=1` a hardware value of exactly 1 is shown as
+  `vfs` (at most 4). These are 16-bit reads by the kernel's SR-IOV code; NVIDIA's driver does not
+  use them (next item);
+- replaces `pci_read_config_dword()` as well, only when `twin_id=1` or when `experimental_vfs=1`
+  lists a Blackwell card. NVIDIA's driver reads TotalVFs, the device ID and the subsystem of
+  Blackwell cards with 32-bit config reads. With `experimental_vfs=1`, the InitialVFs/TotalVFs dword
+  of a listed Blackwell card (SR-IOV position + `0x0C`, so `0x25C`) returns the same counts as the
+  16-bit reads. With `twin_id=1`, dword `0x00` of a listed RTX 5090 returns `10de:2bb5` while the
+  card reads its own ID, and dword `0x2C` returns subsystem `10de:204e`
+  ([twin_id](devices.md#twin_id-rtx-5090-only)); every in-kernel reader of those two dwords sees
+  the twin ID, user space keeps the real one. Every other device, card and offset, the other
+  SR-IOV dwords included, gets the hardware value. Ada is not covered: its driver reads these
+  values through a BAR0 mirror that no config accessor sees, so on Ada only Linux sees the raised
+  count;
 - with `ari=1` (default), enables ARI in software: presents the hidden ARI capability (`0xC14`, only
   if its Next Function Number field is non-zero) and turns on ARI Forwarding in the GPU's immediate
   upstream bridge when that bridge supports it. ARI decoding in the GPU hardware does not work for
@@ -90,8 +104,10 @@ What the module does, for the PCI functions listed in its required `bdfs` parame
 - validates every listed card before patching anything and refuses to load (nothing patched or
   written) when a listed address is missing or not a table card, the SR-IOV header does not match,
   the hardware TotalVFs is 0, or the VF layout check above fails (kernel log:
-  `first VF offset … ; refusing`). It never removes, rescans, resets or binds a device, and has no
-  device table that could autoload it.
+  `first VF offset … ; refusing`). With `twin_id=1` it also refuses when none of the listed cards
+  is an RTX 5090 (on the others `twin_id` has no effect), and when a listed RTX 5090 is behind a
+  hotplug-capable port or has a driver bound (`twin_id refused: …`). It never removes, rescans,
+  resets or binds a device, and has no device table that could autoload it.
 
 The kernel enumerates PCI devices before any module loads, so the CLI removes and rescans each
 selected card after the livepatch is active, holding the upstream bridge awake throughout (a bridge
@@ -115,6 +131,8 @@ step-by-step sequence is in [manual-method.md](manual-method.md).
   card. The identity hook acts only on 580.159.01, 580.178.05 and 595.91.04; only 580.159.01 has
   been measured. Its systemd units `nvidia-vgpud.service` and `nvidia-vgpu-mgr.service` must be
   installed; `doctor` warns when either unit file is missing from systemd's unit directories.
+  Blackwell needs the open flavour, which geforce-sriov does not support yet, and Ada is untested on
+  either flavour ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)).
 - A selected GPU must be function 0 of its slot, must have a PCI bridge directly above it, must not
   share its PCI bus with another device, must not already present SR-IOV (another livepatch or a
   patched kernel; `prepare` does not stack on it), and must not be bound to a display driver when
@@ -137,10 +155,11 @@ A live install copies the binaries to `--prefix` (default `/usr/local`), the hoo
 drop-in, writes `/etc/geforce-sriov/config` with `bdfs=`, `identity=on` and
 `identity_force_host=on` (and `vfs=N` with `--vfs N`), and **enables** the unit for the next boot.
 It never starts the unit or touches a device. It refuses a `vfs` above a selected card's hardware
-default, and prints a `warning:` for every cross-die or experimental card, for a `vfs` above 4 and
-for Ada/Blackwell cards with `experimental_vfs=on`. Every installed file is recorded with its SHA-256
-in `/var/lib/geforce-sriov/installed-files`; running `install` again leaves a file that is already
-in place with the same content, mode and owner alone and prints `unchanged <path>`.
+default, and prints a `warning:` for every cross-die or experimental card, for a `vfs` above 4, for
+Ada/Blackwell cards with `experimental_vfs=on` and for RTX 5090 cards with `twin_id=on`. Every
+installed file is recorded with its SHA-256 in `/var/lib/geforce-sriov/installed-files`; running
+`install` again leaves a file that is already in place with the same content, mode and owner alone
+and prints `unchanged <path>`.
 
 Install refuses (exit 3) an existing `/etc/geforce-sriov/config` that it did not write (edit that
 file yourself or remove it; see `config.example`) and a `DESTDIR` with a symlink in its path; it
@@ -166,9 +185,9 @@ Staging records `--device` addresses unchecked and checks no devices; `--config`
 | `devices` | Print the device table. |
 | `doctor [--device BDF]... [--sysfs-root PATH] [--config FILE]` | Preflight checks and what `prepare` would do. Read-only. Exit 3 when `prepare` would refuse. |
 | `status [--device BDF]... [--sysfs-root PATH] [--config FILE]` | Module, guard and SR-IOV state of the selected GPUs and the next step. Read-only. Exit 1 while a selected GPU is not ready for `enable` (expected before the first prepared boot). |
-| `install [--prefix PATH] [--device BDF]... [--boot-display-release BDF]... [--destdir PATH] [--source DIR] [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off]` | Install or stage (see above). |
-| `prepare [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off] [--release-console=BDF]...` | Prepare the selected GPUs. Root. `--release-console` names every GPU the config grants a console release ([The boot display GPU](#the-boot-display-gpu)). |
-| `prepare --boot [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off]` | What the boot unit runs: as `prepare`, but with a console-release grant in the config it defers, changes nothing and exits 0. Root. |
+| `install [--prefix PATH] [--device BDF]... [--boot-display-release BDF]... [--vfs N] [--destdir PATH] [--source DIR] [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off] [--twin-id=on\|off]` | Install or stage (see above). |
+| `prepare [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off] [--twin-id=on\|off] [--release-console=BDF]...` | Prepare the selected GPUs. Root. `--release-console` names every GPU the config grants a console release ([The boot display GPU](#the-boot-display-gpu)). |
+| `prepare --boot [--ari=on\|off] [--msix=on\|off] [--experimental-vfs=on\|off] [--twin-id=on\|off]` | What the boot unit runs: as `prepare`, but with a console-release grant in the config it defers, changes nothing and exits 0. Root. |
 | `prepare --clear-guard` | Clear the guard of an unfinished attempt, only after a power cycle. |
 | `enable` | Enable the VFs of every prepared, selected GPU with `sriov-manage`. Root. |
 | `uninstall [--unload]` | Remove only the files the package installed (see [recovery.md](recovery.md)). |
@@ -205,7 +224,9 @@ read that fails partway is refused, never parsed in part. The keys are listed in
 does not run, and the hook passes every call through. A file without `vfs` (every file written
 before the key existed) keeps the default of 4. `doctor` and `prepare` refuse a `vfs` above a
 selected card's hardware default and warn above 4; `doctor` also warns when the loaded module's
-count differs from the file's, which takes effect after the next boot.
+count differs from the file's, which takes effect after the next boot. With `twin_id=on`, `doctor`
+fails and `prepare` refuses (exit 3, nothing changed) when no selected card is an RTX 5090, because
+the module would refuse to load.
 
 ## Multiple GPUs and PCI topology
 
@@ -217,7 +238,7 @@ Up to 8 physical functions can be selected. What the package does in each layout
 | Several selected GPUs | `prepare` checks every selected card before changing anything; one card that fails a check refuses the whole run (exit 3, nothing changed). Cards are then prepared one at a time; a card that fails stops the run. `enable` handles them in config order and stops at the first card that is refused or fails; cards enabled before it keep their VFs | Measured with two identical cards |
 | Some GPUs selected, others not | Unselected GPUs are never prepared, never rewritten by the identity hook and never forced to HOST | Measured with two identical cards, one selected |
 | Identical cards, only some selected (for example a twin of the boot display GPU) | The identity hook tells them apart by PCI address (see [The identity hook](#the-identity-hook)). If the driver does not answer its address queries, it falls back to the device ID only when **every** NVIDIA GPU with that ID is selected; otherwise that ID stays unchanged for all of them and a log line says why | Measured on 580.159.01: the unselected twin was logged as unselected and left unchanged |
-| Different models in one host | Each card uses its own device-table row. All of them run under the **one** installed NVIDIA host driver: that build must support every selected card (driver branch, proprietary or open flavour, GSP). The package does not check this, and the two-byte driver patch exists only for the builds listed in [driver-patch.md](driver-patch.md) | Untested |
+| Different models in one host | Each card uses its own device-table row. All of them run under the **one** installed NVIDIA host driver: that build must support every selected card (driver branch, proprietary or open flavour, GSP). The package does not check the driver; `doctor` only notes for each Blackwell card that it needs NVIDIA's open kernel module, which geforce-sriov does not support yet ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)). The two-byte driver patch exists only for the builds listed in [driver-patch.md](driver-patch.md) | Untested |
 | GPU on a dedicated PCIe switch downstream port | The remove/rescan, the held-awake bridge and ARI Forwarding all use the GPU's **immediate** parent bridge, whichever it is; no root-port assumption is made. The switch's upstream link is shared by every GPU below it, so throughput can differ; the VF count does not | Untested |
 | GPU on a bus shared with an unrelated device | Refused by `install --device`, `doctor` and `prepare`: removing the bus would touch the other device | Refused |
 | The boot display GPU (`boot_vga` 1) | Refused unless the config grants its console release (`--boot-display-release`). With the grant the boot unit defers, and `prepare --release-console=BDF` by hand prepares the whole selection in one pass; see [The boot display GPU](#the-boot-display-gpu) | Measured (manual path) |
@@ -237,7 +258,10 @@ may log `VF BAR … can't assign` messages before it settles; what counts is the
 is unassigned; `prepare` refuses a card whose BAR0 is unassigned, and stops when a card comes back
 from the rescan without the BAR0 it had. Enabling *Above 4G decoding* in the firmware, or booting
 with [`pci=realloc`](https://docs.kernel.org/admin-guide/kernel-parameters.html), may give the
-windows enough room.
+windows enough room. These checks look only at whether a BAR is assigned, not at its size, so the
+larger VF BARs of Blackwell (256 KiB, 256 MiB and 32 MiB per VF in public reports) are not an
+error; they need more window space, and *Resizable BAR* settings can change how much is left
+([Per-VF BARs on Blackwell](devices.md#per-vf-bars-on-blackwell)).
 
 ### IOMMU groups and ACS
 

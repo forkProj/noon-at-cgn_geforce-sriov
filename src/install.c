@@ -464,6 +464,8 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		cfg.msix = o->ov.msix, config_changed = 1;
 	if (o->ov.experimental_vfs != GS_SW_UNSET && o->ov.experimental_vfs != cfg.experimental_vfs)
 		cfg.experimental_vfs = o->ov.experimental_vfs, config_changed = 1;
+	if (o->ov.twin_id != GS_SW_UNSET && o->ov.twin_id != cfg.twin_id)
+		cfg.twin_id = o->ov.twin_id, config_changed = 1;
 	if (o->vfs && o->vfs != cfg.vfs)
 		cfg.vfs = o->vfs, config_changed = 1;
 	if (!cfg_exists)
@@ -490,10 +492,13 @@ int gs_cmd_install(const struct gs_install_opts *o)
 				printf("%s: warning: %s\n", c.pf.str, GS_NO_SAME_DIE_MSG);
 			if (c.entry->experimental)
 				printf("%s: warning: experimental device ID: not verified end to end\n", c.pf.str);
-			if ((c.entry->generation == GS_ADA || c.entry->generation == GS_BLACKWELL) &&
-			    cfg.experimental_vfs != GS_SW_OFF)
-				printf("%s: warning: experimental_vfs=on (default): on Ada/Blackwell, where the card reports 1 VF, present up to %u (not verified end to end); off keeps 1 (--experimental-vfs=off)\n",
-				       c.pf.str, GS_DEFAULT_VFS);
+			if (gs_expvfs_msg(c.entry) && cfg.experimental_vfs == GS_SW_ON)
+				printf("%s: warning: experimental_vfs=on: %s Off keeps 1 VF (--experimental-vfs=off)\n",
+				       c.pf.str, gs_expvfs_msg(c.entry));
+			if (cfg.twin_id == GS_SW_ON && gs_has_twin_dwords(c.entry))
+				printf("%s: warning: twin_id=on: %s Off: --twin-id=off\n", c.pf.str, GS_TWIN_ID_MSG);
+			else if (cfg.twin_id == GS_SW_ON)
+				printf("%s: twin_id=on: %s\n", c.pf.str, GS_TWIN_ID_ONLY_MSG);
 			if (gs_config_grants_release(&cfg, c.pf.str) && c.boot_vga != 1)
 				printf("%s: warning: --boot-display-release names it, but it is not the boot display device now (boot_vga=%d); prepare refuses this card while boot_display_release grants it\n",
 				       c.pf.str, c.boot_vga);
@@ -502,6 +507,10 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		printf("staging: the --device addresses are recorded unchecked (this host's PCI devices are not the target's);\n"
 		       "run `geforce-sriov doctor` on the target host before enabling the boot unit\n");
 	}
+	if (!live && cfg.experimental_vfs == GS_SW_ON)
+		printf("warning: %s\n", GS_EXPVFS_OPT_MSG);
+	if (!live && cfg.twin_id == GS_SW_ON)
+		printf("warning: %s\n", GS_TWIN_ID_OPT_MSG);
 	/* The VF count against every selected card, the existing selection included. */
 	for (unsigned int i = 0; live && i < cfg.nbdfs; i++) {
 		struct gs_card c;
