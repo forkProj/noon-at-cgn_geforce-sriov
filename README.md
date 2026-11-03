@@ -53,9 +53,10 @@ More on the [Showcase page](docs/showcase.md), including
   verified to work. Other versions may work but have not been tested. The matching guest drivers
   are taken from the same release. geforce-sriov does not include, download or provide any of
   them.
-- A card from the device table. Only the memory-modded RTX 3080 20GB (`10de:2206`, subsystem
-  `10de:146d`) has been measured; every other listed card is experimental
-  ([docs/devices.md](docs/devices.md)).
+- A card from the device table. Only Ampere is confirmed to work: the memory-modded RTX 3080 20GB
+  (`10de:2206`, subsystem `10de:146d`) is the one card measured, and every other listed card is
+  experimental ([docs/devices.md](docs/devices.md)). Ada and Blackwell use GSP firmware for vGPU
+  hosts and are experimental only.
 - A Linux host (x86_64, kernel 6.8 or later with livepatch support), kernel headers, DKMS, a C
   compiler, `make` and `pciutils`. The IOMMU must be on.
 - A valid NVIDIA vGPU licence setup of your own for the guests. geforce-sriov does not provide
@@ -251,6 +252,33 @@ collect, what to remove before posting and what happens to a report is in
 | [Identity hook](hook/README.md) | Identity hook internals |
 | [Showcase](docs/showcase.md) | Screenshots of the measured host and of a Linux and a Windows guest using a vGPU; vGPU vs host performance |
 | [Changelog](CHANGELOG.md) | Release notes |
+
+## Related projects
+
+geforce-sriov uses SR-IOV virtual functions instead of mdev (mediated devices), and targets Ampere
+and newer cards. Only Ampere is confirmed to work. Ada and Blackwell use GSP firmware for vGPU
+hosts and are experimental only. Other projects with similar goals, and what each one reports:
+
+- [polloloco/vgpu-proxmox](https://gitlab.com/polloloco/vgpu-proxmox): an install guide and driver
+  patches for NVIDIA vGPU on Proxmox VE, using mdev. It covers consumer Maxwell 2.0 (except the
+  GTX 970), Pascal and Turing cards and says RTX 30xx and 40xx cards will not work. Use it for
+  Turing and older cards, which geforce-sriov does not cover.
+- [DualCoder/vgpu_unlock](https://github.com/DualCoder/vgpu_unlock) and
+  [mbilker/vgpu_unlock-rs](https://github.com/mbilker/vgpu_unlock-rs): the original vGPU unlock for
+  consumer cards, which presents a GeForce card to NVIDIA's vGPU software as a supported professional
+  model. Maxwell to Turing, mdev. The identity hook in geforce-sriov follows the same idea.
+- [Nium32/VGPU-MDEV-RTX-3090](https://github.com/Nium32/VGPU-MDEV-RTX-3090): NVIDIA vGPU on a
+  GeForce RTX 3090 through the legacy mdev path, with driver 535.309.01 on Linux 6.1 or 6.5. It
+  documents a scheduler fix and a list of approaches that failed. Same chip family as the tested
+  card here, with a different mechanism.
+- [olealgoritme/blackwell-vgpu-unlock](https://github.com/olealgoritme/blackwell-vgpu-unlock):
+  patches and scripts for one SR-IOV vGPU on a GeForce RTX 5090 with driver 580.159.01. Its README
+  reports compute in a Linux guest and lists graphics, Windows guests and more than one VF as not
+  working. Not verified by geforce-sriov.
+- [bird/vgpu-unlock-blackwell](https://github.com/bird/vgpu-unlock-blackwell): a write-up of an
+  RTX 5090 attempt on driver 595.58.03. It reports that the host-side steps work and that the GPU
+  firmware then stops on registers that are missing on consumer silicon. Not verified by
+  geforce-sriov.
 
 ## License
 
