@@ -10,6 +10,9 @@ licence (the kernel module under GPL-2.0-only OR MIT; see [LICENSE](LICENSE)). I
 or liable for any damage, data loss, hardware failure, instability, downtime or voided warranty
 that results from using it.
 
+Ada and Blackwell GPUs are not expected to work with the current implementation. References to
+them in these docs are for experiments only.
+
 > [!NOTE]
 > **Status: experimental.** geforce-sriov has been measured on one host with two memory-modded
 > RTX 3080 20GB cards and one NVIDIA driver version. Everything else is unverified. See
