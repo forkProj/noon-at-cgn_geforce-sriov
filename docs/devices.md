@@ -170,9 +170,11 @@ geforce-sriov's driver patch and install path support only the proprietary flavo
   supported by proprietary nvidia.ko`. Blackwell therefore cannot be completed with this package yet.
 - **Ada:** NVIDIA's proprietary 580.159.01 host module refuses Ada at probe. With that check
   bypassed by a two-byte change and `NVreg_EnableGpuFirmware=0`, it ran on the CPU without GSP on
-  the one measured RTX 4070 SUPER ([Ada host stack](ada.md)). geforce-sriov's patcher does not make
-  that change. The open flavour, which always uses GSP, ran Linux guests on that card only with
-  further lab-only workarounds, still showed scheduler stalls, and is not supported.
+  the one measured RTX 4070 SUPER ([Ada host stack](ada.md)). `geforce-sriov-patch ada apply` makes
+  that change on a copy, after `geforce-sriov-patch apply`
+  ([Ada revisions](driver-patch.md#ada-revisions)); building and installing the module remain your
+  step. The open flavour, which always uses GSP, ran Linux guests on that card only with further
+  lab-only workarounds, still showed scheduler stalls, and is not supported.
 
 This is what NVIDIA's driver source and the measured Ampere and Ada results lead to expect;
 NVIDIA's host documentation does not state it.

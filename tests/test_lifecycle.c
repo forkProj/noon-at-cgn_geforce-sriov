@@ -2397,6 +2397,42 @@ static void check_ada_untouched(const char *what)
 	free(log);
 }
 
+/*
+ * check against the simulated host while rel appears mid-read: the VF's power/control is a FIFO
+ * whose writer creates rel only once check has opened it in its per-VF loop, then answers "on".
+ */
+static int check_marker_mid_read(const struct gs_config *cfg, const struct gs_activate_opts *o, const char *rel, char **out)
+{
+	char fifo[GS_PATH_MAX], marker[GS_PATH_MAX];
+	int rc, fd, status;
+	pid_t pid;
+
+	gs_pathf(fifo, sizeof(fifo), "%s/" ADA_DEV "0000:03:00.4/power/control", sim.root);
+	gs_pathf(marker, sizeof(marker), "%s/%s", sim.root, rel);
+	unlink(fifo);
+	if (mkfifo(fifo, 0644))
+		die("mkfifo");
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (pid == 0) {
+		fd = open(fifo, O_WRONLY | O_CLOEXEC);
+		if (fd < 0)
+			_exit(2);
+		writef(marker, "boot_id=x\n");
+		_exit(write(fd, "on\n", 3) == 3 ? 0 : 2);
+	}
+	rc = run_ada(child_check, cfg, o, out);
+	/* A check that never opened the FIFO leaves the writer blocked in open(): release it. */
+	if (waitpid(pid, &status, WNOHANG) == 0) {
+		fd = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		waitpid(pid, &status, 0);
+		if (fd >= 0)
+			close(fd);
+	}
+	return rc;
+}
+
 static void test_activate(void)
 {
 	static const char *const order[] = {
@@ -2648,6 +2684,9 @@ static void test_activate(void)
 	log = sim_text("sim.log");
 	CHECK(rc == GS_EXIT_COLD_CYCLE && sim_exists("state/" GS_ATTEMPT_NAME), "PF lost: %d\n%s", rc, out);
 	CHECK(!contains(log, "power/control") && !contains(log, "rescan"), "PF lost: no power write, no rescan: %s", log);
+	CHECK(contains(out, "refuses (exit 5) until a cold power cycle and `geforce-sriov prepare --clear-guard`") &&
+	      !contains(out, "until an activate") && sim_exists("run/" GS_ACTIVATING_NAME),
+	      "PF lost: the stop message names the guard's recovery and the record stays: %s", out);
 	free(log);
 	free(out);
 
@@ -2683,6 +2722,21 @@ static void test_activate(void)
 	rc = run_ada(child_check, &cfg, &o, &out);
 	CHECK(rc == GS_EXIT_FAIL && contains(out, "NOT READY: ") && contains(out, GS_ACTIVATING_NAME), "record: %d\n%s", rc, out);
 	free(out);
+
+	/* An activate or a preparation that starts while check reads the VF: the readings do not count. */
+	{
+		static const char *const marker[] = { "run/" GS_ACTIVATING_NAME, "state/" GS_ATTEMPT_NAME };
+
+		for (size_t k = 0; k < sizeof(marker) / sizeof(marker[0]); k++) {
+			ada_host(k ? "ada-attempt-mid" : "ada-record-mid", root, sizeof(root));
+			gs_pathf(p, sizeof(p), "%s/%s", root, marker[k]);
+			rc = check_marker_mid_read(&cfg, &o, marker[k], &out);
+			CHECK(rc == GS_EXIT_FAIL && contains(out, "OK 0000:03:00.4") && contains(out, "appeared during the check") &&
+			      !contains(out, "exists:") && contains(out, p) && sim_exists(marker[k]), "%s appears mid-read: %d\n%s",
+			      marker[k], rc, out);
+			free(out);
+		}
+	}
 
 	/* check names an Ampere card: refused. */
 	ada_host("ada-check-ampere", root, sizeof(root));

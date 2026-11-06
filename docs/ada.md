@@ -9,7 +9,7 @@ create VMs and does not cover licensing.
 >
 > | Level | What it covers |
 > |---|---|
-> | **Measured, by hand** | One RTX 4070 SUPER (AD104, `10de:2783`, ASUS subsystem `1043:8974`) on one Proxmox VE host, kernel `7.0.14-16-pve`, brought up with hand-written lab scripts. A pre-release geforce-sriov build presented SR-IOV (kernel module from DKMS `geforce-sriov/0.1.0`, config `experimental_vfs=on`, one VF created), and an identity hook built from a pre-release commit of this package ran in `nvidia-vgpud` |
+> | **Measured, by hand** | One RTX 4070 SUPER (AD104, `10de:2783`, ASUS subsystem `1043:8974`) on one Proxmox VE host, kernel `7.0.14-16-pve`, brought up with hand-written lab scripts. A pre-release geforce-sriov build presented SR-IOV (kernel module from DKMS `geforce-sriov/0.1.0`, config `experimental_vfs=on`), and an identity hook built from a pre-release commit of this package was configured in `nvidia-vgpud`. One VF was used: Linux showed 4, of which only the first reached a vGPU |
 > | **Package integration, not hardware-tested** | `geforce-sriov activate` and `geforce-sriov check` of this release. They follow the measured order but have not been run on a GPU, and they do not build or install any NVIDIA part |
 > | **Experimental** | Every other Ada device ID in the [device table](devices.md#rows), on which nothing has been run; and, on the measured card, NVIDIA's open flavour with GSP, which ran Linux guests only with lab-only workarounds and is not packaged |
 >
@@ -230,8 +230,9 @@ in order. It runs only as root, takes the package lock, and does this:
    appears after the `nvidia-vgpud` restart, or whether the PF returns to `nvidia`.
    Right before its first change, `activate` writes `/run/geforce-sriov/activating`. It removes the
    file only after every VF has read back `on`/`active`, and `check` reports `NOT READY` while it
-   exists. After exit 1 it stays until a later `activate` succeeds. After exit 5 the guard is still
-   set, so the next `activate` refuses with exit 5 until the host is powered off and on and
+   exists. After exit 1 it stays until a later `activate` succeeds; if `activate` reported that the
+   guard stays set, recover as for exit 5. After exit 5 the guard is still set, so the next
+   `activate` refuses with exit 5 until the host is powered off and on and
    `geforce-sriov prepare --clear-guard` has run. In either case the host reboot removes the file.
 2. `systemctl restart nvidia-vgpud.service`; checks again that no vGPU appeared meanwhile (if one
    did, it stops with exit 1 before restarting the manager or re-probing anything); then
@@ -284,6 +285,10 @@ set their VFs' type back to `0`, and run `activate` again. A udev rule or a syst
 `ExecStartPost` that writes `on` is not a replacement: on the measured host both were reported to
 have run before the re-probe, which undid them (reported, not measured). That the re-probe's
 registration of the VF resets `power/control` is an inference, not measured.
+
+`check` reads only the current state of the VFs; it does not confirm that `activate` ran in this
+boot. `check --type N` is the stronger check: a vGPU type can only be set on a VF after
+`nvidia-vgpud` has registered the types.
 
 ## On the VM side
 

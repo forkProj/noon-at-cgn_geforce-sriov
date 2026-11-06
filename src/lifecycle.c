@@ -2631,8 +2631,15 @@ static int reprobe_pf(const struct gs_host *h, const struct gs_addr *pf)
 		gs_sleep_ms(POLL_MS);
 	}
 	if ((r = clear_marker(h))) {
-		fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. The guard stays\n"
-			"set.\n%s\n", pf->str, strerror(-r), recovery_msg);
+		char g[GS_PATH_MAX];
+
+		/* clear_marker also fails when the unlink worked and only the directory sync did not. */
+		if (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && !gs_exists(g))
+			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again and the guard was removed, but syncing its\n"
+				"directory failed: %s\n", pf->str, strerror(-r));
+		else
+			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. The guard stays\n"
+				"set.\n%s\n", pf->str, strerror(-r), recovery_msg);
 		return GS_EXIT_FAIL;
 	}
 	printf("%s: re-probed, bound to nvidia again\n", pf->str);
@@ -3101,6 +3108,13 @@ int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const str
 			char drv[64], ctl[32], st[32], type[32];
 			int ok;
 
+			/* experimental_vfs=on: the measurement got a vGPU on virtfn0 only (the others: NV_ERR_OUT_OF_RANGE). */
+			if (j > 0) {
+				printf("NOT READY %s (VF of %s): virtfn%u; only the first VF of an Ada card was measured to reach a vGPU,\n"
+				       "  the others failed with NV_ERR_OUT_OF_RANGE; start no VM on it\n", k->vf[j].str, k->pf.str, j);
+				ready = 0;
+				continue;
+			}
 			dev_driver(sys, k->vf[j].str, drv, sizeof(drv));
 			read_dev_attr(sys, k->vf[j].str, "power/control", ctl, sizeof(ctl));
 			read_dev_attr(sys, k->vf[j].str, "power/runtime_status", st, sizeof(st));

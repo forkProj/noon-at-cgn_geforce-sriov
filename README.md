@@ -99,7 +99,8 @@ output to expect, is explained in the [installation guide](docs/installation.md)
 
 **Ada (experimental, not hardware-tested as packaged):** with your own modified host stack in
 place, replace the last line by `sudo geforce-sriov activate`, and run `geforce-sriov check` before
-every VM start ([Ada host stack](docs/ada.md)).
+every VM start ([Ada host stack](docs/ada.md)). The Proxmox `mdev=` route of Create a VM has not
+been tried on Ada ([On the VM side](docs/ada.md#on-the-vm-side)).
 
 **Why not the boot display?** NVIDIA's
 [vGPU documentation](https://docs.nvidia.com/vgpu/19.0/grid-vgpu-user-guide/grid-vgpu-introduction.html#primary-display-adapter-requirements)
