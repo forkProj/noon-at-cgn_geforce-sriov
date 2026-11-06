@@ -34,7 +34,7 @@ int main(int argc,char **argv)
    rc=0;goto end;
   }
   if(load(argv[3],&p,&n,err,sizeof(err))||gs_ada_find(p,n,&r,&st,err,sizeof(err)))goto end;
-  printf("%s: %s; %s; file offset 0x%zx; %s\n",r->name,r->version,r->artifact,r->site,st==0?"input state":"output state");
+  printf("%s: %s; %s; file offset 0x%zx; %s\n",r->name,r->version,r->artifact,r->site,st==0?"file at input state":"file at output state");
   if(!strcmp(argv[2],"inspect")){rc=0;goto end;}
   if(!strcmp(argv[2],"apply")){
    if(st!=0){snprintf(err,sizeof(err),"already at output state; refusing to repatch or create output");goto end;}

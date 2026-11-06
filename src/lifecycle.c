@@ -2632,9 +2632,12 @@ static int reprobe_pf(const struct gs_host *h, const struct gs_addr *pf)
 	}
 	if ((r = clear_marker(h))) {
 		char g[GS_PATH_MAX];
+		struct stat st;
 
-		/* clear_marker also fails when the unlink worked and only the directory sync did not. */
-		if (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && !gs_exists(g))
+		/* clear_marker also fails when the unlink worked and only the directory sync did not;
+		 * only ENOENT proves the guard is gone, any other lstat error leaves it in place. */
+		if (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && lstat(g, &st) < 0 &&
+		    errno == ENOENT)
 			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again and the guard was removed, but syncing its\n"
 				"directory failed: %s\n", pf->str, strerror(-r));
 		else

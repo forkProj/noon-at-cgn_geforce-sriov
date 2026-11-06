@@ -58,6 +58,8 @@ The lab scripts differed from the package in ways that matter if you compare the
   stack has not been measured.
 - The geforce-sriov config had `experimental_vfs=on`, so Linux showed 4 VFs, of which only the
   first was used. The package default (`experimental_vfs=off`) presents the one VF the card has.
+  With `experimental_vfs=on` and `vfs` above 1 (the default is 4), `check` reports every VF after
+  the first `NOT READY` and so always exits 1 ([The VF power gate](#the-vf-power-gate)).
 
 ### Why each change is needed
 
@@ -258,7 +260,7 @@ Exit codes are the package's usual ones ([configuration.md](configuration.md#com
 | Exit | `activate` | `check` |
 |---|---|---|
 | 0 | every VF on and active (`--dry-run`: the preflight checks passed; the later steps can still fail) | every VF ready |
-| 1 | a step failed after the checks: a daemon did not restart (then no GPU was re-probed), a vGPU appeared after the `nvidia-vgpud` restart, `unbindLock` was not granted (a client such as `nvidia-smi`, `nvidia-persistenced` or a CUDA program still holds the GPU) or another re-probe step stopped, the types did not appear, or the type or power readback is wrong. When it stops at one card, the cards before it were re-probed and powered, but `/run/geforce-sriov/activating` stays, so `check` reports `NOT READY` for every card until `activate` succeeds. Start no VM until then | a VF or PF is `NOT READY`, `/run/geforce-sriov/activating` exists, or the guard is set |
+| 1 | a step failed after the checks: a daemon did not restart (then no GPU was re-probed), a vGPU appeared after the `nvidia-vgpud` restart, `unbindLock` was not granted (a client such as `nvidia-smi`, `nvidia-persistenced` or a CUDA program still holds the GPU) or another re-probe step stopped, the types did not appear, or the type or power readback is wrong. When it stops at one card, the cards before it were re-probed and powered, but `/run/geforce-sriov/activating` stays, so `check` reports `NOT READY` for every card until `activate` succeeds. Start no VM until then | a VF or PF is `NOT READY`, a card has a VF after the first (`experimental_vfs=on`), `/run/geforce-sriov/activating` exists, or the guard is set |
 | 2 | usage error | usage error |
 | 3 | refused, nothing changed | an invalid or empty config, no selected Ada card, a `--device` that is not selected or not an Ada card, or a selected card that is missing |
 | 4 | another `geforce-sriov` command is running | |
@@ -270,7 +272,10 @@ Exit codes are the package's usual ones ([configuration.md](configuration.md#com
 `NOT READY` and exits 1 while `/run/geforce-sriov/activating` exists (`activate` is running or did
 not finish), while the guard `/var/lib/geforce-sriov/prepare-attempt` is set, or when it cannot tell
 whether either file exists (for example a user without access to their directory: `NOT READY:
-cannot tell whether <path> exists: …`). For each VF of the selected Ada cards it prints one line:
+cannot tell whether <path> exists: …`). Every VF after the first (`virtfn1` and up, only present
+with `experimental_vfs=on` and `vfs` above 1) is `NOT READY`, since only the first VF reached a
+vGPU on the measured card; with more than one VF `check` therefore always exits 1. For each VF of
+the selected Ada cards it prints one line:
 
 ```text
 OK 0000:03:00.4 (VF of 0000:03:00.0): driver=nvidia type=911 expected=911 power/control=on runtime_status=active

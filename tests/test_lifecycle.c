@@ -2738,6 +2738,36 @@ static void test_activate(void)
 		}
 	}
 
+	/* Two VFs, both bound, on and active: only virtfn0 was measured to reach a vGPU, virtfn1 is NOT READY. */
+	{
+		static const struct fx_fn vf1[] = {
+			{ "0000:03:00.5", "2783", "030000", "nvidia" },
+			{ NULL, NULL, NULL, NULL },
+		};
+
+		ada_host("ada-check-two-vfs", root, sizeof(root));
+		make_card(root, &topo_default, vf1, 0, NULL);
+		gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.5/physfn", root);
+		link_to("../0000:03:00.0", p);
+		gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.0/virtfn1", root);
+		link_to("../0000:03:00.5", p);
+		sim_writef(ADA_DEV "0000:03:00.0/sriov_totalvfs", "2\n");
+		sim_writef(ADA_DEV "0000:03:00.0/sriov_numvfs", "2\n");
+		sim_writef(ADA_DEV "0000:03:00.5/power/control", "on\n");
+		sim_writef(ADA_DEV "0000:03:00.5/power/runtime_status", "active\n");
+		sim_writef(ADA_DEV "0000:03:00.5/nvidia/current_vgpu_type", "0\n");
+		memset(&o, 0, sizeof(o));
+		rc = run_ada(child_check, &cfg, &o, &out);
+		CHECK(rc == GS_EXIT_FAIL && contains(out, "OK 0000:03:00.4 (VF of 0000:03:00.0)") &&
+		      !contains(out, "NOT READY 0000:03:00.4") && !contains(out, "OK 0000:03:00.5") &&
+		      contains(out, "NOT READY 0000:03:00.5 (VF of 0000:03:00.0): virtfn1; only the first VF of an Ada card "
+				    "was measured to reach a vGPU") &&
+		      contains(out, "the others failed with NV_ERR_OUT_OF_RANGE; start no VM on it"),
+		      "check with two VFs: virtfn0 OK, virtfn1 NOT READY: %d\n%s", rc, out);
+		check_ada_untouched("check with two VFs");
+		free(out);
+	}
+
 	/* check names an Ampere card: refused. */
 	ada_host("ada-check-ampere", root, sizeof(root));
 	sim_writef(ADA_DEV "0000:03:00.0/device", "0x2206\n");

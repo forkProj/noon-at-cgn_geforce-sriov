@@ -95,8 +95,8 @@ geforce-sriov-patch ada revert PATCHED NEWOUTPUT
 
 - `list` prints each revision: name, driver version, file offset, old and new bytes, and the input
   and output SHA-256. It reads no file.
-- `inspect` names the revision whose input or output digest the file has, and whether the file is
-  at the `input state` or the `output state`. It writes nothing.
+- `inspect` names the revision whose input or output digest the file has, and ends its line with
+  `file at input state` or `file at output state`. It writes nothing.
 - `apply` writes the output state and refuses a file already at the output state. `revert` writes
   the input state from a file at the output state; it needs no stock copy.
 - Each revision admits only the exact whole-file SHA-256 digests listed for it by `ada list`. Any
@@ -168,7 +168,7 @@ For an Ada card, replace the `cp` line and the second `inspect` line above with 
 ```sh
 "$GS"/driver/geforce-sriov-patch ada apply /var/tmp/nv-kernel.o_binary.patched /var/tmp/nv-kernel.o_binary.ada
 cp /var/tmp/nv-kernel.o_binary.ada nvidia/nv-kernel.o_binary
-"$GS"/driver/geforce-sriov-patch ada inspect nvidia/nv-kernel.o_binary   # now: output state
+"$GS"/driver/geforce-sriov-patch ada inspect nvidia/nv-kernel.o_binary   # now: file at output state
 ```
 
 The plain `inspect` refuses that file, because it carries both changes. For what the comparison

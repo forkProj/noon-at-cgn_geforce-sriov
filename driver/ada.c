@@ -10,13 +10,13 @@
 
 static const struct gs_ada_revision revisions[] = {
 	{"module-gate",
-	 "nvidia host kernel object (580.159.01, proprietary, CPU-side mode); output is the gate-only object, not the measured stack",
+	 "nvidia host kernel object (580.159.01, proprietary, CPU-side mode); revised state is the gate-only object, not the measured stack",
 	 "580.159.01",
 	 "4e3abe645b6873ed478adea6a06c6955352ff06186849edeea536c9630596449",
 	 "ed3efee68582f4fa9f120cf6c28138d8642db93ff0e6ba07ab0d6d7bf1b9823b",
 	 0xd654ef, {0x75, 0x7f}, {0x90, 0x90}},
 	{"module-gate",
-	 "nvidia host kernel object (580.159.01, proprietary, CPU-side mode); output is the measured stack",
+	 "nvidia host kernel object (580.159.01, proprietary, CPU-side mode); revised state is the measured stack",
 	 "580.159.01",
 	 "ce8a485bfaeebca3a9609f9415a6df81c160a0a53509aec093bc3361a6d12701",
 	 "f5b788cdb3e06aed18860cc6cf950dcc13143bd831d90d8e9c4bf9e744426f12",
