@@ -1384,6 +1384,7 @@ static struct {
 	int stuck_console;     /* the framebuffer unbind write succeeds but its driver stays bound */
 	int lock_denied;       /* NVIDIA's unbindLock reads 0 after a write of 1 (a client holds the GPU) */
 	int systemctl_rc;      /* exit status of every systemctl command */
+	int state_not_dir;     /* the nvidia bind replaces the state directory with a file: the guard's lstat fails, ENOTDIR */
 } sim;
 
 /*
@@ -1495,8 +1496,15 @@ static int sim_write(const char *path, const char *value)
 		gs_pathf(p, sizeof(p), "%.*s", (int)(strlen(path) - 5), path);
 		if (symlink(p, q))
 			return -errno;
-		if (strcmp(r, "bus/pci/drivers/nvidia/bind") == 0)
+		if (strcmp(r, "bus/pci/drivers/nvidia/bind") == 0) {
 			sim_register_vfs(value);
+			if (sim.state_not_dir) {
+				gs_pathf(p, sizeof(p), "%s.moved", sim.state);
+				if (rename(sim.state, p))
+					return -errno;
+				writef(sim.state, "not a directory\n");
+			}
+		}
 		return 0;
 	}
 	if (strncmp(r, "bus/pci/drivers/", 16) == 0 && ends_with(r, "/unbind")) {
@@ -2688,6 +2696,17 @@ static void test_activate(void)
 	      !contains(out, "until an activate") && sim_exists("run/" GS_ACTIVATING_NAME),
 	      "PF lost: the stop message names the guard's recovery and the record stays: %s", out);
 	free(log);
+	free(out);
+
+	/* The guard's state cannot be read after the re-probe: it counts as set, not as gone. */
+	ada_host("ada-guard-unknown", root, sizeof(root));
+	sim.state_not_dir = 1;
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "cannot be told (Not a directory); treat it as set") &&
+	      contains(out, "stays and the guard cannot be ruled out (Not a directory), so `geforce-sriov check`\n"
+			    "reports NOT READY; treat the guard as set: a cold power cycle, then `geforce-sriov prepare --clear-guard`") &&
+	      !contains(out, "until an activate") && sim_exists("run/" GS_ACTIVATING_NAME),
+	      "guard unknown: the stop message counts it as set and the record stays: %d\n%s", rc, out);
 	free(out);
 
 	/* nvidia_vgpu_vfio is not loaded: refused. */

@@ -233,9 +233,10 @@ in order. It runs only as root, takes the package lock, and does this:
    Right before its first change, `activate` writes `/run/geforce-sriov/activating`. It removes the
    file only after every VF has read back `on`/`active`, and `check` reports `NOT READY` while it
    exists. After exit 1 it stays until a later `activate` succeeds; if `activate` reported that the
-   guard stays set, recover as for exit 5. After exit 5 the guard is still set, so the next
-   `activate` refuses with exit 5 until the host is powered off and on and
-   `geforce-sriov prepare --clear-guard` has run. In either case the host reboot removes the file.
+   guard stays set, or that it cannot tell whether the guard exists, recover as for exit 5. After
+   exit 5 the guard is still set, so the next `activate` refuses with exit 5 until the host is
+   powered off and on and `geforce-sriov prepare --clear-guard` has run. In either case the host
+   reboot removes the file.
 2. `systemctl restart nvidia-vgpud.service`; checks again that no vGPU appeared meanwhile (if one
    did, it stops with exit 1 before restarting the manager or re-probing anything); then
    `systemctl restart nvidia-vgpu-mgr.service`, waits up to 10 s until the manager is active, then

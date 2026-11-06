@@ -2779,7 +2779,8 @@ int gs_activate(const struct gs_host *h, const struct gs_config *cfg, const stru
 	char why[1024], which[256], p[GS_PATH_MAX], g[GS_PATH_MAX], boot[64] = "", ver[32];
 	struct ada_card *cards;
 	unsigned int n = 0, i, j;
-	int r, rc = GS_EXIT_OK;
+	struct stat st;
+	int r, e, rc = GS_EXIT_OK;
 
 	if (gs_pathf(p, sizeof(p), "%s/" GS_ATTEMPT_NAME, h->state_dir) || gs_exists(p)) {
 		fprintf(stderr, "geforce-sriov: guard %s is set; nothing done.\n%s\n", p, recovery_msg);
@@ -3007,12 +3008,18 @@ int gs_activate(const struct gs_host *h, const struct gs_config *cfg, const stru
 		return rc;
 	}
 stopped:
-	/* The guard is set (exit 5, or its removal failed): the next activate refuses until it is cleared. */
-	if (rc == GS_EXIT_COLD_CYCLE ||
-	    (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && gs_exists(g)))
+	/* Only ENOENT proves the guard gone: exit 5, a guard that stays and an unknown state count as set. */
+	e = rc == GS_EXIT_COLD_CYCLE ? 0 : -gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir);
+	if (rc != GS_EXIT_COLD_CYCLE && e == 0 && lstat(g, &st) < 0)
+		e = errno;
+	if (e == 0)
 		fprintf(stderr, "geforce-sriov: %s and the guard stay, so `geforce-sriov check` reports NOT READY and\n"
 			"`geforce-sriov activate` refuses (exit 5) until a cold power cycle and `geforce-sriov prepare --clear-guard`\n",
 			p);
+	else if (e != ENOENT)
+		fprintf(stderr, "geforce-sriov: %s stays and the guard cannot be ruled out (%s), so `geforce-sriov check`\n"
+			"reports NOT READY; treat the guard as set: a cold power cycle, then `geforce-sriov prepare --clear-guard`\n",
+			p, strerror(e));
 	else
 		fprintf(stderr, "geforce-sriov: %s stays, so `geforce-sriov check` reports NOT READY until an activate\n"
 			"finishes or the host reboots\n", p);
