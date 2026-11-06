@@ -2633,16 +2633,23 @@ static int reprobe_pf(const struct gs_host *h, const struct gs_addr *pf)
 	if ((r = clear_marker(h))) {
 		char g[GS_PATH_MAX];
 		struct stat st;
+		int e;
 
 		/* clear_marker also fails when the unlink worked and only the directory sync did not;
-		 * only ENOENT proves the guard is gone, any other lstat error leaves it in place. */
-		if (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && lstat(g, &st) < 0 &&
-		    errno == ENOENT)
+		 * only ENOENT proves the guard is gone, any other lstat error leaves its state unknown. */
+		e = -gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir);
+		if (e == 0 && lstat(g, &st) < 0)
+			e = errno;
+		if (e == 0)
+			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. The guard stays\n"
+				"set.\n%s\n", pf->str, strerror(-r), recovery_msg);
+		else if (e == ENOENT)
 			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again and the guard was removed, but syncing its\n"
 				"directory failed: %s\n", pf->str, strerror(-r));
 		else
-			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. The guard stays\n"
-				"set.\n%s\n", pf->str, strerror(-r), recovery_msg);
+			fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. Whether the\n"
+				"guard still exists cannot be told (%s); treat it as set.\n%s\n", pf->str, strerror(-r), strerror(e),
+				recovery_msg);
 		return GS_EXIT_FAIL;
 	}
 	printf("%s: re-probed, bound to nvidia again\n", pf->str);
@@ -2852,7 +2859,8 @@ int gs_activate(const struct gs_host *h, const struct gs_config *cfg, const stru
 		k->nvf = c.numvfs;
 		if (o->type && k->nvf > 1) {
 			snprintf(why, sizeof(why), "%s has %u VFs; --type is refused there because only one VF of an Ada card was\n"
-				 "measured to start a vGPU. Run activate without --type and set each VF's type yourself", k->pf.str, k->nvf);
+				 "measured to start a vGPU. Run activate without --type and set the type of the first VF (virtfn0) yourself;\n"
+				 "check reports every further VF NOT READY", k->pf.str, k->nvf);
 			goto refuse;
 		}
 		for (j = 0; j < k->nvf; j++) {
