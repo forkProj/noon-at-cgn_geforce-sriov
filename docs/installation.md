@@ -6,6 +6,12 @@ version ([Quick start](../README.md#quick-start)) and helps you pick a path
 [The boot display GPU](boot-display.md) before you start. What has been measured, and what has not,
 is listed in [What has been verified](../README.md#what-has-been-verified).
 
+> [!NOTE]
+> **Ada cards** use this guide with three differences: you supply a modified
+> NVIDIA host stack that geforce-sriov does not build (step 3), `geforce-sriov activate` replaces
+> step 7, and `geforce-sriov check` runs before every VM start. Read
+> [Ada host stack](ada.md) first; that page also says what was measured and what was not.
+
 1. [Prerequisites checklist](#1-prerequisites-checklist)
 2. [Build and check](#2-build-and-check)
 3. [Patch the NVIDIA driver](#3-patch-the-nvidia-driver)
@@ -46,9 +52,9 @@ each boot ([details](boot-display.md)).
 | ☐ | Kernel headers for the running kernel, `dkms`, a C compiler, `make` | `dkms status`; `cc --version`. On Proxmox, `pve-nvidia-vgpu-helper setup` installs headers and DKMS |
 | ☐ | `systemd` and `pciutils` (`lspci`, `setpci`; NVIDIA's `sriov-manage` needs them) | `lspci --version` |
 | ☐ | IOMMU on in firmware (VT-d / AMD-Vi) and kernel. In firmware also enable *Above 4G decoding*, and SR-IOV and ARI if offered | `dmesg \| grep -i -e DMAR -e IOMMU`; `ls /sys/kernel/iommu_groups` is not empty |
-| ☐ | Your own NVIDIA vGPU host package for Linux KVM, proprietary flavour, installed with DKMS. Measured version: 580.159.01. Blackwell needs the open flavour, which geforce-sriov does not support yet ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)) | `modinfo -F version nvidia` prints the installed version without loading the module. (`/proc/driver/nvidia/version` exists only while `nvidia` is loaded) |
+| ☐ | Your own NVIDIA vGPU host package for Linux KVM, proprietary flavour, installed with DKMS. Measured version: 580.159.01. Blackwell needs the open flavour, which geforce-sriov does not support yet ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)). Ada needs a modified module run with GSP off ([Ada host stack](ada.md)) | `modinfo -F version nvidia` prints the installed version without loading the module. (`/proc/driver/nvidia/version` exists only while `nvidia` is loaded) |
 | ☐ | NVIDIA's vGPU daemon units `nvidia-vgpud.service` and `nvidia-vgpu-mgr.service` | `systemctl list-unit-files 'nvidia-vgpu*'` lists both. If not, see [below](#nvidias-vgpu-daemon-units) |
-| ☐ | Guest drivers from the **same** vGPU software release as the host driver | NVIDIA's release notes map host to guest versions |
+| ☐ | Guest drivers from the **same** vGPU software release as the host driver (Ada: see [Guest driver prerequisite](ada.md#guest-driver-prerequisite)) | NVIDIA's release notes map host to guest versions |
 | ☐ | A valid NVIDIA vGPU licence setup of your own for the guests (outside this project) | |
 | ☐ | A KVM hypervisor that gives each VM a VF with a vGPU type (measured: Proxmox VE, whose `hostpci` line names the type with `mdev=<type>`) | |
 | ☐ | The card is in the device table, is function `.0`, has a PCI bridge directly above it and does not share its PCI bus with another device | `./geforce-sriov devices`; `./geforce-sriov doctor --device BDF` checks the rest |
@@ -127,6 +133,13 @@ stock build, back up the stock module and install the patched one. After `make`,
 to `/usr/local/bin`. Do this **before the reboot** in step 5, so that the card is prepared and then
 bound by the patched driver. The patcher checks the file's SHA-256 and refuses files it does not
 recognise. Only 580.159.01 has been measured.
+
+On **Ada** this patch alone is not enough: the module also needs the Ada probe-gate change, and
+must load with `NVreg_EnableGpuFirmware=0`; the vGPU plugin needs its H5 copy too
+([Ada host stack](ada.md#what-geforce-sriov-does-for-ada)). `geforce-sriov-patch` makes both
+module revisions on a copy: `apply` first, then `ada apply` on its output. `ada apply` on a copy
+of the plugin makes the H5 copy ([Ada revisions](driver-patch.md#ada-revisions)). Building and
+installing the module remain your step, as above.
 
 > [!WARNING]
 > DKMS rebuilds the **stock** `nvidia.ko` after every kernel update. Re-apply the patch for each
@@ -253,6 +266,9 @@ kernel logged a few lines that look like errors; all are harmless
 > [!NOTE]
 > The VFs do not survive a reboot. Run `enable` after every boot (or put it in your own unit after
 > `geforce-sriov-prepare.service`). `enable` acts only on cards prepared this boot.
+
+On **Ada**, `enable` ends with a line that names `geforce-sriov activate` as the next step: skip
+step 7 and follow [Bring-up order](ada.md#bring-up-order) instead.
 
 ## 7. Register the vGPU types
 

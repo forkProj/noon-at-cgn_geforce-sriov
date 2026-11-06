@@ -21,6 +21,35 @@ All notable changes to this project are recorded here. The format follows
 - [docs/devices.md](docs/devices.md): a status column for every row, and a section on Ada and
   Blackwell: VF count, the NVIDIA driver flavour each generation needs, Blackwell per-VF BAR sizes,
   `twin_id`, and third-party reports for the RTX 5090 (not verified by geforce-sriov).
+- `geforce-sriov activate [--device BDF]... [--type N] [--dry-run]` (Ada only, root): after
+  `enable`, restarts `nvidia-vgpud` and then `nvidia-vgpu-mgr`, re-probes each selected Ada card
+  (guard, NVIDIA's `unbindLock`, driver unbind and bind; no remove or rescan), optionally sets
+  vGPU type `N` on its VF, then writes `power/control=on` and requires the readback `on`/`active`.
+  It refuses unless NVIDIA's driver is 580.159.01 loaded with `NVreg_EnableGpuFirmware=0`,
+  `nvidia_vgpu_vfio` is loaded, `libnvidia-vgpu.so` resolves to the H5 copy of the plugin, no
+  NVIDIA VF on the host has a vGPU type and no GPU outside `bdfs` has VFs enabled (the daemon
+  restart is host-wide). From its first change until every VF reads back `on`/`active` it keeps
+  `/run/geforce-sriov/activating`. Not run on hardware.
+- `geforce-sriov check [--device BDF]... [--type N]` (Ada only, read-only): the gate before every
+  VM start; exit 0 only when each VF is on `nvidia` with `power/control=on` and
+  `runtime_status=active` (and type `N`), and neither `/run/geforce-sriov/activating` nor the
+  guard exists. Not run on hardware.
+- `doctor` prints, for every selected Ada card, the host stack it needs and that geforce-sriov
+  builds and installs none of it; `enable` names `activate` as the next step for Ada cards.
+- [docs/ada.md](docs/ada.md): the Ada host stack measured by hand on one RTX 4070 SUPER
+  (`10de:2783`): proprietary 580.159.01 with GSP off and two `nvidia.ko` changes, the H5 plugin
+  copy, one VF, the VF power fix, the guest drivers that ran, and recovery. It separates that
+  measurement from the package steps above, which are not hardware-tested.
+- `geforce-sriov-patch ada list|inspect|apply|revert` (offline): the Ada revisions on a copy of
+  your own 580.159.01 host kernel object `nv-kernel.o_binary` or vGPU plugin
+  `libnvidia-vgpu.so.580.159.01`, writing only `NEWOUTPUT`. Each revision admits a file only by its
+  exact whole-file SHA-256. Sites: the Ada probe gate in the host object at `0xd654ef`
+  (`75 7f` → `90 90`), accepted on the stock object and on the object that already carries the
+  scheduler revision, and the H5 change in the plugin at `0x8fb0e` (`f8 06` → `00 5a`). Apply the
+  scheduler revision (`geforce-sriov-patch apply`) first: the scheduler commands refuse an object
+  that already carries the gate revision ([Ada revisions](docs/driver-patch.md#ada-revisions)).
+  The accepted and revised digests were verified offline against copies of the measured files. No
+  module is built or installed, and the plugin copy is not installed.
 
 ### Changed
 
@@ -33,12 +62,20 @@ All notable changes to this project are recorded here. The format follows
   count.
 - `doctor` notes for every Blackwell card that the proprietary 580.159.01 driver does not support
   it and that the open kernel module it needs is not supported by geforce-sriov yet.
+- Documentation: Ada is no longer described as "untested on either flavour" or as needing GSP.
+  The one measured card ran the proprietary 580.159.01 module with GSP off and changes made by
+  hand; every Ada row, `2783` included, stays experimental.
 
 ### Fixed
 
 - Documentation: one gate for more than one VF on Ada and Blackwell is known (NVIDIA's driver reads
   TotalVFs from the hardware), and Ada dumps do record config `0x41C` bit 29; only its meaning on
   Ada is unconfirmed.
+
+### Known limitations
+
+- `geforce-sriov-patch` makes the Ada host-object and plugin revisions only on copies; building
+  and installing `nvidia.ko` and installing the plugin copy and its link remain your steps.
 
 ## [0.1.0]
 

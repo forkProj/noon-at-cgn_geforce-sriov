@@ -10,7 +10,10 @@ in the measured setup on the GA102 boards listed in [devices.md](devices.md).
 
 It is a workaround: why the PMU path disables the runlist is unknown, and a clean run does not
 prove the stall cannot return. It does not apply to GSP-based drivers, to NVIDIA's open kernel
-modules, to guest drivers, or to Ada and Blackwell, and it changes no GSP firmware.
+modules, to guest drivers, or to Blackwell, and it changes no GSP firmware. On Ada the same two
+bytes are one of two changes in the measured host module; the other, the Ada probe gate, is made
+by the tool's `ada` commands ([Ada revisions](#ada-revisions)), and an Ada card needs both
+([Ada host stack](ada.md#the-two-nvidiako-changes)).
 
 This repository contains no NVIDIA file. `geforce-sriov-patch` changes a copy of **your own**
 `nv-kernel.o_binary`; you rebuild NVIDIA's kernel module from NVIDIA's source tree yourself. The tool
@@ -72,6 +75,66 @@ step, so the commands below use the built copy.
   standard error that the output file was already created: that file is complete.
 - Exit status: 0 success, 1 refused or failed (the reason is printed on standard error), 2 usage.
 
+## Ada revisions
+
+The same tool has a second command family for the measured Ada stack ([Ada host stack](ada.md)).
+Like the commands above, it reads a copy of **your own** file and writes only `NEWOUTPUT`; the
+installed file is never touched.
+
+```
+geforce-sriov-patch ada list
+geforce-sriov-patch ada inspect INPUT
+geforce-sriov-patch ada apply INPUT NEWOUTPUT
+geforce-sriov-patch ada revert PATCHED NEWOUTPUT
+```
+
+| Revision | Artifact (driver 580.159.01) | File offset | Bytes |
+|---|---|---|---|
+| Ada probe gate | host kernel object `nvidia/nv-kernel.o_binary` | `0xd654ef` | `75 7f` → `90 90` |
+| Plugin change | vGPU plugin `libnvidia-vgpu.so.580.159.01` | `0x8fb0e` | `f8 06` → `00 5a` |
+
+- `list` prints each revision: name, driver version, file offset, old and new bytes, and the input
+  and output SHA-256. It reads no file.
+- `inspect` names the revision whose input or output digest the file has, and whether the file is
+  at the `input state` or the `output state`. It writes nothing.
+- `apply` writes the output state and refuses a file already at the output state. `revert` writes
+  the input state from a file at the output state; it needs no stock copy.
+- Each revision admits only the exact whole-file SHA-256 digests listed for it by `ada list`. Any
+  other file is refused.
+- `NEWOUTPUT` and the exit status follow the rules in [Usage](#usage).
+
+### Order on the host object
+
+The Ada host object carries both two-byte changes. Make them in this order:
+
+1. `geforce-sriov-patch apply` on the stock object (the scheduler workaround).
+2. `geforce-sriov-patch ada apply` on that output (the Ada probe gate).
+
+Revert in the opposite order: `ada revert` first, then
+`geforce-sriov-patch revert PATCHED STOCK NEWOUTPUT`. The order is fixed by the scheduler commands:
+`inspect` and `apply` hash the whole object except their own two bytes, and `revert` requires the
+pair to differ only in those two bytes, so all three refuse an object that carries the Ada probe
+gate. `ada apply` also accepts the stock object and then writes a gate-only object (SHA-256
+`ed3efee68582f4fa9f120cf6c28138d8642db93ff0e6ba07ab0d6d7bf1b9823b`); the scheduler commands refuse
+that file, so undo it with `ada revert` and start again in the order above. Restoring the stock
+module from your own backup also works ([Reverting](#reverting)).
+
+### Digests
+
+Check each step with `sha256sum FILE`:
+
+| File | State | SHA-256 |
+|---|---|---|
+| Host kernel object | stock | `4e3abe645b6873ed478adea6a06c6955352ff06186849edeea536c9630596449` |
+| Host kernel object | after `geforce-sriov-patch apply` | `ce8a485bfaeebca3a9609f9415a6df81c160a0a53509aec093bc3361a6d12701` |
+| Host kernel object | after `ada apply` (both changes) | `f5b788cdb3e06aed18860cc6cf950dcc13143bd831d90d8e9c4bf9e744426f12` |
+| vGPU plugin | stock | `7e52b76dc7ca8490e7ffbc1fd724f5db07f3791a3a2ec07f2d595bf05abdcaa7` |
+| vGPU plugin | after `ada apply` | `097f571588f3a232265103b73e38ba111ddb44ef329ac720562cff71e6170d37` |
+
+These are the digests the tool checks (`ada list`); a round trip in the order above on the user's
+own copies produced exactly these digests. How the plugin copy is used is in
+[The plugin change](ada.md#the-plugin-change).
+
 ## Rebuilding NVIDIA's module
 
 The NVIDIA vGPU-KVM host package installed with DKMS places its kernel source in
@@ -99,6 +162,18 @@ On the measured driver the first `inspect` prints:
 580.159.01: stock; stall workaround; function _nv052453rm; file offset 0x9f2588
 ```
 
+For an Ada card, replace the `cp` line and the second `inspect` line above with these, before
+`make` ([Order on the host object](#order-on-the-host-object)):
+
+```sh
+"$GS"/driver/geforce-sriov-patch ada apply /var/tmp/nv-kernel.o_binary.patched /var/tmp/nv-kernel.o_binary.ada
+cp /var/tmp/nv-kernel.o_binary.ada nvidia/nv-kernel.o_binary
+"$GS"/driver/geforce-sriov-patch ada inspect nvidia/nv-kernel.o_binary   # now: output state
+```
+
+The plain `inspect` refuses that file, because it carries both changes. For what the comparison
+below shows on an Ada build, see the end of [Compare with a stock build](#compare-with-a-stock-build).
+
 The build writes `nvidia.ko` and `nvidia-vgpu-vfio.ko` to the top of the copied tree, for example
 `/var/tmp/nvidia-580.159.01-patched/nvidia.ko`. Only `nvidia.ko` contains the patched object;
 leave the installed `nvidia-vgpu-vfio.ko` as it is. The build also prints a list of `objtool`
@@ -120,16 +195,39 @@ objcopy -O binary -j .text /var/tmp/nvidia-$VER-patched/nvidia.ko /var/tmp/patch
 cmp -l /var/tmp/stock.text /var/tmp/patched.text
 ```
 
-**Success:** `cmp -l` prints exactly two lines, for two neighbouring offsets, and exits 1 because
-the files differ. It prints bytes in octal: `165 220` and `166 220` mean `75` → `90` and `76` →
-`90`. The measured build showed (your offsets may differ):
+**Success (scheduler change only):** `cmp -l` prints exactly two lines, for two neighbouring
+offsets, and exits 1 because the files differ. It prints bytes in octal: `165 220` and `166 220`
+mean `75` → `90` and `76` → `90`. The measured build showed (your offsets may differ):
 
 ```text
 10577673 165 220
 10577674 166 220
 ```
 
-Any other output means the build is not the expected one; do not install it.
+For a module with the scheduler change alone, any other output means the build is not the expected
+one; do not install it.
+
+For an Ada module with both changes, `cmp -l` of the `.text` sections is expected to print four
+lines: the two above, and two neighbouring lines `165 220` and `177 220` (`75 7f` → `90 90`) for
+the Ada probe gate. Any other output means the build is not the expected one; do not install it.
+
+Measured on whole module files (`cmp -l` of a stock 580.159.01 `nvidia.ko` and the Ada `nvidia.ko`,
+without extracting `.text`): exactly four bytes differ. `cmp` positions are 1-based; the file
+offsets are 0-based.
+
+```text
+10588529 165 220
+10588530 166 220
+14205144 165 220
+14205145 177 220
+```
+
+| Change | File offsets in `nvidia.ko` | Bytes |
+|---|---|---|
+| Scheduler workaround | `0xa19170`, `0xa19171` | `75 76` → `90 90` |
+| Ada probe gate | `0xd8c0d7`, `0xd8c0d8` | `75 7f` → `90 90` |
+
+These are offsets in that module file, not in `.text` or in `nv-kernel.o_binary`; yours may differ.
 
 ### Install the patched module
 
@@ -173,6 +271,8 @@ The patch is never applied automatically. After any update:
    - if it is accepted, repeat the rebuild from the new `/usr/src/nvidia-<version>` tree;
    - if it is refused, there is no patch for that build: keep the stock module (the stall can
      return) or stay on a supported build. Do not patch it by hand.
+   - on Ada, the `ada` revisions cover only the 580.159.01 files listed by `ada list`; any other
+     build has no Ada probe-gate change.
 
    Once the new driver is loaded, `geforce-sriov doctor` also prints whether the identity hook
    supports that build; on any other build the hook passes every call through.
@@ -186,3 +286,5 @@ Reinstall your backup of the stock `nvidia.ko` (copy it back to the path `modinf
 printed), or rebuild from the untouched `/usr/src/nvidia-<version>` tree. To restore a stock
 object from a patched one when you also have the stock file,
 `geforce-sriov-patch revert PATCHED STOCK NEWOUTPUT` verifies the pair first.
+For an object with both Ada changes, run `geforce-sriov-patch ada revert PATCHED NEWOUTPUT` first,
+then `revert` on its output ([Order on the host object](#order-on-the-host-object)).

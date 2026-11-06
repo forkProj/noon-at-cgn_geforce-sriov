@@ -10,8 +10,12 @@ licence (the kernel module under GPL-2.0-only OR MIT; see [LICENSE](LICENSE)). I
 or liable for any damage, data loss, hardware failure, instability, downtime or voided warranty
 that results from using it.
 
-Ada and Blackwell GPUs are not expected to work with the current implementation. References to
-them in these docs are for experiments only.
+Blackwell GPUs are not expected to work with the current implementation. Ada GPUs need a modified
+NVIDIA host stack that this package does not fully provide; one RTX 4070 SUPER ran vGPU guests
+with it, set up by hand ([Ada host stack](docs/ada.md)). `geforce-sriov-patch` now makes both
+measured revisions of the host kernel object and the plugin revision, on copies of your files;
+building and installing the module remain your step. References to Ada and Blackwell in these
+docs are for experiments only.
 
 > [!NOTE]
 > **Status: experimental.** geforce-sriov has been measured on one host with two memory-modded
@@ -57,9 +61,11 @@ More on the [Showcase page](docs/showcase.md), including
   are taken from the same release. geforce-sriov does not include, download or provide any of
   them.
 - A card from the device table. Only Ampere is confirmed to work: the memory-modded RTX 3080 20GB
-  (`10de:2206`, subsystem `10de:146d`) is the one card measured, and every other listed card is
-  experimental ([docs/devices.md](docs/devices.md)). Ada and Blackwell use GSP firmware for vGPU
-  hosts and are experimental only.
+  (`10de:2206`, subsystem `10de:146d`) is the one card measured with this package, and every other
+  listed card is experimental ([docs/devices.md](docs/devices.md)). Blackwell needs NVIDIA's GSP
+  firmware and open flavour, which this package does not support. Ada needs your own modified
+  580.159.01 host stack with GSP off, measured by hand on one RTX 4070 SUPER
+  ([Ada host stack](docs/ada.md)).
 - A Linux host (x86_64, kernel 6.8 or later with livepatch support), kernel headers, DKMS, a C
   compiler, `make` and `pciutils`. The IOMMU must be on.
 - A valid NVIDIA vGPU licence setup of your own for the guests. geforce-sriov does not provide
@@ -90,6 +96,10 @@ sudo systemctl restart nvidia-vgpud.service && sudo systemctl restart nvidia-vgp
 
 Then give a VM one vGPU ([Create a VM](docs/installation.md#8-create-a-vm)). Each step, with the
 output to expect, is explained in the [installation guide](docs/installation.md).
+
+**Ada (experimental, not hardware-tested as packaged):** with your own modified host stack in
+place, replace the last line by `sudo geforce-sriov activate`, and run `geforce-sriov check` before
+every VM start ([Ada host stack](docs/ada.md)).
 
 **Why not the boot display?** NVIDIA's
 [vGPU documentation](https://docs.nvidia.com/vgpu/19.0/grid-vgpu-user-guide/grid-vgpu-introduction.html#primary-display-adapter-requirements)
@@ -147,7 +157,7 @@ for example on Proxmox VE. This is the SR-IOV method, not the legacy mdev method
 | Boot unit `geforce-sriov-prepare.service` | Prepares those cards once per boot, before NVIDIA's driver touches them |
 | CLI `geforce-sriov` | Checks the host (`doctor`, `status`), installs everything, and enables the virtual functions (`enable`) |
 | Identity hook `libgeforce_sriov.so` | Lets NVIDIA's `nvidia-vgpud` daemon accept the GeForce card as its professional counterpart, so it offers vGPU types |
-| Driver patcher `geforce-sriov-patch` | Makes a two-byte fix to **your own copy** of NVIDIA's driver object so guest GPU work does not stall |
+| Driver patcher `geforce-sriov-patch` | Makes a two-byte fix to **your own copy** of NVIDIA's driver object so guest GPU work does not stall; its `ada list`, `ada inspect`, `ada apply` and `ada revert` commands make the Ada revisions on copies ([Ada revisions](docs/driver-patch.md#ada-revisions)) |
 
 geforce-sriov is **not** a vBIOS flasher, not a licensing tool and not a security boundary between
 guests. It ships no NVIDIA software and never edits NVIDIA's `vgpuConfig.xml`. Each part is
@@ -233,8 +243,10 @@ Everything below was measured on **one host**. Nothing beyond it is claimed.
 | Workload | One 30-minute run of concurrent CUDA (Linux) and D3D11 (Windows) work; the test harness recorded no failures |
 | Restarts | One Linux guest and one Windows guest were restarted while the other guests kept running |
 
-**Does it work on your machine?** Other hardware has not been measured by this project. What to
-collect, what to remove before posting and what happens to a report is in
+**Does it work on your machine?** Other hardware has not been measured with this package. A
+separate, by-hand Ada measurement on one RTX 4070 SUPER, with a host stack this package does not
+fully provide, is described in [Ada host stack](docs/ada.md). What to collect, what to remove
+before posting and what happens to a report is in
 [docs/compatibility.md](docs/compatibility.md); reports from others are listed under the
 [`compatibility` label](https://github.com/noon-at-cgn/geforce-sriov/issues?q=label%3Acompatibility).
 
@@ -252,6 +264,7 @@ collect, what to remove before posting and what happens to a report is in
 | [Technical reference](docs/technical-reference.md) | How each part works, kernel module, identity hook, PCI topologies, full command and config rules |
 | [Driver patch](docs/driver-patch.md) | Patching and rebuilding NVIDIA's module, and re-applying it after updates |
 | [Devices](docs/devices.md) | The device table and the status of each card |
+| [Ada host stack](docs/ada.md) | Ada: the by-hand RTX 4070 SUPER measurement, what you must provide, `activate` and `check`, recovery |
 | [Compatibility reports](docs/compatibility.md) | Reporting whether geforce-sriov works on your hardware: what to collect, what to remove, what happens to a report |
 | [Identity hook](hook/README.md) | Identity hook internals |
 | [Showcase](docs/showcase.md) | Screenshots of the measured host and of a Linux and a Windows guest using a vGPU; vGPU vs host performance |
@@ -260,8 +273,9 @@ collect, what to remove before posting and what happens to a report is in
 ## Related projects
 
 geforce-sriov uses SR-IOV virtual functions instead of mdev (mediated devices), and targets Ampere
-and newer cards. Only Ampere is confirmed to work. Ada and Blackwell use GSP firmware for vGPU
-hosts and are experimental only. Other projects with similar goals, and what each one reports:
+and newer cards. Only Ampere is confirmed to work with this package. Ada and Blackwell are
+experimental only ([Ada host stack](docs/ada.md)). Other projects with similar goals, and what each
+one reports:
 
 - [polloloco/vgpu-proxmox](https://gitlab.com/polloloco/vgpu-proxmox): an install guide and driver
   patches for NVIDIA vGPU on Proxmox VE, using mdev. It covers consumer Maxwell 2.0 (except the

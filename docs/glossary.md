@@ -14,5 +14,5 @@
 | **Livepatch** | A kernel feature that changes a running kernel's functions without a reboot; used here only for the listed cards |
 | **DKMS** | Rebuilds out-of-tree kernel modules automatically for each new kernel |
 | **Boot display** | The card the firmware uses for the boot screen (`boot_vga` is `1` in sysfs); see [The boot display GPU](boot-display.md) |
-| **GSP** | The GPU System Processor, a processor on the GPU that runs part of NVIDIA's driver as firmware. NVIDIA's vGPU host driver uses it on Ada and Blackwell, not on Ampere |
+| **GSP** | The GPU System Processor, a processor on the GPU that runs part of NVIDIA's driver as firmware. NVIDIA's stock vGPU host driver uses it on Ada and Blackwell, not on Ampere. The measured Ada stack turns it off (`NVreg_EnableGpuFirmware=0`, *CPU-RM*); see [Ada host stack](ada.md) |
 | **Driver flavour** | NVIDIA's Linux kernel module comes as a proprietary and an open flavour; see [NVIDIA driver flavour](devices.md#nvidia-driver-flavour) |

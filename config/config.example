@@ -33,11 +33,12 @@ ari=on
 # msix: unhide MSI-X where the die's mechanism is known (Ampere) (on|off).
 msix=on
 #
-# experimental_vfs (default off): untested. Raises the VF count of Ada/Blackwell
-# cards that report 1 up to the vfs value (max 4). On Blackwell the raised count
-# also reaches NVIDIA's driver, and the GPU firmware may still refuse more than
-# 1 VF; on Ada the driver still sees 1. Off: Ada/Blackwell cards present 1 VF
-# (on|off).
+# experimental_vfs (default off): for experiments. Raises the VF count of
+# Ada/Blackwell cards that report 1 up to the vfs value (max 4). On Blackwell
+# the raised count also reaches NVIDIA's driver, and the GPU firmware may still
+# refuse more than 1 VF (untested); on Ada the driver still sees 1: on the one
+# measured Ada card Linux showed 4 VFs and only the first reached a vGPU.
+# Off: Ada/Blackwell cards present 1 VF (on|off).
 experimental_vfs=off
 #
 # twin_id (default off): EXPERIMENTAL and untested. On GB202 (RTX 5090) the

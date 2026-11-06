@@ -15,6 +15,18 @@ device-ID fallback. It is also tested offline against a stand-in daemon and a fa
 with `experimental = 0` (`2206`) does not mean any other `2206` board has been validated. Every
 other entry is experimental.
 
+**Ada, experimental.** The identity mapping for the measured Ada card (RTX 4070 SUPER `10de:2783`
+→ L4 `10de:27b8`) is in the device table; every Ada entry stays experimental. On one RTX 4070 SUPER
+(`10de:2783`, subsystem `1043:8974`) with the by-hand Ada host stack (580.159.01 proprietary module
+run with GSP off; [Ada host stack](../docs/ada.md)), an identity hook built from a pre-release
+commit of this package was configured in `nvidia-vgpud` for that card through the same drop-in,
+with `identity=on` and `identity_force_host=on`, and the daemon offered the L4 (`10de:27b8`) vGPU
+types on the card's VF. The archived evidence does not show which component rewrote the PCI ID to
+L4. That build is not proven to be byte-identical to this `gs_hook.c`, so this is not a measurement
+of this release's hook. From the code, for an Ada card the hook makes the same rewrite as for any
+table entry: device word `10de:2783` → `10de:27b8`, the board's subsystem kept. It does not check
+whether the driver runs with or without GSP.
+
 ## What it changes
 
 The hook looks only at `NV_ESC_RM_CONTROL` (`ioctl` request `0xc020462a`). It acts after the
@@ -60,7 +72,7 @@ leaves it inactive, and every `ioctl` then passes through:
 
    | Build | Status |
    |---|---|
-   | `580.159.01` | measured: the daemon accepted both selected GA102 boards as `10de:2230` and reported 23 vGPU types each |
+   | `580.159.01` | measured: the daemon accepted both selected GA102 boards as `10de:2230` and reported 23 vGPU types each. A pre-release build of the hook was also configured in `nvidia-vgpud` on this version with GSP off for one Ada card (see the status above) |
    | `580.178.05` | static only. Open headers of tag 580.178.04 (no 580.178.05 tag exists) are byte-identical to 580.159.03 for `nvos.h`, `ctrl2080bus.h`, `ctrl0080gpu.h`, `nv_escape.h` and `nv-ioctl-numbers.h`. No daemon has run under a hook on this build |
    | `595.91.04` | static only. No 595.91.04 source tag exists; the headers used are 595.91.07. No daemon has run under this hook on this build |
 

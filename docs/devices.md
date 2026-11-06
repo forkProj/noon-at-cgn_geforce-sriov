@@ -29,9 +29,10 @@ component.
   default. `experimental_vfs=on` is an opt-in for experiments only: where the hardware value is
   exactly 1 it presents up to 4 (the configured `vfs`, at most 4); a value of 0 stays 0. On
   Blackwell this also raises the count NVIDIA's driver sees; on Ada the driver still sees 1, so
-  only Linux shows more VFs. Both are untested, and the GPU firmware may still refuse more than
-  1 VF. The module refuses the load outright if the card's VF offset or stride would place a VF
-  outside functions 1–7. Details: [Ada and Blackwell](#ada-and-blackwell).
+  only Linux shows more VFs. On Blackwell this is untested, and the GPU firmware may still refuse
+  more than 1 VF; on the one measured Ada card only the first VF reached a vGPU
+  ([Ada host stack](ada.md)). The module refuses the load outright if the card's VF offset or
+  stride would place a VF outside functions 1–7. Details: [Ada and Blackwell](#ada-and-blackwell).
 - **Profile memory is not filtered.** The target's vGPU profile table is presented unchanged; it
   lists the target's profiles, not your card's capacity, so a card can be offered profiles larger
   than its own memory (for example a 10–12 GB GA102 card presented as the 48 GB RTX A6000). No
@@ -56,11 +57,15 @@ Only two identical `2206` cards, together and with one of them selected, have be
 All selected cards share the one installed NVIDIA vGPU-KVM host driver. A row in this table does not
 mean that a given driver build supports that card, or supports it together with the others: each
 card's vGPU target must be supported by the same driver build and flavour. The driver patch exists
-only for the builds in [driver-patch.md](driver-patch.md), and does not apply to GSP-based drivers,
-NVIDIA's open kernel modules, Ada or Blackwell. Blackwell needs the open flavour and Ampere was
-tested with the proprietary one ([NVIDIA driver flavour](#nvidia-driver-flavour)), so an Ampere and
-a Blackwell card cannot share one host with geforce-sriov today. Host layouts (switches, shared
-buses, IOMMU groups, BAR space) are covered in
+only for the builds in [driver-patch.md](driver-patch.md), and does not apply to GSP-based drivers
+or NVIDIA's open kernel modules; on its own it does not make a driver that runs Ada
+([Ada host stack](ada.md#the-two-nvidiako-changes)) or Blackwell. Blackwell needs the open
+flavour and Ampere was tested with the proprietary one
+([NVIDIA driver flavour](#nvidia-driver-flavour)), so an Ampere and a Blackwell card cannot share
+one host with geforce-sriov today. `geforce-sriov activate` restarts NVIDIA's daemons for the whole
+host, so it refuses while a GPU outside `bdfs` has VFs enabled; VFs of a selected Ampere card are
+allowed, but an Ampere and an Ada card under the one modified Ada module have not been run. Host
+layouts (switches, shared buses, IOMMU groups, BAR space) are covered in
 [the technical reference](technical-reference.md#multiple-gpus-and-pci-topology).
 
 ## Rows
@@ -93,7 +98,7 @@ buses, IOMMU groups, BAR space) are covered in
 | `2705` | AD103 | RTX 4070 Ti SUPER | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
 | `2709` | AD103 | RTX 4070 | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
 | `2782` | AD104 | RTX 4070 Ti | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
-| `2783` | AD104 | RTX 4070 SUPER | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
+| `2783` | AD104 | RTX 4070 SUPER | `27b8` L4 | any | yes | Ada | experimental; one board measured by hand with a host stack this package does not fully provide ([Ada host stack](ada.md)); 1 VF |
 | `2786` | AD104 | RTX 4070 | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
 | `2788` | AD104 | RTX 4060 Ti | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
 | `2803` | AD106 | RTX 4060 Ti | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
@@ -133,17 +138,19 @@ the kernel wrote during setup.
 
 ## Ada and Blackwell
 
-Only Ampere is confirmed to work. Ada and Blackwell use GSP firmware on vGPU hosts and are
-experimental only. What follows comes from NVIDIA's public driver source, public config-space dumps
-and the third-party reports below; none of it has been run with geforce-sriov.
+Only Ampere is confirmed to work with this package. NVIDIA's stock vGPU host drivers run Ada and
+Blackwell on GSP firmware. One Ada card, an RTX 4070 SUPER (`10de:2783`), ran vGPU guests on one
+host with a modified, CPU-only (GSP off) NVIDIA host stack that this package does not fully provide;
+what was measured and what is missing is in [Ada host stack](ada.md). Everything else below comes
+from NVIDIA's public driver source, public config-space dumps and the third-party reports below.
 
 | | Ada (AD10x) | Blackwell (GB20x) |
 |---|---|---|
 | VFs by default | 1, the card's own count | 1, the card's own count |
-| With `experimental_vfs=on` | Linux shows up to 4 VFs, but NVIDIA's driver still sees 1 (it reads the count through a BAR0 mirror that the module cannot change), so only one VF is expected to become a vGPU | Linux and NVIDIA's driver see up to 4 VFs. Untested: the GPU firmware may still refuse more than 1 VF |
+| With `experimental_vfs=on` | Linux shows up to 4 VFs, but NVIDIA's driver still sees 1 (it reads the count through a BAR0 mirror that the module cannot change). On the measured RTX 4070 SUPER only the first VF reached a vGPU; the others failed with `NV_ERR_OUT_OF_RANGE` | Linux and NVIDIA's driver see up to 4 VFs. Untested: the GPU firmware may still refuse more than 1 VF |
 | `twin_id` | not available | RTX 5090 (`2b85`) only ([below](#twin_id-rtx-5090-only)) |
-| NVIDIA driver flavour | untested on either flavour | open flavour needed, which geforce-sriov does not support yet ([below](#nvidia-driver-flavour)) |
-| Status | experimental; untested | experimental; RTX 5090 third-party reports mixed, not verified by geforce-sriov; other cards untested |
+| NVIDIA driver flavour | proprietary 580.159.01 with GSP off and a modified module, measured by hand on one card ([Ada host stack](ada.md)); the open flavour is not supported | open flavour needed, which geforce-sriov does not support yet ([below](#nvidia-driver-flavour)) |
+| Status | experimental; `2783` measured by hand on one board, every other Ada card untested | experimental; RTX 5090 third-party reports mixed, not verified by geforce-sriov; other cards untested |
 
 **Why 1 VF by default.** NVIDIA's driver does not use the count Linux sees. On these cards it reads
 TotalVFs from the hardware itself and accepts vGPUs only up to that count. On Blackwell it reads it
@@ -161,10 +168,14 @@ geforce-sriov's driver patch and install path support only the proprietary flavo
 - **Blackwell:** needs the open flavour. The proprietary 580.159.01 object does not support these
   GPUs on a vGPU host; NVIDIA's message for it reads `… installed in this vGPU host system is not
   supported by proprietary nvidia.ko`. Blackwell therefore cannot be completed with this package yet.
-- **Ada:** untested on either flavour.
+- **Ada:** NVIDIA's proprietary 580.159.01 host module refuses Ada at probe. With that check
+  bypassed by a two-byte change and `NVreg_EnableGpuFirmware=0`, it ran on the CPU without GSP on
+  the one measured RTX 4070 SUPER ([Ada host stack](ada.md)). geforce-sriov's patcher does not make
+  that change. The open flavour, which always uses GSP, ran Linux guests on that card only with
+  further lab-only workarounds, still showed scheduler stalls, and is not supported.
 
-This is what NVIDIA's driver source and the measured Ampere result lead to expect; NVIDIA's host
-documentation does not state it.
+This is what NVIDIA's driver source and the measured Ampere and Ada results lead to expect;
+NVIDIA's host documentation does not state it.
 
 ### Per-VF BARs on Blackwell
 

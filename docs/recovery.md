@@ -85,6 +85,14 @@ The same four kernel switches can be given once on the command line as
 install time with the same options on `geforce-sriov install` (which also takes `--vfs N`). The
 module's parameters are fixed at load time; to change them, reboot.
 
+## Ada: activate and the VF power gate
+
+`geforce-sriov activate` uses the same guard around each PF re-probe: when a PF does not come back
+to `nvidia` it exits 5, leaves the guard set and powers none of that card's VFs; recover as above
+(cold power cycle, `doctor`, `prepare --clear-guard`). Any other stop after it has restarted
+NVIDIA's daemons is exit 1. Its refusals, the `check` gate and how to undo the VF power and type
+settings are in [Ada host stack](ada.md#recovery).
+
 ## Remove the package
 
 ```sh
