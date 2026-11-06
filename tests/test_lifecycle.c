@@ -543,6 +543,23 @@ static void test_cli_mutation_guards(void)
 	rc = run_cli(&out, NULL, (const char *const[]){ "install", "--help", NULL });
 	CHECK(rc == 0 && contains(out, "Usage:"), "install --help: %d", rc);
 	free(out);
+	{
+		static const char *const usage_cases[][4] = {
+			{ "activate", "--sysfs-root", "/tmp", NULL },
+			{ "activate", "--type", "0", NULL },
+			{ "activate", "--type", "0911", NULL },
+			{ "activate", "--type=1000000", NULL, NULL },
+			{ "activate", "--device", "0000:03:00.4", NULL },
+			{ "check", "--dry-run", NULL, NULL },
+			{ "check", "--type", "x", NULL },
+		};
+
+		for (size_t k = 0; k < sizeof(usage_cases) / sizeof(usage_cases[0]); k++) {
+			rc = run_cli(&out, NULL, usage_cases[k]);
+			CHECK(rc == GS_EXIT_USAGE, "%s %s: %d", usage_cases[k][0], usage_cases[k][1], rc);
+			free(out);
+		}
+	}
 	if (geteuid() != 0) {
 		rc = run_cli(&out, NULL, (const char *const[]){ "prepare", NULL });
 		CHECK(rc == GS_EXIT_REFUSED && contains(out, "must run as root"), "prepare non-root: %d", rc);
@@ -556,6 +573,9 @@ static void test_cli_mutation_guards(void)
 		rc = run_cli(&out, NULL, (const char *const[]){ "install", "--source", srcdir, NULL });
 		CHECK(rc == GS_EXIT_REFUSED && contains(out, "set DESTDIR to stage"), "live install non-root: %d\n%s",
 		      rc, out);
+		free(out);
+		rc = run_cli(&out, NULL, (const char *const[]){ "activate", NULL });
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, "must run as root"), "activate non-root: %d", rc);
 		free(out);
 	}
 }
@@ -1362,7 +1382,32 @@ static struct {
 	const char *no_sriov;  /* rescan brings this PF back without SR-IOV */
 	int modprobe_fail;
 	int stuck_console;     /* the framebuffer unbind write succeeds but its driver stays bound */
+	int lock_denied;       /* NVIDIA's unbindLock reads 0 after a write of 1 (a client holds the GPU) */
+	int systemctl_rc;      /* exit status of every systemctl command */
 } sim;
+
+/*
+ * NVIDIA's driver probing a PF with VFs: each VF's vfio device registers again, which sets
+ * its power/control back to auto, and the vGPU manager publishes the VF's types.
+ */
+static void sim_register_vfs(const char *pf)
+{
+	char p[GS_PATH_MAX], real[PATH_MAX];
+
+	for (unsigned int i = 0;; i++) {
+		gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/virtfn%u", sim.root, pf, i);
+		if (!realpath(p, real))
+			return;
+		gs_pathf(p, sizeof(p), "%s/power/control", real);
+		writef(p, "auto\n");
+		gs_pathf(p, sizeof(p), "%s/power/runtime_status", real);
+		writef(p, "suspended\n");
+		gs_pathf(p, sizeof(p), "%s/nvidia/creatable_vgpu_types", real);
+		writef(p, "ID    : vGPU Name\n908   : NVIDIA L4-1Q\n911   : NVIDIA L4-2Q\n");
+		gs_pathf(p, sizeof(p), "%s/nvidia/current_vgpu_type", real);
+		writef(p, "0\n");
+	}
+}
 
 static void sim_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -1425,6 +1470,10 @@ static int sim_write(const char *path, const char *value)
 		}
 		return 0;
 	}
+	if (ends_with(r, "/unbindLock")) {
+		writef(path, "%s\n", sim.lock_denied ? "0" : value);
+		return 0;
+	}
 	if (strncmp(r, "bus/platform/devices/", 21) == 0 && ends_with(r, "/driver/unbind") && sim.stuck_console)
 		return 0;
 	if (strncmp(r, "bus/platform/devices/", 21) == 0 && ends_with(r, "/driver/unbind")) {
@@ -1444,7 +1493,15 @@ static int sim_write(const char *path, const char *value)
 			return -ENODEV;
 		gs_pathf(q, sizeof(q), "%s/driver", real);
 		gs_pathf(p, sizeof(p), "%.*s", (int)(strlen(path) - 5), path);
-		return symlink(p, q) ? -errno : 0;
+		if (symlink(p, q))
+			return -errno;
+		if (strcmp(r, "bus/pci/drivers/nvidia/bind") == 0)
+			sim_register_vfs(value);
+		return 0;
+	}
+	if (strncmp(r, "bus/pci/drivers/", 16) == 0 && ends_with(r, "/unbind")) {
+		gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/driver", sim.root, value);
+		return unlink(p) ? -errno : 0;
 	}
 	if (strncmp(r, "bus/pci/devices/", 16) == 0 && ends_with(r, "/driver/unbind")) {
 		gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/driver", sim.root, value);
@@ -1522,6 +1579,8 @@ static int sim_run(const char *const argv[])
 	for (size_t i = 0; argv[i]; i++)
 		strcat(strcat(line, " "), argv[i]);
 	sim_log("%s\n", line);
+	if (strcmp(argv[0], "systemctl") == 0)
+		return sim.systemctl_rc;
 	if (strcmp(argv[0], "modprobe") != 0 || sim.modprobe_fail)
 		return 1;
 	/* Like the module: vfs defaults to GS_DEFAULT_VFS when modprobe does not pass it. */
@@ -2235,6 +2294,406 @@ static void test_vf_count(void)
 	CHECK(gs_check_presented(&c, &cfg, why, sizeof(why)) != 0, "nothing presented: refused");
 }
 
+/* ---- activate and check (Ada) ----------------------------------------- */
+
+static const struct fx_fn ada_gpu[] = {
+	{ "0000:03:00.0", "2783", "030000", "nvidia" },
+	{ "0000:03:00.1", "22bc", "040300", "snd_hda_intel" },
+	{ "0000:03:00.4", "2783", "030000", "nvidia" },
+	{ NULL, NULL, NULL, NULL },
+};
+
+#define ADA_DEV "devices/pci0000:00/0000:00:02.0/"
+
+static void sim_writef(const char *rel, const char *text)
+{
+	char p[GS_PATH_MAX];
+
+	gs_pathf(p, sizeof(p), "%s/%s", sim.root, rel);
+	writef(p, "%s", text);
+}
+
+/*
+ * The measured Ada host after `enable`: AD104 PF 0000:03:00.0 and its one VF 0000:03:00.4 on
+ * nvidia, prepared this boot, NVIDIA's 580.159.01 driver loaded with GSP off. The VF reads
+ * on/active, as an early udev hook leaves it before the re-probe.
+ */
+static void ada_host(const char *name, char *root, size_t len)
+{
+	char p[GS_PATH_MAX], boot[64] = "";
+
+	snprintf(root, len, "%s/%s", tmp, name);
+	make_card(root, &topo_default, ada_gpu, 0, "1/1");
+	memset(&sim, 0, sizeof(sim));
+	gs_copy(sim.root, sizeof(sim.root), root);
+	gs_pathf(sim.proc, sizeof(sim.proc), "%s/proc", root);
+	gs_pathf(sim.state, sizeof(sim.state), "%s/state", root);
+	gs_pathf(sim.run, sizeof(sim.run), "%s/run", root);
+	gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.4/physfn", root);
+	link_to("../0000:03:00.0", p);
+	gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.0/virtfn0", root);
+	link_to("../0000:03:00.4", p);
+	sim_writef(ADA_DEV "0000:03:00.4/power/control", "on\n");
+	sim_writef(ADA_DEV "0000:03:00.4/power/runtime_status", "active\n");
+	sim_writef(ADA_DEV "0000:03:00.4/nvidia/current_vgpu_type", "0\n");
+	sim_writef("proc/driver/nvidia/version",
+		   "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.01  Release Build\n"
+		   "GCC version:  gcc version 12.2.0 (Debian 12.2.0-14)\n");
+	sim_writef("proc/driver/nvidia/params", "ResmanDebugLevel: 4294967295\nEnableGpuFirmware: 0\nRegistryDwords: \"\"\n");
+	sim_writef("proc/driver/nvidia/gpus/0000:03:00.0/unbindLock", "0\n");
+	sim_writef("module/nvidia_vgpu_vfio/refcnt", "0\n");
+	gs_boot_id(boot, sizeof(boot));
+	gs_pathf(p, sizeof(p), "%s/run/" GS_PREPARED_NAME "/0000:03:00.0", root);
+	writef(p, "boot_id=%s\ntotalvfs=1\nari_enabled=1\n", boot);
+}
+
+static int child_activate(const struct gs_config *cfg, const struct gs_activate_opts *o)
+{
+	struct gs_host h = { sim.root, sim.proc, sim.state, sim.run, sim_write, sim_run };
+
+	return gs_activate(&h, cfg, o);
+}
+
+static int child_check(const struct gs_config *cfg, const struct gs_activate_opts *o)
+{
+	struct gs_host h = { sim.root, sim.proc, sim.state, sim.run, sim_write, sim_run };
+
+	return gs_check_vfs(&h, cfg, o);
+}
+
+/* fn against the simulated host in a child; returns its exit status and output. */
+static int run_ada(int (*fn)(const struct gs_config *, const struct gs_activate_opts *), const struct gs_config *cfg,
+		   const struct gs_activate_opts *o, char **out)
+{
+	int pipefd[2];
+	pid_t pid;
+
+	if (pipe(pipefd))
+		die("pipe");
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (pid == 0) {
+		int rc;
+
+		dup2(pipefd[1], 1);
+		dup2(pipefd[1], 2);
+		close(pipefd[0]);
+		rc = fn(cfg, o);
+		fflush(stdout);
+		fflush(stderr);
+		_exit(rc);
+	}
+	close(pipefd[1]);
+	return collect(pipefd[0], pid, out);
+}
+
+static void check_ada_untouched(const char *what)
+{
+	char *log = sim_text("sim.log");
+
+	CHECK(!log, "%s: no write and no command: %s", what, log ? log : "");
+	CHECK(!sim_exists("state/" GS_ATTEMPT_NAME), "%s: no guard", what);
+	free(log);
+}
+
+static void test_activate(void)
+{
+	static const char *const order[] = {
+		"R systemctl restart nvidia-vgpud.service\n",
+		"R systemctl restart nvidia-vgpu-mgr.service\n",
+		"R systemctl is-active --quiet nvidia-vgpu-mgr.service\n",
+		"W proc/driver/nvidia/gpus/0000:03:00.0/unbindLock 1\n",
+		"W bus/pci/drivers/nvidia/unbind 0000:03:00.0\n",
+		"W bus/pci/drivers/nvidia/bind 0000:03:00.0\n",
+		"W bus/pci/devices/0000:03:00.4/nvidia/current_vgpu_type 911\n",
+		"W bus/pci/devices/0000:03:00.4/power/control on\n",
+	};
+	static const struct {
+		const char *name, *rel, *text, *msg;
+	} refusals[] = {
+		{ "ada-gsp", "proc/driver/nvidia/params", "EnableGpuFirmware: 18\n", "NVreg_EnableGpuFirmware=0" },
+		{ "ada-ver", "proc/driver/nvidia/version", "NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.91.04  Release Build\n",
+		  "measured only with 580.159.01" },
+		{ "ada-vgpu", ADA_DEV "0000:03:00.4/nvidia/current_vgpu_type", "911\n", "would end it" },
+		{ "ada-novf", ADA_DEV "0000:03:00.0/sriov_numvfs", "0\n", "run `geforce-sriov enable` first" },
+		{ "ada-ampere", ADA_DEV "0000:03:00.0/device", "0x2206\n", "no selected GPU is an Ada GPU" },
+	};
+	char root[GS_PATH_MAX], p[GS_PATH_MAX], *out, *log, *t;
+	struct gs_activate_opts o;
+	struct gs_config cfg;
+	unsigned int v = 0;
+	long prev = -1;
+	int rc;
+
+	CHECK(gs_parse_vgpu_type("911", &v) == 0 && v == 911, "type 911");
+	CHECK(gs_parse_vgpu_type("0", &v) != 0 && gs_parse_vgpu_type("0911", &v) != 0 &&
+	      gs_parse_vgpu_type("1000000", &v) != 0 && gs_parse_vgpu_type("9x", &v) != 0, "bad types refused");
+	cfg_of(&cfg, "bdfs=0000:03:00.0\n");
+
+	/* The measured order; the type and power/control come after the last re-probe. */
+	ada_host("ada-ok", root, sizeof(root));
+	memset(&o, 0, sizeof(o));
+	o.type = 911;
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "NOT READY 0000:03:00.4"), "check before activate: %d\n%s", rc, out);
+	free(out);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_OK, "activate: %d\n%s", rc, out);
+	for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
+		long at = pos_of(log, order[k]);
+
+		CHECK(at > prev, "activate order: %s at %ld, after %ld\n%s", order[k], at, prev, log ? log : "");
+		if (at >= 0)
+			prev = at;
+	}
+	CHECK(!contains(log, "rescan") && !contains(log, "/remove"), "activate never removes or rescans: %s", log);
+	CHECK(!sim_exists("state/" GS_ATTEMPT_NAME), "guard cleared after the re-probe");
+	t = sim_text(ADA_DEV "0000:03:00.4/power/control");
+	CHECK(t && strcmp(t, "on\n") == 0, "VF power/control on after the re-probe: %s", t ? t : "(none)");
+	free(t);
+	t = sim_text(ADA_DEV "0000:03:00.4/nvidia/current_vgpu_type");
+	CHECK(t && strncmp(t, "911", 3) == 0 && (t[3] == '\0' || t[3] == '\n'), "VF type 911: %s", t ? t : "(none)");
+	free(t);
+	free(log);
+	free(out);
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_OK && contains(out, "OK 0000:03:00.4"), "check after activate: %d\n%s", rc, out);
+	free(out);
+	o.type = 912;
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL, "check with another type: %d\n%s", rc, out);
+	free(out);
+	/* A later re-probe (or manager restart) sets power/control back to auto: check fails closed. */
+	sim_register_vfs("0000:03:00.0");
+	o.type = 0;
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "power/control=auto"), "check after a re-registration: %d\n%s", rc, out);
+	free(out);
+
+	/* Without --type the type is the operator's: never written. */
+	ada_host("ada-notype", root, sizeof(root));
+	memset(&o, 0, sizeof(o));
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_OK && !contains(log, "current_vgpu_type") && contains(log, "0000:03:00.4/power/control on"),
+	      "activate without --type: %d\n%s\n%s", rc, out, log);
+	free(log);
+	free(out);
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_OK && contains(out, "no vGPU type yet"), "check without --type: %d\n%s", rc, out);
+	free(out);
+
+	/* --dry-run: every check, then the steps, and no change. */
+	ada_host("ada-dry", root, sizeof(root));
+	o.dry_run = 1;
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_OK && contains(out, "dry run"), "dry run: %d\n%s", rc, out);
+	check_ada_untouched("dry run");
+	free(out);
+	o.dry_run = 0;
+
+	for (size_t k = 0; k < sizeof(refusals) / sizeof(refusals[0]); k++) {
+		ada_host(refusals[k].name, root, sizeof(root));
+		sim_writef(refusals[k].rel, refusals[k].text);
+		rc = run_ada(child_activate, &cfg, &o, &out);
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, refusals[k].msg), "%s: %d\n%s", refusals[k].name, rc, out);
+		check_ada_untouched(refusals[k].name);
+		free(out);
+	}
+
+	/* The VF must be the PF's own: its physfn link leads back to the PF. */
+	ada_host("ada-physfn", root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.4/physfn", root);
+	link_to("../0000:03:00.1", p);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "does not lead back"), "physfn: %d\n%s", rc, out);
+	check_ada_untouched("physfn");
+	free(out);
+
+	/* A VF handed to another driver is refused. */
+	ada_host("ada-vfio", root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.4/driver", root);
+	link_to("../../../../bus/pci/drivers/vfio-pci", p);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "bound to vfio-pci, not nvidia"), "VF driver: %d\n%s", rc, out);
+	check_ada_untouched("VF driver");
+	free(out);
+
+	/* Not prepared this boot. */
+	ada_host("ada-unprepared", root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/run/" GS_PREPARED_NAME "/0000:03:00.0", root);
+	unlink(p);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "not prepared this boot"), "unprepared: %d\n%s", rc, out);
+	check_ada_untouched("unprepared");
+	free(out);
+
+	/* --device outside the selection. */
+	ada_host("ada-device", root, sizeof(root));
+	o.ndevices = 1;
+	gs_addr_parse("0000:05:00.0", &o.devices[0]);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "is not selected"), "--device: %d\n%s", rc, out);
+	check_ada_untouched("--device");
+	free(out);
+	o.ndevices = 0;
+
+	/* The guard of an unfinished attempt stops everything. */
+	ada_host("ada-guard", root, sizeof(root));
+	sim_writef("state/" GS_ATTEMPT_NAME, "boot_id=x\nstep=reprobe\n");
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_COLD_CYCLE && !log, "guard set: %d\n%s", rc, out);
+	free(log);
+	free(out);
+
+	/* A client holds the GPU: the lock is released and nothing is unbound. */
+	ada_host("ada-lock", root, sizeof(root));
+	sim.lock_denied = 1;
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "did not grant unbindLock") && contains(out, "were restarted") &&
+	      contains(log, "R systemctl restart nvidia-vgpu-mgr.service"), "lock denied after the daemon restart: %d\n%s", rc, out);
+	CHECK(contains(log, "unbindLock 1\n") && contains(log, "unbindLock 0\n") && !contains(log, "drivers/nvidia/unbind") &&
+	      !contains(log, "power/control"), "lock denied: released, nothing unbound: %s", log);
+	CHECK(!sim_exists("state/" GS_ATTEMPT_NAME) && sim_exists(ADA_DEV "0000:03:00.0/driver"), "lock denied: no guard, PF bound");
+	free(log);
+	free(out);
+
+	/* A PF driver_override other than nvidia would make the re-probe's bind fail: refused first. */
+	ada_host("ada-override", root, sizeof(root));
+	sim_writef(ADA_DEV "0000:03:00.0/driver_override", "pci-pf-stub\n");
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "driver_override=pci-pf-stub"), "driver_override: %d\n%s", rc, out);
+	check_ada_untouched("driver_override");
+	free(out);
+
+	/* An unselected GPU with VFs: the daemon restart would re-register them unpowered. Refused. */
+	{
+		static const struct fx_fn other_04[] = {
+			{ "0000:04:00.0", "2206", "030000", "nvidia" },
+			{ "0000:04:00.4", "2206", "030000", "nvidia" },
+			{ NULL, NULL, NULL, NULL },
+		};
+
+		ada_host("ada-foreign", root, sizeof(root));
+		make_card(root, &topo_display, other_04, 0, "1/1");
+		gs_pathf(p, sizeof(p), "%s/devices/%s/0000:04:00.4/physfn", root, topo_display.bridge_path);
+		link_to("../0000:04:00.0", p);
+		rc = run_ada(child_activate, &cfg, &o, &out);
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, "VF 0000:04:00.4 of 0000:04:00.0") &&
+		      contains(out, "that GPU is not selected"), "foreign VFs: %d\n%s", rc, out);
+		check_ada_untouched("foreign VFs");
+		free(out);
+	}
+
+	/* A selected Ampere GPU with VFs: activate goes ahead, names it and writes nothing for it. */
+	{
+		static const struct fx_fn ampere_04[] = {
+			{ "0000:04:00.0", "2206", "030000", "nvidia" },
+			{ "0000:04:00.4", "2206", "030000", "nvidia" },
+			{ NULL, NULL, NULL, NULL },
+		};
+		struct gs_config mixed;
+
+		ada_host("ada-mixed", root, sizeof(root));
+		make_card(root, &topo_display, ampere_04, 0, "1/1");
+		gs_pathf(p, sizeof(p), "%s/devices/%s/0000:04:00.4/physfn", root, topo_display.bridge_path);
+		link_to("../0000:04:00.0", p);
+		cfg_of(&mixed, "bdfs=0000:03:00.0,0000:04:00.0\n");
+		rc = run_ada(child_activate, &mixed, &o, &out);
+		log = sim_text("sim.log");
+		CHECK(rc == GS_EXIT_OK && contains(out, "note: VF 0000:04:00.4 of 0000:04:00.0") && !contains(log, "0000:04:00"),
+		      "mixed Ampere + Ada: %d\n%s\n%s", rc, out, log);
+		free(log);
+		free(out);
+	}
+
+	/* Two selected Ada GPUs: --device naming one is refused, the daemon restart covers both. */
+	{
+		static const struct fx_fn ada_04[] = {
+			{ "0000:04:00.0", "2783", "030000", "nvidia" },
+			{ NULL, NULL, NULL, NULL },
+		};
+		struct gs_config two;
+
+		ada_host("ada-two", root, sizeof(root));
+		make_card(root, &topo_display, ada_04, 0, "1/1");
+		cfg_of(&two, "bdfs=0000:03:00.0,0000:04:00.0\n");
+		o.ndevices = 1;
+		gs_addr_parse("0000:03:00.0", &o.devices[0]);
+		rc = run_ada(child_activate, &two, &o, &out);
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, "name every\nselected Ada GPU"), "--device subset: %d\n%s", rc, out);
+		check_ada_untouched("--device subset");
+		free(out);
+		o.ndevices = 0;
+	}
+
+	/* nvidia-vgpud does not start: no GPU is touched. */
+	ada_host("ada-vgpud", root, sizeof(root));
+	sim.systemctl_rc = 1;
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_FAIL && !contains(log, "unbindLock") && !contains(log, "nvidia-vgpu-mgr"), "vgpud fails: %d\n%s",
+	      rc, log);
+	free(log);
+	free(out);
+
+	/* The PF does not come back to nvidia: the guard stays, no VF is powered, nothing rescans. */
+	ada_host("ada-lost", root, sizeof(root));
+	sim.fail = "drivers/nvidia/bind";
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_COLD_CYCLE && sim_exists("state/" GS_ATTEMPT_NAME), "PF lost: %d\n%s", rc, out);
+	CHECK(!contains(log, "power/control") && !contains(log, "rescan"), "PF lost: no power write, no rescan: %s", log);
+	free(log);
+	free(out);
+
+	/* nvidia_vgpu_vfio is not loaded: refused. */
+	ada_host("ada-novfio", root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/module/nvidia_vgpu_vfio", root);
+	cleanup(p);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "nvidia_vgpu_vfio is not loaded"), "no vfio module: %d\n%s", rc, out);
+	check_ada_untouched("no vfio module");
+	free(out);
+
+	/* The plugin gate fails closed: an unknown file and a missing one are both refused. */
+	ada_host("ada-plugin", root, sizeof(root));
+	gs_pathf(p, sizeof(p), "%s/libnvidia-vgpu.so", root);
+	writef(p, "not NVIDIA's plugin\n");
+	o.plugin = p;
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "neither NVIDIA's 580.159.01 plugin nor its H5 copy"), "unknown plugin: %d\n%s",
+	      rc, out);
+	check_ada_untouched("unknown plugin");
+	free(out);
+	gs_pathf(p, sizeof(p), "%s/no-such-libnvidia-vgpu.so", root);
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "cannot read"), "missing plugin: %d\n%s", rc, out);
+	check_ada_untouched("missing plugin");
+	free(out);
+	o.plugin = NULL;
+
+	/* An activate that did not finish leaves its record: check fails closed. */
+	ada_host("ada-record", root, sizeof(root));
+	sim_writef("run/" GS_ACTIVATING_NAME, "boot_id=x\npfs=0000:03:00.0\n");
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "NOT READY: ") && contains(out, GS_ACTIVATING_NAME), "record: %d\n%s", rc, out);
+	free(out);
+
+	/* check names an Ampere card: refused. */
+	ada_host("ada-check-ampere", root, sizeof(root));
+	sim_writef(ADA_DEV "0000:03:00.0/device", "0x2206\n");
+	o.ndevices = 1;
+	gs_addr_parse("0000:03:00.0", &o.devices[0]);
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "not an Ada GPU"), "check on Ampere: %d\n%s", rc, out);
+	free(out);
+}
+
 int main(void)
 {
 	cli = getenv("GS_CLI");
@@ -2267,6 +2726,7 @@ int main(void)
 	test_prepare_default_and_deferral();
 	test_prepare_release();
 	test_vf_count();
+	test_activate();
 	test_enable_check();
 
 	cleanup(tmp);

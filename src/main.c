@@ -22,6 +22,14 @@ static void usage(FILE *f)
 		"                             next step; exits 0 only when each was prepared this boot and\n"
 		"                             passes the SR-IOV and BAR checks (exit 1 is normal before the\n"
 		"                             first prepared boot)\n"
+		"  check [--device BDF]... [--type N]\n"
+		"                             Ada: before every VM start, each VF of the selected Ada GPUs\n"
+		"                             must be bound to nvidia with power/control on and\n"
+		"                             runtime_status active (and vGPU type N with --type);\n"
+		"                             exit 0 ready, 1 not ready, 3 refused (config invalid, no Ada\n"
+		"                             GPU selected, a --device not selected or not Ada, or a\n"
+		"                             selected GPU missing). A point-in-time read: it does\n"
+		"                             not stop a later re-probe or daemon restart\n"
 		"\n"
 		"Changing the system (root; the live /sys only):\n"
 		"  install [--prefix PATH] [--device BDF]... [--boot-display-release BDF]... [--vfs N]\n"
@@ -43,6 +51,15 @@ static void usage(FILE *f)
 		"  prepare --clear-guard      clear the guard of an unfinished attempt, after a power cycle\n"
 		"  uninstall [--unload]       remove only files installed by geforce-sriov; --unload also\n"
 		"                             unloads the module when no VF is active and no GPU was prepared\n"
+		"  activate [--device BDF]... [--type N] [--dry-run]\n"
+		"                             Ada, after `enable`: restart nvidia-vgpud and nvidia-vgpu-mgr,\n"
+		"                             re-probe each selected Ada GPU (driver unbind and bind, no\n"
+		"                             rescan), with --type N set that vGPU type on its VF, then set\n"
+		"                             power/control=on on every VF and read it back. Needs your own\n"
+		"                             580.159.01 CPU-RM stack (docs/ada.md); refuses while any vGPU\n"
+		"                             exists on the host; run it only while no VM can start (it\n"
+		"                             restarts the host-wide daemons). --dry-run checks and prints\n"
+		"                             the steps\n"
 		"\n"
 		"  --vfs N                    VFs per selected GPU, 1 up to the card's hardware default\n"
 		"                             (`devices` lists it); default %u. ARI decoding in the GPU does\n"
@@ -170,6 +187,35 @@ static int parse_switch_opt(int argc, char **argv, int *i, struct gs_overrides *
 	return 0;
 }
 
+/* --device and --type of activate and check; --dry-run too when with_dry. */
+static int parse_ada_opts(int argc, char **argv, struct gs_activate_opts *o, int with_dry)
+{
+	int i, r;
+
+	memset(o, 0, sizeof(*o));
+	for (i = 2; i < argc; i++) {
+		const char *v;
+
+		if ((v = opt_value(argc, argv, &i, "--device"))) {
+			if ((r = parse_device("--device", v, o->devices, &o->ndevices)))
+				return r;
+			if (o->devices[o->ndevices - 1].func != 0)
+				return bad("--device %s: name the physical function .0", v);
+		} else if ((v = opt_value(argc, argv, &i, "--type"))) {
+			if (o->type)
+				return bad("%s given twice", "--type");
+			if (gs_parse_vgpu_type(v, &o->type))
+				return bad("--type '%s': give a vGPU type ID, 1 to %u, as nvidia/creatable_vgpu_types lists it", v,
+					   GS_VGPU_TYPE_MAX);
+		} else if (with_dry && strcmp(argv[i], "--dry-run") == 0) {
+			o->dry_run = 1;
+		} else {
+			return unknown_opt(argv[i], 0);
+		}
+	}
+	return 0;
+}
+
 static int diag_main(int argc, char **argv, int status)
 {
 	struct gs_diag_opts o;
@@ -254,6 +300,13 @@ int main(int argc, char **argv)
 		return diag_main(argc, argv, 0);
 	if (strcmp(cmd, "status") == 0)
 		return diag_main(argc, argv, 1);
+	if (strcmp(cmd, "check") == 0) {
+		struct gs_activate_opts o;
+
+		if ((r = parse_ada_opts(argc, argv, &o, 0)))
+			return r;
+		return gs_cmd_check(&o);
+	}
 
 	if ((r = reject_diag_opts(argc, argv)))
 		return r;
@@ -346,6 +399,13 @@ int main(int argc, char **argv)
 		if (argc > 2)
 			return unknown_opt(argv[2], 0);
 		return gs_cmd_enable();
+	}
+	if (strcmp(cmd, "activate") == 0) {
+		struct gs_activate_opts o;
+
+		if ((r = parse_ada_opts(argc, argv, &o, 1)))
+			return r;
+		return gs_cmd_activate(&o);
 	}
 	if (strcmp(cmd, "uninstall") == 0) {
 		int unload = 0;

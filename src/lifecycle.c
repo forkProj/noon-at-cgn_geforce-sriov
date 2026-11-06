@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 /*
- * devices, doctor, status (read-only, any sysfs root) and prepare, enable
- * (live system; prepare also against a fixture host in the tests).
+ * devices, doctor, status, check (read-only, any sysfs root) and prepare, enable, activate
+ * (live system; prepare and activate also against a fixture host in the tests).
  *
  * The prepare sequence follows these rules: one guarded attempt, refuse the
  * boot display unless the config grants its console release and the operator
@@ -35,6 +35,12 @@
 #define VF_BIND_WAIT_MS 15000
 #define POLL_MS 100
 #define RELEASE_WAIT_MS 2000
+#define MGR_ACTIVE_WAIT_MS 10000
+#define PF_REBIND_WAIT_MS 10000
+#define VF_TYPES_WAIT_MS 15000
+#define VF_ACTIVE_WAIT_MS 1000
+/* The measured bring-up paused 3 s after starting nvidia-vgpu-mgr before the PF re-probe. */
+#define MGR_SETTLE_MS 3000
 
 static const char *const recovery_msg =
 	"Recovery: do not rescan again and do not warm-reboot in a loop. Power the machine fully off\n"
@@ -49,6 +55,16 @@ static const char *const recovery_msg =
 #define BLACKWELL_DRIVER_NOTE \
 	"the closed 580.159.01 driver does not support this GPU; Blackwell needs NVIDIA's open kernel module, " \
 	"which geforce-sriov does not support yet"
+/* Doctor's note for every selected Ada card: what the package does not provide. */
+#define ADA_STACK_NOTE \
+	"Ada needs your own NVIDIA 580.159.01 proprietary (CPU-RM) host stack: nvidia.ko rebuilt with the Ada probe-gate " \
+	"and scheduler changes, loaded with NVreg_EnableGpuFirmware=0, and the H5 copy of libnvidia-vgpu.so " \
+	"(docs/ada.md); geforce-sriov builds and installs none of them. After `enable`: `geforce-sriov activate`, " \
+	"and `geforce-sriov check` before every VM start"
+/* The measured Ada host stack (docs/ada.md); activate refuses anything else. */
+#define ADA_DRIVER_VERSION "580.159.01"
+#define ADA_PLUGIN_STOCK_SHA "7e52b76dc7ca8490e7ffbc1fd724f5db07f3791a3a2ec07f2d595bf05abdcaa7"
+#define ADA_PLUGIN_H5_SHA "097f571588f3a232265103b73e38ba111ddb44ef329ac720562cff71e6170d37"
 /* The module refuses to load with twin_id=1 when no listed PF has twin dwords. */
 #define TWIN_ID_NONE "twin_id=on, but no selected GPU is a GB202, so the module refuses to load"
 
@@ -454,13 +470,14 @@ static int unit_file_present(const char *name)
 	return 0;
 }
 
-static void nvidia_version(char *out, size_t len)
+/* The x.y.z version in procroot/driver/nvidia/version; "" when NVIDIA's driver is not loaded. */
+static void nvidia_version(const char *procroot, char *out, size_t len)
 {
-	char *data, *tok, *save = NULL;
+	char *data, *tok, *save = NULL, p[GS_PATH_MAX];
 	size_t dlen;
 
 	out[0] = '\0';
-	if (gs_read_whole("/proc/driver/nvidia/version", &data, &dlen, 1 << 16))
+	if (gs_pathf(p, sizeof(p), "%s/driver/nvidia/version", procroot) || gs_read_whole(p, &data, &dlen, 1 << 16))
 		return;
 	for (tok = strtok_r(data, " \t\n", &save); tok; tok = strtok_r(NULL, " \t\n", &save)) {
 		unsigned int a, b, c;
@@ -544,6 +561,8 @@ static void entry_checks(struct tally *t, const struct gs_card *c, const struct 
 	}
 	if (e->generation == GS_BLACKWELL)
 		check(t, "INFO", "%s: " BLACKWELL_DRIVER_NOTE, c->pf.str);
+	if (e->generation == GS_ADA)
+		check(t, "INFO", "%s: " ADA_STACK_NOTE, c->pf.str);
 	if (cfg->twin_id == GS_SW_ON && gs_has_twin_dwords(e))
 		check(t, "WARN", "%s: twin_id=on: %s", c->pf.str, GS_TWIN_ID_MSG);
 	else if (cfg->twin_id == GS_SW_ON)
@@ -917,7 +936,7 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 		}
 		if (deps_ok)
 			check(&t, "OK", "lspci and setpci found (sriov-manage needs them for `enable`)");
-		nvidia_version(ver, sizeof(ver));
+		nvidia_version(GS_LIVE_PROC, ver, sizeof(ver));
 		if (ver[0]) {
 			int known = 0;
 
@@ -2272,5 +2291,874 @@ int gs_cmd_enable(void)
 		else
 			break;
 	}
+	if (rc == GS_EXIT_OK)
+		for (i = 0; i < cfg.nbdfs; i++) {
+			struct gs_card c;
+
+			gs_card_inspect(GS_LIVE_SYSFS, &cfg.bdfs[i], &c);
+			if (c.entry && c.entry->generation == GS_ADA)
+				printf("%s (Ada): next `geforce-sriov activate`; it restarts nvidia-vgpud and nvidia-vgpu-mgr itself, in\n"
+				       "  the measured order, then re-probes the GPU and powers its VFs\n",
+				       cfg.bdfs[i].str);
+		}
 	return rc;
+}
+
+/* ---- activate and check: the Ada CPU-RM host stack ---------------------------------------- */
+
+int gs_parse_vgpu_type(const char *value, unsigned int *out)
+{
+	unsigned long v;
+	char *end;
+
+	if (!value || value[0] < '1' || value[0] > '9')
+		return -1;
+	errno = 0;
+	v = strtoul(value, &end, 10);
+	if (errno || *end || v > GS_VGPU_TYPE_MAX)
+		return -1;
+	*out = (unsigned int)v;
+	return 0;
+}
+
+/* One selected Ada PF and its enabled VFs, as its virtfnN and their physfn links name them. */
+struct ada_card {
+	struct gs_addr pf;
+	struct gs_addr vf[GS_VFS_MAX];
+	unsigned int nvf;
+};
+
+static int read_dev_attr(const char *sys, const char *bdf, const char *name, char *buf, size_t len)
+{
+	char p[GS_PATH_MAX];
+
+	buf[0] = '\0';
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/%s", sys, bdf, name))
+		return -ENAMETOOLONG;
+	return gs_read_attr(p, buf, len);
+}
+
+/* The name of the driver bdf is bound to; "" when unbound. */
+static void dev_driver(const char *sys, const char *bdf, char *out, size_t len)
+{
+	char p[GS_PATH_MAX], target[GS_PATH_MAX];
+	const char *base;
+	ssize_t n;
+
+	out[0] = '\0';
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/driver", sys, bdf))
+		return;
+	n = readlink(p, target, sizeof(target) - 1);
+	if (n <= 0)
+		return;
+	target[n] = '\0';
+	base = strrchr(target, '/');
+	gs_copy(out, len, base ? base + 1 : target);
+}
+
+/* virtfn0..numvfs-1 of pf, each confirmed by its own physfn link back to pf. 0, or -1 with why. */
+static int vf_list(const char *sys, const struct gs_addr *pf, unsigned int numvfs, struct gs_addr *out, char *why,
+		   size_t len)
+{
+	char p[GS_PATH_MAX], real[PATH_MAX];
+	const char *base;
+
+	if (numvfs > GS_VFS_MAX)
+		return snprintf(why, len, "%s has %u VFs, more than %u", pf->str, numvfs, GS_VFS_MAX), -1;
+	for (unsigned int i = 0; i < numvfs; i++) {
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/virtfn%u", sys, pf->str, i) || !realpath(p, real))
+			return snprintf(why, len, "%s: virtfn%u is missing", pf->str, i), -1;
+		base = strrchr(real, '/');
+		if (gs_addr_parse(base ? base + 1 : real, &out[i]))
+			return snprintf(why, len, "%s: virtfn%u names no PCI address", pf->str, i), -1;
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/physfn", sys, out[i].str) || !realpath(p, real) ||
+		    !(base = strrchr(real, '/')) || strcmp(base + 1, pf->str) != 0)
+			return snprintf(why, len, "%s: the physfn link of its virtfn%u %s does not lead back to it", pf->str, i,
+					out[i].str), -1;
+	}
+	return 0;
+}
+
+/*
+ * The selected Ada GPUs, or those named by --device. A --device outside the selection or not an
+ * Ada card, and a selected card that is missing, are refused; other selected cards are skipped.
+ */
+static int select_ada(const char *sys, const struct gs_config *cfg, const struct gs_activate_opts *o,
+		      struct ada_card *out, unsigned int *n)
+{
+	*n = 0;
+	for (unsigned int i = 0; i < o->ndevices; i++) {
+		if (!addr_listed(cfg->bdfs, cfg->nbdfs, o->devices[i].str)) {
+			fprintf(stderr, "geforce-sriov: refused, nothing changed: --device %s is not selected (bdfs= in %s)\n",
+				o->devices[i].str, gs_config_path());
+			return GS_EXIT_REFUSED;
+		}
+	}
+	for (unsigned int i = 0; i < cfg->nbdfs; i++) {
+		const struct gs_addr *pf = &cfg->bdfs[i];
+		int named = addr_listed(o->devices, o->ndevices, pf->str);
+		struct gs_card c;
+
+		if (o->ndevices && !named)
+			continue;
+		gs_card_inspect(sys, pf, &c);
+		if (!c.present) {
+			fprintf(stderr, "geforce-sriov: refused, nothing changed: %s is missing\n", pf->str);
+			return GS_EXIT_REFUSED;
+		}
+		if (c.entry && c.entry->generation == GS_ADA) {
+			out[(*n)++].pf = *pf;
+			continue;
+		}
+		if (named) {
+			fprintf(stderr, "geforce-sriov: refused, nothing changed: %s is not an Ada GPU (%s); this step is for Ada GPUs only\n",
+				pf->str, c.entry ? gs_generation_name(c.entry->generation) : "not in the device table");
+			return GS_EXIT_REFUSED;
+		}
+		printf("%s: %s, skipped: this step is for Ada GPUs only (no re-probe, type or power write for it)\n", pf->str,
+		       c.entry ? gs_generation_name(c.entry->generation) : "not in the device table");
+	}
+	if (*n == 0) {
+		fprintf(stderr, "geforce-sriov: refused, nothing changed: no selected GPU is an Ada GPU\n");
+		return GS_EXIT_REFUSED;
+	}
+	return 0;
+}
+
+/*
+ * An NVIDIA VF on the host whose PF is not selected in the config: 1 with which, 0 none, -1 when
+ * the device list is unreadable. VFs of a selected GPU that activate does not act on (Ampere,
+ * Blackwell) are named in a note: the daemon restart re-registers them, as their own flow does.
+ */
+static int foreign_vf(const char *sys, const struct gs_config *cfg, const struct ada_card *cards, unsigned int n,
+		      char *which, size_t len)
+{
+	char p[GS_PATH_MAX], real[PATH_MAX];
+	const char *base;
+	struct dirent *de;
+	unsigned int vendor, i;
+	int found = 0;
+	DIR *d;
+
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices", sys) || !(d = opendir(p)))
+		return snprintf(which, len, "%s/bus/pci/devices is unreadable", sys), -1;
+	while (!found && (de = readdir(d))) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/physfn", sys, de->d_name) || !realpath(p, real))
+			continue;
+		base = strrchr(real, '/');
+		base = base ? base + 1 : real;
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/vendor", sys, de->d_name) || gs_read_hex(p, &vendor) ||
+		    vendor != 0x10de)
+			continue;
+		for (i = 0; i < n && strcmp(cards[i].pf.str, base) != 0; i++)
+			;
+		if (i < n)
+			continue;
+		if (addr_listed(cfg->bdfs, cfg->nbdfs, base)) {
+			printf("note: VF %s of %s (selected, not Ada): the daemon restart re-registers it, which is expected to\n"
+			       "set its power/control back to auto (inferred, not measured); activate does not change it\n",
+			       de->d_name, base);
+			continue;
+		}
+		snprintf(which, len, "VF %.32s of %.32s", de->d_name, base);
+		found = 1;
+	}
+	closedir(d);
+	return found;
+}
+
+/*
+ * A VF of an NVIDIA PF anywhere on the host that has a vGPU: current_vgpu_type not 0, or present
+ * and unreadable. 1 with which, 0 none, -1 when the device list is unreadable.
+ */
+static int host_vgpu(const char *sys, char *which, size_t len)
+{
+	char p[GS_PATH_MAX], type[32];
+	struct dirent *de;
+	unsigned int vendor;
+	int found = 0, r;
+	DIR *d;
+
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices", sys) || !(d = opendir(p)))
+		return snprintf(which, len, "%s/bus/pci/devices is unreadable", sys), -1;
+	while (!found && (de = readdir(d))) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/physfn", sys, de->d_name) || !gs_exists(p))
+			continue;
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/vendor", sys, de->d_name) || gs_read_hex(p, &vendor) ||
+		    vendor != 0x10de)
+			continue;
+		r = read_dev_attr(sys, de->d_name, "nvidia/current_vgpu_type", type, sizeof(type));
+		if (r == 0 && strcmp(type, "0") != 0) {
+			snprintf(which, len, "VF %.32s has vGPU type %.31s", de->d_name, type);
+			found = 1;
+		} else if (r && r != -ENOENT) {
+			snprintf(which, len, "VF %.32s: nvidia/current_vgpu_type is unreadable (%.64s)", de->d_name, strerror(-r));
+			found = 1;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/* NVIDIA's driver loaded with NVreg_EnableGpuFirmware=0 (GSP off): 0, or -1 with why. */
+static int check_gsp_off(const char *procroot, char *why, size_t len)
+{
+	char p[GS_PATH_MAX], *data, *line, *save = NULL;
+	const char *v;
+	size_t dlen;
+	int r = -1;
+
+	if (gs_pathf(p, sizeof(p), "%s/driver/nvidia/params", procroot) || gs_read_whole(p, &data, &dlen, 1 << 20))
+		return snprintf(why, len, "%.300s is unreadable: NVIDIA's driver is not loaded", p), -1;
+	snprintf(why, len, "%.300s has no EnableGpuFirmware line; the Ada host stack needs NVreg_EnableGpuFirmware=0", p);
+	for (line = strtok_r(data, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "EnableGpuFirmware:", 18) != 0)
+			continue;
+		for (v = line + 18; *v == ' ' || *v == '\t'; v++)
+			;
+		if (strcmp(v, "0") == 0)
+			r = 0;
+		else
+			snprintf(why, len, "NVIDIA's driver is loaded with EnableGpuFirmware: %.32s; the Ada host stack needs it loaded with NVreg_EnableGpuFirmware=0 (GSP off, CPU-RM)",
+				 v);
+		break;
+	}
+	free(data);
+	return r;
+}
+
+/* The plugin nvidia-vgpu-mgr loads must be the H5 copy of 580.159.01's: 0, or -1 with why. */
+static int check_plugin(const char *path, char *why, size_t len)
+{
+	char sha[65], real[PATH_MAX];
+
+	if (gs_sha256_file(path, sha))
+		return snprintf(why, len, "cannot read %.300s, the vGPU plugin NVIDIA's host package installs", path), -1;
+	if (!realpath(path, real))
+		gs_copy(real, sizeof(real), path);
+	if (strcmp(sha, ADA_PLUGIN_H5_SHA) == 0) {
+		printf("vGPU plugin %s -> %s: the H5 copy\n", path, real);
+		return 0;
+	}
+	if (strcmp(sha, ADA_PLUGIN_STOCK_SHA) == 0)
+		return snprintf(why, len, "%.300s is NVIDIA's unchanged 580.159.01 plugin (%.300s); Ada needs its H5 copy (docs/ada.md)",
+				path, real), -1;
+	return snprintf(why, len, "%.300s (%.300s) has SHA-256 %s: neither NVIDIA's 580.159.01 plugin nor its H5 copy", path, real,
+			sha), -1;
+}
+
+/* 1 when the VF's nvidia/creatable_vgpu_types lists type (lines like "911 : NVIDIA L4-2Q"). */
+static int type_creatable(const char *sys, const char *vf, unsigned int type)
+{
+	char p[GS_PATH_MAX], *data, *line, *save = NULL;
+	size_t dlen;
+	int found = 0;
+
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/nvidia/creatable_vgpu_types", sys, vf) ||
+	    gs_read_whole(p, &data, &dlen, 1 << 16))
+		return 0;
+	for (line = strtok_r(data, "\n", &save); line && !found; line = strtok_r(NULL, "\n", &save)) {
+		unsigned long v;
+		char *end;
+
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (*line < '0' || *line > '9')
+			continue;
+		v = strtoul(line, &end, 10);
+		while (*end == ' ' || *end == '\t')
+			end++;
+		found = v == type && *end == ':';
+	}
+	free(data);
+	return found;
+}
+
+/*
+ * The measured PF re-probe (driver unbind, then bind; never remove or rescan), behind the guard
+ * and NVIDIA's unbindLock, which the driver grants only while no client holds the GPU (the count
+ * an unbind would otherwise wait on). 0; GS_EXIT_REFUSED: lock not granted, nothing unbound;
+ * GS_EXIT_FAIL: still bound, nothing else changed; GS_EXIT_COLD_CYCLE: not back on nvidia, guard set.
+ */
+static int reprobe_pf(const struct gs_host *h, const struct gs_addr *pf)
+{
+	char lock[GS_PATH_MAX], unbind_path[GS_PATH_MAX], bind_path[GS_PATH_MAX], drv[GS_PATH_MAX], val[16] = "", now[64];
+	int r;
+
+	if (gs_pathf(lock, sizeof(lock), "%s/driver/nvidia/gpus/%s/unbindLock", h->proc, pf->str) ||
+	    gs_pathf(unbind_path, sizeof(unbind_path), "%s/bus/pci/drivers/nvidia/unbind", h->sys) ||
+	    gs_pathf(bind_path, sizeof(bind_path), "%s/bus/pci/drivers/nvidia/bind", h->sys) ||
+	    gs_pathf(drv, sizeof(drv), "%s/bus/pci/devices/%s/driver", h->sys, pf->str))
+		return GS_EXIT_FAIL;
+	if ((r = write_marker(h, pf->str, "reprobe"))) {
+		fprintf(stderr, "geforce-sriov: cannot write the guard: %s; %s was not re-probed\n", strerror(-r), pf->str);
+		return GS_EXIT_FAIL;
+	}
+	r = h->write_attr(lock, "1");
+	if (r || gs_read_attr(lock, val, sizeof(val)) || strcmp(val, "1") != 0) {
+		h->write_attr(lock, "0");
+		clear_marker(h);
+		fprintf(stderr, "geforce-sriov: %s: NVIDIA's driver did not grant unbindLock (it reads '%s'%s%s): a client still\n"
+			"holds the GPU, for example nvidia-smi, nvidia-persistenced or a CUDA program. It was not unbound\n",
+			pf->str, val, r ? "; the write failed: " : "", r ? strerror(-r) : "");
+		return GS_EXIT_REFUSED;
+	}
+	printf("%s: unbindLock granted\necho %s > /sys/bus/pci/drivers/nvidia/unbind\n", pf->str, pf->str);
+	r = h->write_attr(unbind_path, pf->str);
+	if (wait_exists(drv, 0, PF_REBIND_WAIT_MS)) {
+		h->write_attr(lock, "0");
+		clear_marker(h);
+		fprintf(stderr, "geforce-sriov: %s is still bound after the unbind%s%s; unbindLock released, nothing else changed\n",
+			pf->str, r ? ": " : "", r ? strerror(-r) : "");
+		return GS_EXIT_FAIL;
+	}
+	printf("echo %s > /sys/bus/pci/drivers/nvidia/bind\n", pf->str);
+	r = h->write_attr(bind_path, pf->str);
+	for (unsigned int t = 0;; t += POLL_MS) {
+		dev_driver(h->sys, pf->str, now, sizeof(now));
+		if (strcmp(now, "nvidia") == 0)
+			break;
+		if (t >= PF_REBIND_WAIT_MS) {
+			fprintf(stderr, "geforce-sriov: %s is bound to %s, not nvidia, after the re-probe%s%s. The guard stays set and no\n"
+				"VF is powered.\n%s\n",
+				pf->str, now[0] ? now : "nothing", r ? ": " : "", r ? strerror(-r) : "", recovery_msg);
+			return GS_EXIT_COLD_CYCLE;
+		}
+		gs_sleep_ms(POLL_MS);
+	}
+	if ((r = clear_marker(h))) {
+		fprintf(stderr, "geforce-sriov: %s is bound to nvidia again, but removing the guard failed: %s. The guard stays\n"
+			"set.\n%s\n", pf->str, strerror(-r), recovery_msg);
+		return GS_EXIT_FAIL;
+	}
+	printf("%s: re-probed, bound to nvidia again\n", pf->str);
+	return 0;
+}
+
+/* --type on one VF: current_vgpu_type must be 0 or type, and type listed as creatable. */
+static int set_type_vf(const struct gs_host *h, const struct gs_addr *vf, unsigned int type)
+{
+	char p[GS_PATH_MAX], cur[32], want[16];
+	int r;
+
+	snprintf(want, sizeof(want), "%u", type);
+	if ((r = read_dev_attr(h->sys, vf->str, "nvidia/current_vgpu_type", cur, sizeof(cur)))) {
+		fprintf(stderr, "geforce-sriov: %s: nvidia/current_vgpu_type is unreadable: %s\n", vf->str, strerror(-r));
+		return GS_EXIT_FAIL;
+	}
+	if (strcmp(cur, want) == 0) {
+		printf("%s: vGPU type already %s\n", vf->str, want);
+		return 0;
+	}
+	if (strcmp(cur, "0") != 0) {
+		fprintf(stderr, "geforce-sriov: %s has vGPU type %s, not 0 or %s; nothing written\n", vf->str, cur, want);
+		return GS_EXIT_FAIL;
+	}
+	for (unsigned int t = 0; !type_creatable(h->sys, vf->str, type); t += POLL_MS) {
+		if (t >= VF_TYPES_WAIT_MS) {
+			fprintf(stderr, "geforce-sriov: %s: type %s is not in nvidia/creatable_vgpu_types (`cat` it for the types this\n"
+				"GPU offers); nothing written\n", vf->str, want);
+			return GS_EXIT_FAIL;
+		}
+		gs_sleep_ms(POLL_MS);
+	}
+	gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/nvidia/current_vgpu_type", h->sys, vf->str);
+	printf("%s: echo %s > nvidia/current_vgpu_type\n", vf->str, want);
+	if ((r = h->write_attr(p, want))) {
+		fprintf(stderr, "geforce-sriov: %s: writing the vGPU type failed: %s\n", vf->str, strerror(-r));
+		return GS_EXIT_FAIL;
+	}
+	if (read_dev_attr(h->sys, vf->str, "nvidia/current_vgpu_type", cur, sizeof(cur)) || strcmp(cur, want) != 0) {
+		fprintf(stderr, "geforce-sriov: %s: current_vgpu_type reads '%s' after writing %s\n", vf->str, cur, want);
+		return GS_EXIT_FAIL;
+	}
+	return 0;
+}
+
+/* power/control=on on one VF, then the gate: on and active read back after the write. */
+static int power_on_vf(const struct gs_host *h, const struct gs_addr *vf)
+{
+	char ctl[GS_PATH_MAX], st[GS_PATH_MAX], c[32] = "", s[32] = "";
+	int r;
+
+	if (gs_pathf(ctl, sizeof(ctl), "%s/bus/pci/devices/%s/power/control", h->sys, vf->str) ||
+	    gs_pathf(st, sizeof(st), "%s/bus/pci/devices/%s/power/runtime_status", h->sys, vf->str))
+		return GS_EXIT_FAIL;
+	if (gs_read_attr(ctl, c, sizeof(c)) == 0 && strcmp(c, "on") == 0) {
+		printf("%s: power/control already on\n", vf->str);
+	} else if ((r = h->write_attr(ctl, "on"))) {
+		fprintf(stderr, "geforce-sriov: %s: writing on to power/control failed: %s; do not start a VM on it\n", vf->str,
+			strerror(-r));
+		return GS_EXIT_FAIL;
+	} else {
+		printf("%s: echo on > power/control\n", vf->str);
+	}
+	wait_attr_eq(st, "active", VF_ACTIVE_WAIT_MS);
+	c[0] = s[0] = '\0';
+	gs_read_attr(ctl, c, sizeof(c));
+	gs_read_attr(st, s, sizeof(s));
+	printf("%s: gate: power/control=%s runtime_status=%s\n", vf->str, c, s);
+	if (strcmp(c, "on") != 0 || strcmp(s, "active") != 0) {
+		fprintf(stderr, "geforce-sriov: %s is not on/active after the write; do not start a VM on it\n", vf->str);
+		return GS_EXIT_FAIL;
+	}
+	return 0;
+}
+
+/* After the last re-probe: the same VFs again, registered by the vGPU stack, then type and power. */
+static int finish_card(const struct gs_host *h, const struct ada_card *k, const struct gs_activate_opts *o)
+{
+	struct gs_addr now[GS_VFS_MAX];
+	char why[512], p[GS_PATH_MAX], drv[64];
+	struct gs_card c;
+	unsigned int j;
+
+	gs_card_inspect(h->sys, &k->pf, &c);
+	if (c.numvfs != k->nvf || vf_list(h->sys, &k->pf, c.numvfs, now, why, sizeof(why))) {
+		fprintf(stderr, "geforce-sriov: %s: after the re-probe it has %u VFs, not the %u it had%s%s\n", k->pf.str,
+			c.numvfs, k->nvf, c.numvfs == k->nvf ? ": " : "", c.numvfs == k->nvf ? why : "");
+		return GS_EXIT_FAIL;
+	}
+	for (j = 0; j < k->nvf; j++) {
+		if (strcmp(now[j].str, k->vf[j].str) != 0) {
+			fprintf(stderr, "geforce-sriov: %s: virtfn%u is %s after the re-probe, not %s\n", k->pf.str, j, now[j].str,
+				k->vf[j].str);
+			return GS_EXIT_FAIL;
+		}
+	}
+	for (j = 0; j < k->nvf; j++) {
+		const struct gs_addr *vf = &k->vf[j];
+
+		gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/nvidia/creatable_vgpu_types", h->sys, vf->str);
+		for (unsigned int t = 0;; t += POLL_MS) {
+			dev_driver(h->sys, vf->str, drv, sizeof(drv));
+			if (strcmp(drv, "nvidia") == 0 && gs_exists(p))
+				break;
+			if (t >= VF_TYPES_WAIT_MS) {
+				fprintf(stderr, "geforce-sriov: %s: no nvidia/creatable_vgpu_types %u ms after the re-probe (bound to %s);\n"
+					"nvidia-vgpu-mgr publishes it (`journalctl -u nvidia-vgpu-mgr -b`). Do not start a VM on it\n",
+					vf->str, VF_TYPES_WAIT_MS, drv[0] ? drv : "nothing");
+				return GS_EXIT_FAIL;
+			}
+			gs_sleep_ms(POLL_MS);
+		}
+		if (o->type && set_type_vf(h, vf, o->type))
+			return GS_EXIT_FAIL;
+		if (power_on_vf(h, vf))
+			return GS_EXIT_FAIL;
+	}
+	return 0;
+}
+
+int gs_activate(const struct gs_host *h, const struct gs_config *cfg, const struct gs_activate_opts *o)
+{
+	static const char *const vgpud[] = { "systemctl", "restart", "nvidia-vgpud.service", NULL };
+	static const char *const mgr[] = { "systemctl", "restart", "nvidia-vgpu-mgr.service", NULL };
+	static const char *const mgr_active[] = { "systemctl", "is-active", "--quiet", "nvidia-vgpu-mgr.service", NULL };
+	char why[1024], which[256], p[GS_PATH_MAX], g[GS_PATH_MAX], boot[64] = "", ver[32];
+	struct ada_card *cards;
+	unsigned int n = 0, i, j;
+	int r, rc = GS_EXIT_OK;
+
+	if (gs_pathf(p, sizeof(p), "%s/" GS_ATTEMPT_NAME, h->state_dir) || gs_exists(p)) {
+		fprintf(stderr, "geforce-sriov: guard %s is set; nothing done.\n%s\n", p, recovery_msg);
+		return GS_EXIT_COLD_CYCLE;
+	}
+	cards = calloc(GS_CFG_MAX_BDFS, sizeof(*cards));
+	if (!cards)
+		return GS_EXIT_FAIL;
+	if ((r = select_ada(h->sys, cfg, o, cards, &n))) {
+		free(cards);
+		return r;
+	}
+	/* The daemon restart re-registers the VFs of every GPU, so every selected Ada GPU must be named. */
+	if (o->ndevices) {
+		struct ada_card *all = calloc(GS_CFG_MAX_BDFS, sizeof(*all));
+		struct gs_activate_opts every = *o;
+		unsigned int nall = 0;
+
+		every.ndevices = 0;
+		if (!all) {
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+		r = select_ada(h->sys, cfg, &every, all, &nall);
+		free(all);
+		if (r || nall != n) {
+			snprintf(why, sizeof(why), "the restart of NVIDIA's vGPU daemons re-registers the VFs of every GPU; name every\n"
+				 "selected Ada GPU with --device, or none");
+			goto refuse;
+		}
+	}
+
+	/* Preflight: every check passes before anything changes. */
+	nvidia_version(h->proc, ver, sizeof(ver));
+	if (strcmp(ver, ADA_DRIVER_VERSION) != 0) {
+		snprintf(why, sizeof(why), "NVIDIA's driver %s%s; the Ada host stack is measured only with %s (proprietary, CPU-RM)",
+			 ver[0] ? ver : "is not loaded", ver[0] ? " is loaded" : "", ADA_DRIVER_VERSION);
+		goto refuse;
+	}
+	if (check_gsp_off(h->proc, why, sizeof(why)))
+		goto refuse;
+	/* The measured bring-up loaded it after the VF existed and before the daemons started. */
+	if (gs_pathf(p, sizeof(p), "%s/module/nvidia_vgpu_vfio", h->sys) || !gs_exists(p)) {
+		snprintf(why, sizeof(why), "nvidia_vgpu_vfio is not loaded: `modprobe nvidia_vgpu_vfio` first (NVIDIA's vGPU host package)");
+		goto refuse;
+	}
+	if (o->plugin && check_plugin(o->plugin, why, sizeof(why)))
+		goto refuse;
+	gs_boot_id(boot, sizeof(boot));
+	for (i = 0; i < n; i++) {
+		struct ada_card *k = &cards[i];
+		struct gs_prepared rec;
+		struct gs_card c;
+		char drv[64];
+
+		gs_card_inspect(h->sys, &k->pf, &c);
+		gs_prepared_read(h->run_dir, &k->pf, &rec);
+		if (gs_check_enable(&c, cfg, &rec, boot, why, sizeof(why)) || gs_check_presented(&c, cfg, why, sizeof(why)))
+			goto refuse;
+		if (strcmp(c.driver, "nvidia") != 0) {
+			snprintf(why, sizeof(why), "%s is bound to %s, not nvidia", k->pf.str, c.driver[0] ? c.driver : "nothing");
+			goto refuse;
+		}
+		if (read_dev_attr(h->sys, k->pf.str, "driver_override", drv, sizeof(drv)) == 0 && drv[0] &&
+		    strcmp(drv, "(null)") != 0 && strcmp(drv, "nvidia") != 0) {
+			snprintf(why, sizeof(why), "%s has driver_override=%s: the re-probe's bind to nvidia would fail; `echo > /sys/bus/pci/devices/%s/driver_override`\n"
+				 "first", k->pf.str, drv, k->pf.str);
+			goto refuse;
+		}
+		if (c.numvfs < 1 || c.numvfs != c.totalvfs) {
+			snprintf(why, sizeof(why), "%s has %u of %u VFs enabled: run `geforce-sriov enable` first", k->pf.str, c.numvfs,
+				 c.totalvfs);
+			goto refuse;
+		}
+		if (vf_list(h->sys, &k->pf, c.numvfs, k->vf, why, sizeof(why)))
+			goto refuse;
+		k->nvf = c.numvfs;
+		if (o->type && k->nvf > 1) {
+			snprintf(why, sizeof(why), "%s has %u VFs; --type is refused there because only one VF of an Ada card was\n"
+				 "measured to start a vGPU. Run activate without --type and set each VF's type yourself", k->pf.str, k->nvf);
+			goto refuse;
+		}
+		for (j = 0; j < k->nvf; j++) {
+			dev_driver(h->sys, k->vf[j].str, drv, sizeof(drv));
+			if (strcmp(drv, "nvidia") != 0) {
+				snprintf(why, sizeof(why), "VF %s of %s is bound to %s, not nvidia", k->vf[j].str, k->pf.str,
+					 drv[0] ? drv : "nothing");
+				goto refuse;
+			}
+			if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/power/control", h->sys, k->vf[j].str) || !gs_exists(p)) {
+				snprintf(why, sizeof(why), "VF %s has no power/control", k->vf[j].str);
+				goto refuse;
+			}
+		}
+		if (gs_pathf(p, sizeof(p), "%s/driver/nvidia/gpus/%s/unbindLock", h->proc, k->pf.str) || !gs_exists(p)) {
+			snprintf(why, sizeof(why), "%.300s is missing: the re-probe needs NVIDIA's unbindLock for %s", p, k->pf.str);
+			goto refuse;
+		}
+	}
+	/* The daemons serve every GPU on the host: a restart would end any vGPU there. */
+	if ((r = host_vgpu(h->sys, which, sizeof(which)))) {
+		if (r < 0)
+			snprintf(why, sizeof(why), "%s", which);
+		else
+			snprintf(why, sizeof(why), "%s: restarting NVIDIA's vGPU daemons would end it. Stop its VM and write 0 to its\n"
+				 "nvidia/current_vgpu_type first", which);
+		goto refuse;
+	}
+	/* The restart also re-registers the VFs of GPUs outside the selection: refused. */
+	if ((r = foreign_vf(h->sys, cfg, cards, n, which, sizeof(which)))) {
+		if (r < 0)
+			snprintf(why, sizeof(why), "%s", which);
+		else
+			snprintf(why, sizeof(why), "%s: that GPU is not selected, and the restart of NVIDIA's vGPU daemons would\n"
+				 "re-register it too. Disable its VFs first", which);
+		goto refuse;
+	}
+
+	if (o->dry_run) {
+		printf("dry run: every check passed; activate would run, in this order:\n"
+		       "  systemctl restart nvidia-vgpud.service\n"
+		       "  systemctl restart nvidia-vgpu-mgr.service, then wait until it is active\n");
+		for (i = 0; i < n; i++)
+			printf("  %s: unbindLock, then echo %s > /sys/bus/pci/drivers/nvidia/unbind and .../nvidia/bind\n",
+			       cards[i].pf.str, cards[i].pf.str);
+		for (i = 0; i < n; i++)
+			for (j = 0; j < cards[i].nvf; j++) {
+				if (o->type)
+					printf("  %s: echo %u > nvidia/current_vgpu_type\n", cards[i].vf[j].str, o->type);
+				printf("  %s: echo on > power/control, then read back on and active\n", cards[i].vf[j].str);
+			}
+		free(cards);
+		return GS_EXIT_OK;
+	}
+
+	/*
+	 * From the first change until the final readback, check reports NOT READY. The record stays
+	 * on every failure, so check fails closed until an activate finishes (or the next boot).
+	 */
+	{
+		char rec[GS_BDF_LIST_STR_SIZE + 128];
+		size_t off;
+
+		gs_boot_id(boot, sizeof(boot));
+		off = (size_t)snprintf(rec, sizeof(rec), "boot_id=%s\npfs=", boot);
+		for (i = 0; i < n && off < sizeof(rec); i++)
+			off += (size_t)snprintf(rec + off, sizeof(rec) - off, "%s%s", i ? "," : "", cards[i].pf.str);
+		if (off < sizeof(rec))
+			off += (size_t)snprintf(rec + off, sizeof(rec) - off, "\n");
+		if (off >= sizeof(rec) || gs_pathf(p, sizeof(p), "%s/" GS_ACTIVATING_NAME, h->run_dir) ||
+		    (r = gs_mkdir_p(h->run_dir, 0755)) || (r = gs_write_file_atomic(p, rec, off, 0644))) {
+			fprintf(stderr, "geforce-sriov: cannot write %s/" GS_ACTIVATING_NAME "; nothing changed\n", h->run_dir);
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+	}
+	/* The measured order: the VFs exist, then both daemons start, then the PF re-probe. */
+	printf("systemctl restart nvidia-vgpud.service\n");
+	if ((r = h->run(vgpud))) {
+		fprintf(stderr, "geforce-sriov: systemctl restart nvidia-vgpud.service failed (%d); no GPU was re-probed\n"
+			"(`journalctl -u nvidia-vgpud -b` says why)\n", r);
+		rc = GS_EXIT_FAIL;
+		goto stopped;
+	}
+	/* A VM may have started since the preflight: nvidia-vgpud restarted, nothing else changed yet. */
+	if ((r = host_vgpu(h->sys, which, sizeof(which)))) {
+		fprintf(stderr, "geforce-sriov: %s since the checks; nvidia-vgpud was restarted, nvidia-vgpu-mgr was not and no GPU\n"
+			"was re-probed\n", which);
+		rc = GS_EXIT_FAIL;
+		goto stopped;
+	}
+	printf("systemctl restart nvidia-vgpu-mgr.service\n");
+	if ((r = h->run(mgr))) {
+		fprintf(stderr, "geforce-sriov: systemctl restart nvidia-vgpu-mgr.service failed (%d); no GPU was re-probed\n"
+			"(`journalctl -u nvidia-vgpu-mgr -b` says why)\n", r);
+		rc = GS_EXIT_FAIL;
+		goto stopped;
+	}
+	for (unsigned int t = 0; h->run(mgr_active) != 0; t += POLL_MS) {
+		if (t >= MGR_ACTIVE_WAIT_MS) {
+			fprintf(stderr, "geforce-sriov: nvidia-vgpu-mgr.service is not active %u ms after its restart; no GPU was re-probed\n",
+				MGR_ACTIVE_WAIT_MS);
+			rc = GS_EXIT_FAIL;
+			goto stopped;
+		}
+		gs_sleep_ms(POLL_MS);
+	}
+	if (o->settle_ms)
+		gs_sleep_ms(o->settle_ms);
+	for (i = 0; i < n; i++) {
+		if ((r = reprobe_pf(h, &cards[i].pf)) == 0)
+			continue;
+		if (r == GS_EXIT_COLD_CYCLE) {
+			rc = r;
+			goto stopped;
+		}
+		/* The daemons were restarted: that is a change, so this is a failure, not a refusal. */
+		fprintf(stderr, "geforce-sriov: activate stopped at %s after nvidia-vgpud and nvidia-vgpu-mgr were restarted;\n"
+			"%u GPU(s) before it were re-probed and are finished now; it and the GPUs after it are not ready\n",
+			cards[i].pf.str, i);
+		for (j = 0; j < i; j++)
+			finish_card(h, &cards[j], o);
+		rc = GS_EXIT_FAIL;
+		goto stopped;
+	}
+	/* Every re-probe has run: the VFs' power/control is written last, after their final registration. */
+	for (i = 0; i < n; i++)
+		if (finish_card(h, &cards[i], o))
+			rc = GS_EXIT_FAIL;
+	if (rc == GS_EXIT_OK && unlink(p) < 0 && errno != ENOENT) {
+		fprintf(stderr, "geforce-sriov: cannot remove %s: %s; check stays NOT READY\n", p, strerror(errno));
+		rc = GS_EXIT_FAIL;
+	}
+	if (rc == GS_EXIT_OK) {
+		char arg[32] = "";
+
+		if (o->type)
+			snprintf(arg, sizeof(arg), " --type %u", o->type);
+		printf("ready. Run `geforce-sriov check%s` before every VM start: a later PF re-probe or restart of\n"
+		       "nvidia-vgpu-mgr is expected to set power/control back to auto (inferred, not measured; stop the\n"
+		       "VMs, then run activate again)\n",
+		       arg);
+		free(cards);
+		return rc;
+	}
+stopped:
+	/* The guard is set (exit 5, or its removal failed): the next activate refuses until it is cleared. */
+	if (rc == GS_EXIT_COLD_CYCLE ||
+	    (gs_pathf(g, sizeof(g), "%s/" GS_ATTEMPT_NAME, h->state_dir) == 0 && gs_exists(g)))
+		fprintf(stderr, "geforce-sriov: %s and the guard stay, so `geforce-sriov check` reports NOT READY and\n"
+			"`geforce-sriov activate` refuses (exit 5) until a cold power cycle and `geforce-sriov prepare --clear-guard`\n",
+			p);
+	else
+		fprintf(stderr, "geforce-sriov: %s stays, so `geforce-sriov check` reports NOT READY until an activate\n"
+			"finishes or the host reboots\n", p);
+	free(cards);
+	return rc;
+refuse:
+	fprintf(stderr, "geforce-sriov: refused, nothing changed: %s\n", why);
+	free(cards);
+	return GS_EXIT_REFUSED;
+}
+
+int gs_cmd_activate(const struct gs_activate_opts *in)
+{
+	/* Where NVIDIA's host package puts the plugin link; a missing one is refused by its check. */
+	static const char *const plugins[] = { "/usr/lib/x86_64-linux-gnu/libnvidia-vgpu.so", "/usr/lib64/libnvidia-vgpu.so",
+					       "/usr/lib/libnvidia-vgpu.so" };
+	struct gs_activate_opts o = *in;
+	struct gs_config cfg;
+	char prog[GS_PATH_MAX];
+	int r;
+
+	if ((r = require_root("activate")))
+		return r;
+	if ((r = gs_lock()))
+		return r;
+	if ((r = load_live_config(&cfg)))
+		return r;
+	if (gs_find_program("systemctl", prog, sizeof(prog))) {
+		fprintf(stderr, "geforce-sriov: refused, nothing changed: systemctl not found in /usr/sbin:/usr/bin:/sbin:/bin\n");
+		return GS_EXIT_REFUSED;
+	}
+	o.plugin = plugins[0];
+	for (size_t k = 0; k < sizeof(plugins) / sizeof(plugins[0]); k++) {
+		if (gs_exists(plugins[k])) {
+			o.plugin = plugins[k];
+			break;
+		}
+	}
+	o.settle_ms = MGR_SETTLE_MS;
+	return gs_activate(&gs_host_live, &cfg, &o);
+}
+
+int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const struct gs_activate_opts *o)
+{
+	const char *sys = h->sys;
+	struct ada_card *cards;
+	unsigned int n = 0, i, j;
+	char want[16] = "";
+	int r, ready = 1;
+
+	cards = calloc(GS_CFG_MAX_BDFS, sizeof(*cards));
+	if (!cards)
+		return GS_EXIT_FAIL;
+	if ((r = select_ada(sys, cfg, o, cards, &n))) {
+		free(cards);
+		return r;
+	}
+	/* An unfinished activate or prepare: the VF state read now may be about to change. */
+	for (i = 0; i < 2; i++) {
+		char p[GS_PATH_MAX];
+		struct stat st;
+
+		if (gs_pathf(p, sizeof(p), "%s/%s", i ? h->run_dir : h->state_dir, i ? GS_ACTIVATING_NAME : GS_ATTEMPT_NAME)) {
+			printf("NOT READY: the %s path is too long\n", i ? GS_ACTIVATING_NAME : GS_ATTEMPT_NAME);
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+		if (lstat(p, &st) == 0) {
+			printf("NOT READY: %s exists: %s did not finish; start no VM\n", p,
+			       i ? "`geforce-sriov activate` is running or" : "a preparation or re-probe");
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+		if (errno != ENOENT) {
+			printf("NOT READY: cannot tell whether %s exists: %s\n", p, strerror(errno));
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+	}
+	if (o->type)
+		snprintf(want, sizeof(want), "%u", o->type);
+	for (i = 0; i < n; i++) {
+		struct ada_card *k = &cards[i];
+		char why[512];
+		struct gs_card c;
+
+		gs_card_inspect(sys, &k->pf, &c);
+		if (strcmp(c.driver, "nvidia") != 0) {
+			printf("NOT READY %s: bound to %s, not nvidia\n", k->pf.str, c.driver[0] ? c.driver : "nothing");
+			ready = 0;
+			continue;
+		}
+		if (c.numvfs < 1) {
+			printf("NOT READY %s: no VF is enabled (`geforce-sriov enable`, then `geforce-sriov activate`)\n", k->pf.str);
+			ready = 0;
+			continue;
+		}
+		if (vf_list(sys, &k->pf, c.numvfs, k->vf, why, sizeof(why))) {
+			printf("NOT READY %s\n", why);
+			ready = 0;
+			continue;
+		}
+		for (j = 0; j < c.numvfs; j++) {
+			char drv[64], ctl[32], st[32], type[32];
+			int ok;
+
+			dev_driver(sys, k->vf[j].str, drv, sizeof(drv));
+			read_dev_attr(sys, k->vf[j].str, "power/control", ctl, sizeof(ctl));
+			read_dev_attr(sys, k->vf[j].str, "power/runtime_status", st, sizeof(st));
+			ok = read_dev_attr(sys, k->vf[j].str, "nvidia/current_vgpu_type", type, sizeof(type)) == 0 &&
+			     strcmp(drv, "nvidia") == 0 && strcmp(ctl, "on") == 0 && strcmp(st, "active") == 0 &&
+			     (!o->type || strcmp(type, want) == 0);
+			printf("%s %s (VF of %s): driver=%s type=%s%s%s power/control=%s runtime_status=%s\n", ok ? "OK" : "NOT READY",
+			       k->vf[j].str, k->pf.str, drv[0] ? drv : "none", type[0] ? type : "unreadable", o->type ? " expected=" : "",
+			       want, ctl[0] ? ctl : "unreadable", st[0] ? st : "unreadable");
+			if (!ok)
+				ready = 0;
+			else if (!o->type && strcmp(type, "0") == 0)
+				printf("  note: %s has no vGPU type yet; whatever starts the VM must set one\n", k->vf[j].str);
+		}
+	}
+	/* An activate or prepare that started during the reads: what was read above may be changing. */
+	for (i = 0; i < 2; i++) {
+		char p[GS_PATH_MAX];
+		struct stat st;
+
+		if (gs_pathf(p, sizeof(p), "%s/%s", i ? h->run_dir : h->state_dir, i ? GS_ACTIVATING_NAME : GS_ATTEMPT_NAME)) {
+			printf("NOT READY: the %s path is too long\n", i ? GS_ACTIVATING_NAME : GS_ATTEMPT_NAME);
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+		if (lstat(p, &st) == 0) {
+			printf("NOT READY: %s appeared during the check (%s); the readings above do not count; start no VM\n",
+			       p, i ? "`geforce-sriov activate` started" : "a preparation or re-probe started");
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+		if (errno != ENOENT) {
+			printf("NOT READY: cannot tell whether %s exists: %s; the readings above do not count\n", p,
+			       strerror(errno));
+			free(cards);
+			return GS_EXIT_FAIL;
+		}
+	}
+	free(cards);
+	if (!ready)
+		fprintf(stderr, "geforce-sriov: not ready: start no VM on a VF marked NOT READY. After a PF re-probe or a restart of\n"
+			"nvidia-vgpu-mgr, stop the VMs that use a vGPU and run `geforce-sriov activate` again\n");
+	return ready ? GS_EXIT_OK : GS_EXIT_FAIL;
+}
+
+int gs_cmd_check(const struct gs_activate_opts *o)
+{
+	const char *path = gs_config_path();
+	struct gs_config cfg;
+	char err[512];
+
+	if (gs_config_load(path, &cfg, err, sizeof(err))) {
+		fprintf(stderr, "geforce-sriov: config: %s: %s\n", path, err);
+		return GS_EXIT_REFUSED;
+	}
+	if (cfg.nbdfs == 0) {
+		fprintf(stderr, "geforce-sriov: no device selected (bdfs= in %s)\n", path);
+		return GS_EXIT_REFUSED;
+	}
+	return gs_check_vfs(&gs_host_live, &cfg, o);
 }

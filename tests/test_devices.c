@@ -670,6 +670,41 @@ static void test_default_vf_count(void)
 }
 
 /*
+ * The AD104 bring-up (10de:2783, subsystem 1043:8974, closed 580.159.01
+ * CPU-RM host stack): raw config 0xBCC = c1410010 (hidden SR-IOV v1),
+ * InitialVFs/TotalVFs 1/1, first VF offset 4, stride 1; 0xC14 = c1c1000e
+ * (hidden ARI v1, next function 1); PF and audio at functions 0-1; one VF at
+ * function 4; nvidia-vgpud shown 10de:27b8 (L4) with the board subsystem.
+ * The table must keep reproducing that with the default options.
+ */
+static void test_ada_measured_config(void)
+{
+	const struct gs_device *d = gs_device_lookup(0x2783);
+	unsigned int limit;
+
+	CHECK(d != NULL);
+	if (!d)
+		return;
+	/* Identity: L4 on the same die, board subsystem kept (wildcard <pgpu>). */
+	CHECK(d->generation == GS_ADA);
+	CHECK(d->target == 0x27b8 && d->same_die);
+	CHECK(d->target_subvendor == 0 && d->target_subdevice == 0);
+	/* Capabilities at the measured offsets; no MSI-X write, no 32-bit hooks. */
+	CHECK(d->sriov_pos == 0xbcc && !gs_sriov_native(d));
+	CHECK(gs_ext_cap_hdr_is(0xc1410010u, GS_EXT_CAP_ID_SRIOV, 1));
+	CHECK(d->ari_pos == 0xc14 && gs_ext_cap_hdr_is(0xc1c1000eu, GS_EXT_CAP_ID_ARI, 1));
+	CHECK(d->msix_hide_pos == 0);
+	CHECK(!gs_has_twin_dwords(d) && !gs_expvfs_reaches_driver(d));
+	/* Default options (experimental_vfs off, vfs 4): exactly one VF, at function 4. */
+	limit = gs_vf_limit(d, 1, 0, GS_DEFAULT_VFS);
+	CHECK(limit == 1);
+	CHECK(gs_vf_geometry_check(limit, 4, 1, 0x03) == GS_GEOM_OK);
+	CHECK(gs_vf_setup_check(limit, limit, 4, 1, 0x03) == GS_GEOM_OK);
+	/* What NVIDIA's driver reads stays the hardware 1/1. */
+	CHECK(gs_vf_dword(d, 0x00010001u, 0, GS_DEFAULT_VFS) == 0x00010001u);
+}
+
+/*
  * Per-entry twin dwords and the TotalVFs-by-dword flag: GB202 only has twin
  * dwords; every Blackwell entry, and only Blackwell, has vf_dword.
  */
@@ -939,6 +974,7 @@ int main(void)
 	test_vf_setup_check();
 	test_vf_geometry_states();
 	test_default_vf_count();
+	test_ada_measured_config();
 	test_twin_and_dword_flags();
 	test_vf_dword();
 	test_twin_id_dword();

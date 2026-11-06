@@ -281,6 +281,37 @@ int gs_cmd_prepare(const struct gs_overrides *ov, const struct gs_prepare_opts *
 int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_prepare_opts *po);
 int gs_cmd_enable(void);
 
+/*
+ * Ada CPU-RM host stack (docs/ada.md), after `enable`. activate: restart nvidia-vgpud and
+ * nvidia-vgpu-mgr, re-probe each selected Ada PF (driver unbind/bind, never remove/rescan),
+ * optionally set the vGPU type, then power/control=on on each VF, gated on the readback.
+ * check: read-only gate before every VM start. Other cards get no re-probe, type or power write,
+ * but the host-wide daemon restart re-registers their VFs too; activate refuses while any vGPU exists.
+ */
+#define GS_VGPU_TYPE_MAX 999999u
+struct gs_activate_opts {
+	struct gs_addr devices[GS_CFG_MAX_BDFS]; /* --device; none: every selected Ada GPU */
+	unsigned int ndevices;
+	unsigned int type;       /* --type N; 0: leave current_vgpu_type alone */
+	int dry_run;
+	unsigned int settle_ms;  /* pause after nvidia-vgpu-mgr is active, before the re-probe */
+	const char *plugin;      /* libnvidia-vgpu.so whose SHA-256 must be the H5 copy; NULL: not checked (tests) */
+};
+/* --type value: decimal 1..GS_VGPU_TYPE_MAX without a leading zero. 0 or -1. */
+int gs_parse_vgpu_type(const char *value, unsigned int *out);
+int gs_cmd_activate(const struct gs_activate_opts *o);
+/* activate after the root check, lock and config load. */
+int gs_activate(const struct gs_host *h, const struct gs_config *cfg, const struct gs_activate_opts *o);
+int gs_cmd_check(const struct gs_activate_opts *o);
+/*
+ * check against h->sys with cfg (tests use a fixture host); a point-in-time read with no lock, so
+ * nothing stops a re-probe or daemon restart between it and a VM start. NOT READY while h->state_dir holds the
+ * guard or h->run_dir holds GS_ACTIVATING_NAME, which activate writes before its first change and
+ * removes only after every VF read back on/active.
+ */
+#define GS_ACTIVATING_NAME "activating"
+int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const struct gs_activate_opts *o);
+
 struct gs_install_opts {
 	const char *prefix;        /* absolute; default GS_DEFAULT_PREFIX */
 	const char *destdir;       /* "" or NULL: live install */
