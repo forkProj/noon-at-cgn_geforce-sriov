@@ -61,8 +61,23 @@ See [Ada](ada.md#with-the-other-generation) for the Ada side.
 
 A vGPU type, also called a profile, sets how much of the card's memory each vGPU gets.
 The card offers the RTX A6000 types.
-Its Q types are 524 (1Q), 525 (2Q), 526 (3Q), 527 (4Q), 528 (6Q), 529 (8Q), 530 (12Q), 531 (16Q), 532 (24Q) and 533 (48Q); NVS-class types are offered too.
-The number before Q is the profile size in GiB, and the list is not filtered by the card's memory.
+Its Q types are:
+
+| Type | Profile | Size |
+|---|---|---|
+| 524 | 1Q | 1 GiB |
+| 525 | 2Q | 2 GiB |
+| 526 | 3Q | 3 GiB |
+| 527 | 4Q | 4 GiB |
+| 528 | 6Q | 6 GiB |
+| 529 | 8Q | 8 GiB |
+| 530 | 12Q | 12 GiB |
+| 531 | 16Q | 16 GiB |
+| 532 | 24Q | 24 GiB |
+| 533 | 48Q | 48 GiB |
+
+NVS-class types are offered too.
+The list is not filtered by the card's memory.
 Set the type with `type_ampere=` in the config; every VF of the card gets it ([Choosing a vGPU type](configuration.md#choosing-a-vgpu-type)).
 
 > [!IMPORTANT]
