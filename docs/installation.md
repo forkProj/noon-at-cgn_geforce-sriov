@@ -420,11 +420,8 @@ flowchart TD
     E --> F[Verify NVIDIA device]
 ```
 
-The package installs nothing in a guest.
-Install NVIDIA's vGPU guest driver for your card from the Linux guest and Windows guest rows of the [supported stack](#supported-software-stack).
-Other guest driver versions are not supported.
-An Ada card with a 580-series guest driver and an Ampere card with the 16.9 drivers are not supported pairs.
-A bare-metal or Data Center driver does not work in a vGPU guest; on Windows it typically shows Code 43.
+The toolkit does not install anything in a guest.
+You handle installation of the NVIDIA vGPU drivers inside each guest. Make sure to use vGPU guest drivers, not regular GeForce or Data Center drivers. The versions listed in the [supported stack](#supported-software-stack) are confirmed to work.
 
 Guest licensing is your responsibility.
 
