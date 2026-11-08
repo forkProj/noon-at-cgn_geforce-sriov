@@ -36,6 +36,8 @@ static const char *cli, *srcdir;
 		} \
 	} while (0)
 
+static void die(const char *what) __attribute__((noreturn));
+
 static void die(const char *what)
 {
 	perror(what);
