@@ -41,7 +41,7 @@ int gs_patch_structure(const unsigned char *p,size_t n,const char *version,struc
  /* Scan the entire text, including already-patched signatures, not just the named callback. */
  for(i=0;i+19<=sh.sh_size;i++){const unsigned char *q=p+sh.sh_offset+i;
   if(!memcmp(q,prefix,6)&&q[10]==0xf6&&q[11]==0x87&&q[16]==0x10&&((q[17]==0x75)||(q[17]==0x90&&q[18]==0x90))){sig=i;count++;}}
- if(count!=1)return fail(err,en,"patch site not found or ambiguous (open and GSP objects are unsupported)");
+ if(count!=1)return fail(err,en,"patch site not found or ambiguous (open and GSP objects are not supported)");
  if(sig<cb.value||sig-cb.value>cr.size-19)return fail(err,en,"signature outside expected callback");
  i=sig-cb.value;
  if(u32(cr.bytes+i+12)!=r->flag||u32(cr.bytes+i+6)!=0xaf)return fail(err,en,"flag or conditional control-flow mismatch");
@@ -72,7 +72,7 @@ int gs_patch_inspect(const unsigned char *p,size_t n,struct gs_patch_info *out,c
   if(strcmp(hash,recipes[i].hash))return fail(err,en,"stock-normalized SHA-256 mismatch: unknown version/flavour or other modifications");
   *out=info;return 0;
  }
- return fail(err,en,"no supported driver build matched (accepted: 580.159.01, 595.91.04; open, GSP, guest and unknown objects are refused)");
+ return fail(err,en,"no driver build matched (accepted: 580.159.01, 595.91.04; open, GSP, guest and unknown objects are refused)");
 }
 int gs_patch_exact_pair(const unsigned char *patched,size_t pn,const unsigned char *stock,size_t sn,size_t site,char *err,size_t en)
 {

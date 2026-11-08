@@ -35,7 +35,7 @@ body:
     attributes:
       label: Versions
       description: "`geforce-sriov --version`, `uname -r`, `modinfo -F version nvidia`"
-      placeholder: "geforce-sriov 0.1.0, kernel 7.0.14-16-pve, NVIDIA 580.159.01"
+      placeholder: "geforce-sriov 0.2.0, kernel <kernel release>, NVIDIA 580.159.01"
     validations:
       required: true
   - type: checkboxes

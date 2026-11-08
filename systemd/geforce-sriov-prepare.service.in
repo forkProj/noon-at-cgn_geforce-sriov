@@ -12,7 +12,8 @@
 # With boot_display_release= in the config, `prepare --boot` defers: it changes
 # nothing on any card, records /run/geforce-sriov/deferred (which holds
 # nvidia-vgpud back) and exits 0. The selection is then prepared by hand after
-# boot with `geforce-sriov prepare --release-console=BDF`.
+# boot with `geforce-sriov setup`, or with the commands the deferral message lists
+# (`geforce-sriov prepare --release-console=BDF` first).
 #
 # One-boot escape hatch: add `geforce_sriov.skip` to the kernel command line.
 # The unit is enabled by `geforce-sriov install --device BDF` only; installing
@@ -35,7 +36,9 @@ ConditionKernelCommandLine=!geforce_sriov.skip
 Type=oneshot
 ExecStart=@BINDIR@/geforce-sriov prepare --boot
 RemainAfterExit=yes
-TimeoutStartSec=120
+# 300 s covers the 15 s livepatch wait and the remove and rescan waits of up to
+# eight selected cards (up to 28 s for a card with an audio function).
+TimeoutStartSec=300
 StandardOutput=journal+console
 StandardError=journal+console
 

@@ -25,7 +25,7 @@ body:
     attributes:
       label: GPU model and memory
       description: Product name, board maker and VRAM size.
-      placeholder: "RTX 3080 20GB, memory-modded"
+      placeholder: "<card model>"
     validations:
       required: true
   - type: input
@@ -33,7 +33,7 @@ body:
     attributes:
       label: PCI ID and subsystem ID
       description: "From `lspci -nnv -s <address>`: the `[10de:....]` at the end of the first line and the ID on the `Subsystem:` line."
-      placeholder: "10de:2206, subsystem 10de:146d"
+      placeholder: "10de:<device>, subsystem <vendor>:<device>"
     validations:
       required: true
   - type: dropdown
@@ -53,7 +53,6 @@ body:
       options:
         - Ampere (RTX 30)
         - Ada (RTX 40)
-        - Blackwell (RTX 50)
         - Other
     validations:
       required: true
@@ -84,7 +83,7 @@ body:
     attributes:
       label: Host kernel
       description: "`uname -r`"
-      placeholder: "7.0.14-16-pve"
+      placeholder: "<kernel release>"
     validations:
       required: true
   - type: dropdown
@@ -129,14 +128,14 @@ body:
     attributes:
       label: geforce-sriov version or commit
       description: "`geforce-sriov --version`, and `git rev-parse --short HEAD` if you built from a checkout."
-      placeholder: "0.1.0, commit 723f471"
+      placeholder: "0.2.0, commit <short hash>"
     validations:
       required: true
   - type: input
     id: settings
     attributes:
       label: Changed settings
-      description: "Only settings you changed from the defaults: `vfs`, `ari`, `msix`, `experimental_vfs`, `twin_id`, a boot-display grant."
+      description: "Only settings you changed from the defaults: `vfs`, `ari`, `msix`, a boot-display grant."
       placeholder: "vfs=2, ari=off"
   - type: textarea
     id: guests
@@ -157,14 +156,14 @@ body:
       options:
         - label: "geforce-sriov doctor: no FAIL"
         - label: prepare succeeded
-        - label: enable created VFs
+        - label: activate created VFs
         - label: VMs started with a vGPU
         - label: A CUDA or graphics program ran in a guest
         - label: A VM was restarted while other VMs kept running
   - type: input
     id: vf-count
     attributes:
-      label: VFs per card after enable
+      label: VFs per card after activate
       placeholder: "4"
   - type: dropdown
     id: result

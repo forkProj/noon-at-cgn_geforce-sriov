@@ -86,6 +86,46 @@ static int bridge_ari_forwarding(const char *bridge_dir)
 	return -1;
 }
 
+/*
+ * Is MSI-X (capability 0x11) in the PF's capability list, walked as the kernel's
+ * pci_find_capability() does? -1 when <dir>/config cannot tell: unreadable, shorter than 0x40
+ * bytes, or ending before the walk does (unprivileged reads stop at 64 bytes).
+ */
+static int msix_linked(const char *dir)
+{
+	unsigned char cfg[256];
+	char p[GS_PATH_MAX];
+	unsigned int pos, guard = 0;
+	ssize_t n;
+	int fd;
+
+	if (gs_pathf(p, sizeof(p), "%s/config", dir))
+		return -1;
+	fd = open(p, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = pread(fd, cfg, sizeof(cfg), 0);
+	close(fd);
+	if (n < 0x40)
+		return -1;
+	if (!(cfg[0x06] & 0x10))
+		return 0;
+	pos = cfg[0x34];
+	while (guard++ < 48) {
+		pos &= 0xfc;
+		if (pos < 0x40)
+			return 0;
+		if ((ssize_t)pos + 1 >= n)
+			return -1;
+		if (cfg[pos] == 0xff)
+			return 0;
+		if (cfg[pos] == 0x11)
+			return 1;
+		pos = cfg[pos + 1];
+	}
+	return 0;
+}
+
 /* <pf>/resource: is BAR0 (line 0), and is any VF BAR (lines 7-12) assigned? -1 stays when unknown. */
 static void read_resources(const char *dir, struct gs_card *card)
 {
@@ -129,6 +169,7 @@ int gs_card_inspect(const char *sysroot, const struct gs_addr *pf, struct gs_car
 	card->bridge_ari_fwd_supported = -1;
 	card->bar0_assigned = -1;
 	card->vf_bars_assigned = -1;
+	card->msix_linked = -1;
 	if (gs_pathf(dir, sizeof(dir), "%s/bus/pci/devices/%s", sysroot, pf->str))
 		return -ENAMETOOLONG;
 	if (!realpath(dir, real))
@@ -155,6 +196,7 @@ int gs_card_inspect(const char *sysroot, const struct gs_addr *pf, struct gs_car
 			card->numvfs = v;
 	}
 	read_resources(dir, card);
+	card->msix_linked = msix_linked(dir);
 	if (!gs_pathf(p, sizeof(p), "%s/ari_enabled", dir) && !gs_read_uint(p, &v))
 		card->ari_enabled = v ? 1 : 0;
 	if (!gs_pathf(p, sizeof(p), "%s/iommu_group", dir)) {
@@ -241,26 +283,26 @@ void gs_plan_prepare(const struct gs_card *c, const struct gs_display *d, struct
 	memset(plan, 0, sizeof(*plan));
 	plan->verdict = GS_PLAN_READY;
 	if (!c->present)
-		REFUSE("%s: no such PCI function (missing PF)", c->pf.str);
+		REFUSE("%s: no such PCI function", c->pf.str);
 	if (c->pf.func != 0)
-		REFUSE("%s: not function 0; only a physical function .0 is accepted", c->pf.str);
+		REFUSE("%s: not function 0; select the physical function .0", c->pf.str);
 	if (c->is_vf)
-		REFUSE("%s: is a virtual function, not a physical function", c->pf.str);
+		REFUSE("%s is a virtual function, not a physical function", c->pf.str);
 	if (c->vendor != GS_VENDOR_NVIDIA)
 		REFUSE("%s: vendor 0x%04x is not NVIDIA", c->pf.str, c->vendor);
 	if (!c->entry)
-		REFUSE("%s: 10de:%04x is not in the device table (see `geforce-sriov devices`)",
+		REFUSE("%s (10de:%04x) is not in the device table (see `geforce-sriov devices`)",
 		       c->pf.str, c->device);
 	if (!is_display_class(c->class_code))
 		REFUSE("%s: class 0x%06x is not a display controller", c->pf.str, c->class_code);
 	if (c->boot_vga == 1 && !d)
-		REFUSE("%s: is the boot display device (boot_vga=1); preparing it releases the console and needs boot_display_release in the config and `prepare --release-console=%s`",
+		REFUSE("%s is the boot display device (boot_vga=1). Preparing it releases its console and needs boot_display_release in the config and `prepare --release-console=%s`",
 		       c->pf.str, c->pf.str);
 	if (d && c->boot_vga != 1)
 		REFUSE("%s: boot_display_release grants it, but it is not the boot display device (boot_vga=%d); remove it from boot_display_release",
 		       c->pf.str, c->boot_vga);
 	if (c->driver[0])
-		REFUSE("%s: bound to driver '%s'; preparation must run before any display driver binds the PF",
+		REFUSE("%s is bound to driver '%s'; prepare must run before any display driver binds the PF",
 		       c->pf.str, c->driver);
 	if (c->has_sriov && c->numvfs > 0)
 		REFUSE("%s: %u virtual functions are active", c->pf.str, c->numvfs);
@@ -285,7 +327,7 @@ void gs_plan_prepare(const struct gs_card *c, const struct gs_display *d, struct
 		       c->pf.str, fn->bdf.str, fn->driver);
 	}
 	if (!c->bridge_is_pci)
-		REFUSE("%s: sits on a root bus without a PCI bridge; the bridge-scoped rescan is not possible",
+		REFUSE("%s sits on a root bus without a PCI bridge, so the bridge-scoped rescan is not possible",
 		       c->pf.str);
 	if (!c->rescan_present)
 		REFUSE("%s: bridge %s has no pci_bus/%04x:%02x/rescan", c->pf.str, c->bridge.str, c->pf.domain,
@@ -295,8 +337,8 @@ void gs_plan_prepare(const struct gs_card *c, const struct gs_display *d, struct
 		       c->bridge.str);
 	if (c->bar0_assigned == 0)
 		REFUSE("%s: BAR0 is not assigned; a rescan cannot place it", c->pf.str);
-	if (c->has_sriov && c->entry && !gs_sriov_native(c->entry))
-		REFUSE("%s: already presents SR-IOV (sriov_totalvfs=%u) from another kernel change (patched kernel or other livepatch); prepare does not stack on it",
+	if (c->has_sriov)
+		REFUSE("%s already presents SR-IOV (sriov_totalvfs=%u) from another kernel change (patched kernel or other livepatch); prepare does not stack on it",
 		       c->pf.str, c->totalvfs);
 	if (d) {
 		if (d->refuse[0])
@@ -316,12 +358,12 @@ int gs_check_selectable(const struct gs_card *c, int release_granted, char *reas
 	if (c->pf.func != 0 || c->is_vf)
 		return snprintf(reason, len, "%s: not a physical function .0", c->pf.str), -1;
 	if (c->vendor != GS_VENDOR_NVIDIA || !c->entry)
-		return snprintf(reason, len, "%s: %04x:%04x is not in the device table", c->pf.str,
+		return snprintf(reason, len, "%s (%04x:%04x) is not in the device table", c->pf.str,
 				c->vendor, c->device), -1;
 	if (!is_display_class(c->class_code))
 		return snprintf(reason, len, "%s: not a display controller", c->pf.str), -1;
 	if (c->boot_vga == 1 && !release_granted)
-		return snprintf(reason, len, "%s: is the boot display device (boot_vga=1); select it only together with --boot-display-release %s",
+		return snprintf(reason, len, "%s is the boot display device (boot_vga=1); select it only with --boot-display-release %s",
 				c->pf.str, c->pf.str), -1;
 	if (c->nothers > 0)
 		return snprintf(reason, len, "%s: bus shared with %s", c->pf.str, c->others[0].bdf.str), -1;
@@ -685,7 +727,7 @@ int gs_check_presented(const struct gs_card *c, const struct gs_config *cfg, cha
 	if (!c->has_sriov)
 		return snprintf(why, len, "%s presents no SR-IOV (sriov_totalvfs absent)", c->pf.str), -1;
 	if (c->totalvfs < 1 || c->totalvfs > vfs)
-		return snprintf(why, len, "%s presents sriov_totalvfs=%u, outside 1..%u (the configured vfs); the count is fixed at module load, so a changed vfs needs the next boot",
+		return snprintf(why, len, "%s presents sriov_totalvfs=%u, outside 1..%u (the configured vfs); a changed vfs takes effect at the next boot",
 				c->pf.str, c->totalvfs, vfs), -1;
 	return 0;
 }

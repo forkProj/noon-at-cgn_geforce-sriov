@@ -15,10 +15,9 @@ Licensing of this repository
 - Each source file carries its own SPDX-License-Identifier line, which is
   authoritative for that file.
 
-The kernel module and its MSI-X unhide step are adapted from earlier,
-unpublished GPL-2.0-only code (a livepatch and an MSI-X helper module) written
-for the same copyright holder, who offers the adapted code here under
-GPL-2.0-only OR MIT.
+The kernel module and its MSI-X unhide step are adapted from earlier
+unpublished code by the same copyright holder, who offers the adapted code here
+under GPL-2.0-only OR MIT.
 No Linux kernel source files are vendored. The module's replacement functions
 are written for this project on top of exported Linux kernel interfaces. Its
 replacements for pci_read_config_word() and pci_write_config_word() repeat the
@@ -86,17 +85,17 @@ Third-party notices
 2. vgpu_unlock-rs
    https://github.com/mbilker/vgpu_unlock-rs
 
-   The identity hook (hook/gs_hook.c) is a C adaptation of the vgpu-toolkit
-   hook (Rust, MIT, Copyright (c) 2026 vgpu-toolkit contributors), which was trimmed from a fork of
-   vgpu_unlock-rs 2.5.0: an LD_PRELOAD ioctl wrapper that rewrites the PCI
-   device identity the NVIDIA vGPU daemon reads. hook/LICENSE carries the same
-   notices for the hook on its own.
+   The identity hook (hook/gs_hook.c) is an LD_PRELOAD ioctl wrapper that
+   rewrites the PCI device identity the NVIDIA vGPU daemon reads. It is adapted
+   from earlier unpublished code by the same copyright holder, which was itself
+   trimmed from a fork of vgpu_unlock-rs 2.5.0 (MIT, Copyright (c) 2021 Jonathan
+   Johansson, Copyright (c) 2021 Matt Bilker), which builds on DualCoder's
+   vgpu_unlock. hook/LICENSE carries the same notices for the hook on its own.
 
    MIT License
 
    Copyright (c) 2021 Jonathan Johansson
    Copyright (c) 2021 Matt Bilker
-   Copyright (c) 2026 vgpu-toolkit contributors
    Copyright (c) 2026 geforce-sriov contributors
 
    Permission is hereby granted, free of charge, to any person obtaining a copy

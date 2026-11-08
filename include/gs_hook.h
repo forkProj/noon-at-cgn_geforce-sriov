@@ -54,14 +54,9 @@
 
 /*
  * Driver builds the hook may act on, matched exactly against the version token of the
- * "NVRM version:" line. Each is a vGPU host package release:
- *   580.159.01  an identity hook with the same commands and sizes has presented a GA102
- *               board as its vGPU target on this build; open headers of tag 580.159.03.
- *   580.178.05  static only: open headers of tag 580.178.04 are byte-identical to 580.159.03;
- *               no daemon run.
- *   595.91.04   an identity hook with the same commands and sizes has presented a GA102
- *               board on this build; open headers of tag 595.91.07.
- * This C hook itself has not run against any real driver.
+ * "NVRM version:" line. Each is a vGPU host package release: 580.159.01, 580.178.05 and
+ * 595.91.04. Only 580.159.01 is supported; the hook acts on the other two as well, and
+ * passes every ioctl through on any other version. See docs/ampere.md.
  */
 static const char *const gs_hook_driver_versions[] = {
 	"580.159.01",

@@ -1,81 +1,379 @@
 # Changelog
 
-All notable changes to this project are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
+## [0.2.0] - 2026-11-07
 
 ### Added
 
-- GitHub issue forms: a compatibility report for results on your own hardware, working or not,
-  and a short bug report for software bugs. How to collect and redact the details:
-  [docs/compatibility.md](docs/compatibility.md).
-- `twin_id` (module parameter, config key `twin_id`, `install --twin-id=on|off`,
-  `prepare --twin-id=on|off`), off by default, experimental and untested: on an RTX 5090
-  (`10de:2b85`) the kernel module shows NVIDIA's driver the RTX PRO 6000 Blackwell Server Edition
-  ID (`10de:2bb5`, subsystem `10de:204e`) in its 32-bit reads of config dwords `0x00` and `0x2C`.
-  It may make the GPU firmware fail to start. No effect on other cards; `doctor` fails and
-  `prepare` refuses when no selected card is an RTX 5090. The module also refuses `twin_id` for a
-  card behind a hotplug-capable port or with a driver already bound.
-- [docs/devices.md](docs/devices.md): a status column for every row, and a section on Ada and
-  Blackwell: VF count, the NVIDIA driver flavour each generation needs, Blackwell per-VF BAR sizes,
-  `twin_id`, and third-party reports for the RTX 5090 (not verified by geforce-sriov).
-- `geforce-sriov activate [--device BDF]... [--type N] [--dry-run]` (Ada only, root): after
-  `enable`, restarts `nvidia-vgpud` and then `nvidia-vgpu-mgr`, re-probes each selected Ada card
-  (guard, NVIDIA's `unbindLock`, driver unbind and bind; no remove or rescan), optionally sets
-  vGPU type `N` on its VF, then writes `power/control=on` and requires the readback `on`/`active`.
-  It refuses unless NVIDIA's driver is 580.159.01 loaded with `NVreg_EnableGpuFirmware=0`,
-  `nvidia_vgpu_vfio` is loaded, `libnvidia-vgpu.so` resolves to the H5 copy of the plugin, no
-  NVIDIA VF on the host has a vGPU type and no GPU outside `bdfs` has VFs enabled (the daemon
-  restart is host-wide). From its first change until every VF reads back `on`/`active` it keeps
-  `/run/geforce-sriov/activating`. Not run on hardware.
-- `geforce-sriov check [--device BDF]... [--type N]` (Ada only, read-only): the gate before every
-  VM start; exit 0 only when each VF is on `nvidia` with `power/control=on` and
-  `runtime_status=active` (and type `N`), and neither `/run/geforce-sriov/activating` nor the
-  guard exists. Not run on hardware.
-- `doctor` prints, for every selected Ada card, the host stack it needs and that geforce-sriov
-  builds and installs none of it; `enable` names `activate` as the next step for Ada cards.
-- [docs/ada.md](docs/ada.md): the Ada host stack measured by hand on one RTX 4070 SUPER
-  (`10de:2783`): proprietary 580.159.01 with GSP off and two `nvidia.ko` changes, the H5 plugin
-  copy, one VF, the VF power fix, the guest drivers that ran, and recovery. It separates that
-  measurement from the package steps above, which are not hardware-tested.
-- `geforce-sriov-patch ada list|inspect|apply|revert` (offline): the Ada revisions on a copy of
-  your own 580.159.01 host kernel object `nv-kernel.o_binary` or vGPU plugin
-  `libnvidia-vgpu.so.580.159.01`, writing only `NEWOUTPUT`. Each revision admits a file only by its
-  exact whole-file SHA-256. Sites: the Ada probe gate in the host object at `0xd654ef`
-  (`75 7f` → `90 90`), accepted on the stock object and on the object that already carries the
-  scheduler revision, and the H5 change in the plugin at `0x8fb0e` (`f8 06` → `00 5a`). Apply the
-  scheduler revision (`geforce-sriov-patch apply`) first: the scheduler commands refuse an object
-  that already carries the gate revision ([Ada revisions](docs/driver-patch.md#ada-revisions)).
-  The accepted and revised digests were verified offline against copies of the measured files. No
-  module is built or installed, and the plugin copy is not installed.
+#### Installation and driver patches
+
+- Install NVIDIA's vGPU host package through `install` or `setup` with `--driver-file PATH` and `--accept-nvidia-license`.
+  Build with `make`, then run:
+
+  ```sh
+  sudo ./geforce-sriov setup --driver-file NVIDIA-Linux-x86_64-580.159.01-vgpu-kvm.run --accept-nvidia-license
+  ```
+
+  Add `--device BDF` for multiple cards, when more than one card is eligible, or for a boot display card.
+  Install kernel headers for the running kernel, `dkms`, `pciutils`, a C compiler and `make` with your package manager first.
+  A live `install` refuses if any are missing and lists them in one sentence.
+
+- `--driver-file` extracts the `.run` package into `/var/lib/geforce-sriov/nvidia/<version>/` and uses its `kernel/` tree.
+  It copies missing `nvidia-vgpud.service` and `nvidia-vgpu-mgr.service` files to `/etc/systemd/system/`, and missing `sriov-manage` to `/usr/lib/nvidia/sriov-manage`.
+  Combining it with `--nvidia-source` or `--driver=skip`, or using it with `DESTDIR` staging, is a usage error.
+  Use `--nvidia-source DIR` for a kernel tree outside `/usr/src/nvidia-<version>`, such as an extracted package's `kernel/` directory.
+
+- With `--driver-file`, `--accept-nvidia-license` prints the licence notice and runs NVIDIA's userspace installer as `sh PATH --silent --dkms --skip-module-load`.
+  The module stays unloaded until the boot unit runs.
+  The installer is skipped if that version's `libnvidia-vgpu.so` is already installed, and refused while `nouveau` is loaded.
+  Without licence acceptance, the package is extracted, but missing userspace causes refusal with NVIDIA's installer command.
+
+- Before writing anything, `install --driver-file` refuses an existing non-vGPU NVIDIA driver (no `libnvidia-vgpu.so*`) or a driver owned by distribution packages.
+  It names the removal command.
+  The driver step warns if the installed module is NVIDIA's open flavour.
+  `setup` lists selected cards already bound to `nvidia` on one line and explains that preparation must wait for the power cycle.
+
+- The driver step, `scripts/geforce-sriov-driver.sh`, is installed as `geforce-sriov-driver`.
+  `install` runs it unless `--driver=skip` is given.
+  It applies three host-object revisions and two plugin revisions to copies of your files, builds and installs the module, backs up the stock module, installs the patched plugin copy, and writes `/var/lib/geforce-sriov/driver-build` and the modprobe file.
+
+- Driver inputs and patch results are checked against whole-file SHA-256 digests recorded for 580.159.01.
+  The host object, stock plugin, revised object and each plugin revision must match their recorded digests; other files and driver versions are refused.
+  After the build, the installed stock module and rebuilt module must differ at exactly these eight `.text`-relative offsets: `0x14a7c4`-`0x14a7c7`, `0xa16708`, `0xa16709`, `0xd8966f`, `0xd89670`.
+  Any other difference causes refusal and reports the first unexpected offset.
+
+- Identical `.text` means the installed module is already this build.
+  The step writes the build record for this kernel and exits 0 only if the modprobe file, patched plugin copy and stock backup are in place, with the backup differing at exactly the eight expected offsets.
+  Otherwise it refuses and asks you to reinstall the stock module, or use `--driver=skip` to keep the installed module.
+
+- `--dry-run` prints the driver plan without applying it.
+  Refusals before the first write exit 3; a later failure restores replaced files.
+  `--restore`, also used by `uninstall`, restores the stock module only while the installed one is still the step's build, points `libnvidia-vgpu.so` back at the stock plugin and removes the modprobe file.
+
+- `install` writes the `nvidia-vgpud` drop-in and `/etc/geforce-sriov/config` only after the driver step succeeds, or when using `--driver=skip`.
+  Once anything has been written, a failure or refusal exits 1.
+  Exit 3 means nothing changed.
+
+#### Guided setup and boot activation
+
+- `geforce-sriov setup` runs the required steps as child processes of the same binary.
+  Run it before the first cold power cycle, then repeat the same command afterwards.
+  On a fresh host it runs `doctor`, then `install`.
+  On an installed host after boot, it runs `doctor`, `check`, `prepare --boot` if this boot has no prepared record, `activate --boot`, then `check` again.
+  It stops early if every VF is already ready, or at the first failed step, returning that step's exit code.
+
+- `setup` automatically selects a single eligible card that is not the boot display.
+  If the host's only NVIDIA card is the boot display, it asks the console-release question for that card. Without a terminal, or with `--no-prompt`, it refuses before installing and names `--device` and `--boot-display-release`.
+  On later runs, it notes and ignores the first-install options: `--driver-file`, `--vfs`, `--boot-display-release`, `--nvidia-source` and `--driver=skip`.
+  A `--device` selection that differs from the configured cards is refused.
+  It explains when to power the host fully off and on, lists each card's guest drivers, and leaves VM creation and VF attachment to you.
+
+- `install` installs and enables `systemd/geforce-sriov-activate.service`.
+  It runs `activate --boot` once per boot, after preparation and NVIDIA's two daemons, and before VM autostart.
+  It is ordered before `libvirt-guests.service` and `pve-guests.service`, but requires no particular hypervisor.
+  Its start timeout is 600 seconds.
+  It does not run on the boot-display path while the deferred marker exists.
+
+- `doctor` checks kernel headers, `cc`, `make` and NVIDIA's kernel source tree at `/usr/src/nvidia-<version>`.
+  Missing headers, `cc` or `make` are failures before the running kernel's module is installed, and warnings afterwards because only a later `install` needs them.
+  Host driver versions other than 580.159.01, which are not supported, produce a warning.
+  `doctor` and `status` report whether the installed `nvidia.ko` matches the driver step's recorded build.
+  `doctor --driver-file` and `doctor --boot-display-release BDF` check the host as installation will leave it; `setup` passes both through.
+
+#### Ada and multi-GPU support
+
+- [Ada](docs/ada.md) now has the same support tier as [Ampere](docs/ampere.md): four VFs per card, three host-object revisions (scheduler, probe gate and VF count), two plugin revisions, and the `activate` and `check` commands.
+  Other host and guest driver versions are not supported.
+  Blackwell GPUs are not expected to work.
+
+- The Ada VF-count revision makes NVIDIA's driver report 4 total VFs instead of 1.
+  It changes site `0x126644` in `_nv039075rm` (`kbifCacheVFInfo`) from `0f b7 45 06` to `31 c0 b0 04`, taking the object SHA-256 from `f5b788cd…` to `946b27b8…`.
+  See [the full digests](docs/driver-patch.md#revisions).
+  The revision applies to every TU/GA/AD card bound to the module, not just selected cards.
+
+- `activate` and `check` handle every VF of every selected Ada card.
+  Mixed-generation selections produce one `[WARN]` from `doctor`, but are not refused.
+  Both generations share a host module, VF count and plugin copy ([combining generations](docs/devices.md#combining-generations)).
+  [Mixed-host documentation](docs/devices.md#combining-generations) covers the shared driver stack, four VFs per card, required driver versions and startup order.
+
+- Added workstation device IDs, handled like GeForce cards of the same generation with four VFs by default:
+  - Ada AD104: `27b1` RTX 4500 Ada Generation and `27b2` RTX 4000 Ada Generation.
+  - Ada AD107: `28b0` RTX 2000 / 2000E Ada Generation.
+  - Ampere GA104: `24b0` RTX A4000.
+  - Ampere GA106: `2571` RTX A2000 12GB.
+
+- Added GitHub issue forms for compatibility reports, including failed setups, and software bugs.
+  [Compatibility reporting](docs/compatibility.md) explains what to collect and redact.
+  [Supported cards](docs/devices.md) lists each generation's target, default type, VF count and required NVIDIA driver flavour.
+
+#### Activation and readiness checks
+
+- `geforce-sriov activate [--type N] [--dry-run] [--boot]` configures all Ada and Ampere cards selected by `bdfs`.
+  It runs as root and takes no `--device` option.
+  Activation:
+  1. Creates missing VFs and loads `nvidia_vgpu_vfio`.
+  2. Restarts `nvidia-vgpud`, then `nvidia-vgpu-mgr`.
+  3. Re-probes each selected PF under the guard and NVIDIA's `unbindLock`, using driver unbind and bind, never device removal or a bus rescan.
+  4. Sets each VF's type from `--type N`, then `type_ada` or `type_ampere`, then the default: 942 (RTX6000-Ada-2Q, 2048 MiB) on Ada or 525 on Ampere.
+  5. Writes `power/control=on`, verifies `on`/`active`, and prints the `check` result.
+
+- Activation refuses unless the driver has `NVreg_EnableGpuFirmware=0` and `libnvidia-vgpu.so` resolves to the patched plugin copy.
+  These two checks only warn on host driver versions other than 580.159.01; the version is reported as not supported and activation continues.
+  Because the daemon restart affects the whole host, activation also refuses if any NVIDIA VF has a vGPU type, or any GPU outside `bdfs` has VFs enabled.
+  An installed `nvidia.ko` that differs from the recorded build, including a record for another kernel, is refused.
+  A missing record produces only a warning.
+
+- `/run/geforce-sriov/activating` exists from the first activation change until every VF reads back `on`/`active`.
+  If a type is absent from `nvidia/creatable_vgpu_types`, no type is written.
+  The error explains: `The driver keeps the vGPU types it registered first after a boot, so after a change of identity or target, power the machine off and on`.
+  With `--boot`, activation first waits up to 30 s for the driver version file and each selected PF to bind to `nvidia`.
+
+- `geforce-sriov check [--device BDF]... [--type N]` is a read-only check before each VM start.
+  It exits 0 only when every VF is on `nvidia`, has `power/control=on` and `runtime_status=active`, carries the expected type, and neither the guard nor `/run/geforce-sriov/activating` exists.
+  Type precedence is `N` from `--type`, then `type_ada` or `type_ampere`, then 942 on Ada or 525 on Ampere.
+  It does not read the plugin.
+
+- An unfinished activation produces a warning in `doctor`:
+  `/run/geforce-sriov/activating exists: geforce-sriov activate is running or did not finish; check reports NOT READY until activate succeeds`.
+  `status` prints `activate: /run/geforce-sriov/activating exists (activate is running or did not finish)` and `` next: stop every VM that uses a vGPU, then run `geforce-sriov activate` ``, and exits 1.
+
+- For each selected Ada card, `doctor` lists its required host stack and explains that `install` prepares it unless `--driver=skip` is given.
+  [Ada documentation](docs/ada.md) covers the proprietary 580.159.01 host stack with GSP off, host-object and plugin revisions, VF power fix, guest drivers and recovery.
+
+#### Offline Ada patcher
+
+- `geforce-sriov-patch ada list|inspect|apply|revert` applies the Ada revisions offline to your own 580.159.01 `nv-kernel.o_binary` or `libnvidia-vgpu.so.580.159.01`, writing only `NEWOUTPUT`.
+  Like the install step, it checks each revision against recorded SHA-256 digests.
+
+- Patch sites and accepted inputs:
+  - Probe gate: `0xd654ef`, `75 7f` → `90 90`; accepts the stock host object or one with the scheduler revision.
+  - VF count: `0x126644`, `0f b7 45 06` → `31 c0 b0 04`; accepts an object with both scheduler and probe-gate revisions.
+  - Plugin placement: `0x8fc17`, 15 bytes; its output is the input for the 6-byte framebuffer change at `0xa5f28`.
+    The resulting plugin serves both Ada and Ampere.
+
+- Apply revisions in order: scheduler (`geforce-sriov-patch apply`), probe gate (`ada apply`), VF count (`ada apply` again), then both plugin changes.
+  The scheduler commands refuse an object that already has the gate revision.
+  See [Ada revisions](docs/driver-patch.md#revisions).
+  `ada inspect` and `ada apply` print a `row N: …` line.
+  The plugin starts from stock `7e52b76d…` and ends at SHA-256 `aa4fdeb5…`.
+
+#### Console release and driver diagnostics
+
+- Existing files in `/etc/modprobe.d/` that set `NVreg_EnableGpuFirmware=0` are kept.
+  The driver step writes no modprobe file of its own, and `--restore` and `uninstall` leave the existing file alone.
+  Any other value causes refusal: `<file> sets NVreg_EnableGpuFirmware=<value>; this stack needs 0`.
+  `doctor` reports the same conflict.
+  With `boot_display_release` set, it also warns if `/etc/modprobe.d/` lacks the boot hold: `blacklist nvidia` and `install nvidia /bin/false`.
+
+- After boot, `setup` can release the console when a grant exists, `check` is not ready and NVIDIA's driver is unloaded.
+  It asks `Release the console of <BDF> and bring the GPUs up now? [y/N]`.
+  Yes runs these commands in order, stopping on the first failure and returning its exit status:
+  1. `geforce-sriov prepare --release-console=<BDF>`
+  2. `modprobe --ignore-install nvidia`
+  3. `geforce-sriov activate`
+  4. `geforce-sriov check`
+
+  No prints the commands and exits 0.
+  `--no-prompt`, no terminal or end of input causes refusal with exit 3 and no changes:
+  `setup: releasing the console needs a yes. Run setup on a terminal, or run these commands:`.
+
+  `doctor`, `status`, the boot unit's deferral message and `install` print the same four commands under `After each boot, as root, in this order:`, followed by `or run geforce-sriov setup`.
+  With a release grant, `install` prints the hold file and commands near the end of its output.
+
+  Before first installation, `setup` asks for permission for any boot-display card selected at its prompt.
+  The default is no, which excludes the card; the prompt also says `SSH keeps working`.
+
+- Driver-step output is saved to `/var/lib/geforce-sriov/driver-step.log`, mode 0600, replaced on each run and removed by `uninstall`.
+  Before starting, `install` prints `This may build NVIDIA's module for <kernel release>, which can take a few minutes; progress is in /var/lib/geforce-sriov/driver-step.log`.
+  It then shows only `geforce-sriov-driver: …` lines, plus the last 40 log lines and log path on failure.
+  The last displayed log line is the step's own refusal; only source-tree and vendor-object refusals mention `--nvidia-source`.
+  Success ends with `geforce-sriov-driver: NVIDIA's module and plugin are prepared`.
+  The installed plugin copy has mode 0755, including on reruns that find a prepared host but a copy missing that mode.
+
+- Before its closing line, the driver step reports `geforce-sriov-driver: patched plugin copy installed: <path> (sha256 <first 16 hex digits>)`.
+  `install` shows this with the step's other lines.
+
+- `doctor`, `status` and `check` compare the loaded `nvidia` build-id from `/sys/module/nvidia/notes/.note.gnu.build-id` with the installed `nvidia.ko`, but only when the installed module is the driver step's build.
+  A mismatch makes `doctor` warn `the running nvidia module (build-id <first 12 hex digits>) is not the installed one (<first 12 hex digits>); power the machine off and on to load it`.
+  `status` adds the sentence to the card's `nvidia.ko` note and exits 1.
+  `check` adds it to its `nvidia.ko` line without changing its exit status.
+  If the installed module is not the driver step's build, none reports on the loaded module.
+
+- `doctor` checks systemd's unit drop-in directories for `LD_PRELOAD` overrides in `nvidia-vgpud` and `nvidia-vgpu-mgr`.
+  The package's own `geforce-sriov.conf` is excluded.
+  Other files produce `[WARN] <file> sets LD_PRELOAD for <unit> and overrides the geforce-sriov identity hook. Remove it or point it at <hook path>.`
+  In `nvidia-vgpud.service.d`, files read before `geforce-sriov.conf` are not reported because the last `LD_PRELOAD` wins.
+
+- With neither a driver-step record nor an install manifest, including after uninstall, `doctor` prints `[INFO] the driver step has not run on this host; install runs it`.
+  With a manifest but no record (`install --driver=skip`), or a record for another module or kernel, it instead says to rerun the driver step.
+
+- `uninstall` restores the stock module, then removes the running kernel's backup in `/var/lib/geforce-sriov/stock/`, empty `build/` and `stock/` directories, and `/var/lib/geforce-sriov/` if empty.
+  It prints `removed <path>` for each.
+  Other kernels' backups remain, and a later install takes a fresh backup.
+  If restoration fails, uninstall exits 1 and removes other installed files, but keeps `geforce-sriov-driver` and every backup.
+  It prints `NVIDIA's module was not restored: <reason>` with two ways to complete restoration by hand.
+
+#### Profiles and guest setup
+
+- `type_ada=N` and `type_ampere=N` select the type that `activate` sets and `check` expects on each VF.
+  Without them, the defaults are 942 on Ada and 525 on Ampere.
+  Invalid values are refused with `line N: type_ada must be a vGPU type ID from 1 to 999999, as nvidia/creatable_vgpu_types lists it`.
+  `config.example` and the installed config show both keys commented out unless set.
+
+- After setting an Ada card's types, `activate` names VFs whose framebuffer slots end above 75% of the card's memory.
+  For example: `0000:03:00.0: with type 946 the VFs 0000:03:00.5, 0000:03:00.6 and 0000:03:00.7 may not start: their framebuffer slots end near the top of the card's 16376 MiB. Put VMs on the lower VFs, or choose a smaller type.`
+  VF k occupies `[k × (P − 32), (k + 1) × (P − 32))` MiB, where P is the type's `profileSize` in `/usr/share/nvidia/vgpu/vgpuConfig.xml`.
+  Memory comes from `nvidia-smi`, which is killed after 5 s.
+  This is advisory: the exit status is unchanged, missing either source produces no message, and Ampere cards get no message.
+
+- Q profiles are listed in [Ada](docs/ada.md#choosing-a-profile) and [Ampere](docs/ampere.md#choosing-a-profile).
+  [Choosing a vGPU type](docs/configuration.md#choosing-a-vgpu-type) explains how to change size.
+
+- [Guests](docs/installation.md#guests) documents each card's guest drivers, where to set `RMSetVgpuGspPluginOffloadMode=0` on Linux and Windows, and unsupported pairs: Ada with a 580-series guest driver, or Ampere with 16.9 drivers.
+  [Ada](docs/ada.md#guests-and-vms) and [Ampere](docs/ampere.md#guests-and-vms) link to those instructions.
 
 ### Changed
 
-- Ada and Blackwell cards present 1 VF, the card's own count, by default: `experimental_vfs` now
-  defaults to `off` (module parameter `0`). NVIDIA's driver reads the VF count of these cards from
-  the hardware itself.
-- With `experimental_vfs=on`, the raised count on Blackwell now also reaches NVIDIA's driver: the
-  kernel module answers its 32-bit read of InitialVFs/TotalVFs with the same count the kernel sees.
-  Untested; the GPU firmware may still refuse more than 1 VF. On Ada only Linux sees the raised
-  count.
-- `doctor` notes for every Blackwell card that the proprietary 580.159.01 driver does not support
-  it and that the open kernel module it needs is not supported by geforce-sriov yet.
-- Documentation: Ada is no longer described as "untested on either flavour" or as needing GSP.
-  The one measured card ran the proprietary 580.159.01 module with GSP off and changes made by
-  hand; every Ada row, `2783` included, stays experimental.
+#### GPU support and profiles
 
-### Fixed
+- `msix=on` now exposes MSI-X on Ada as well as Ampere.
+  Every Ada device-table row uses `0x41C` bit 29 as the hide bit; the module clears it at load, then `prepare` removes and rescans the card.
+  A card reset hides MSI-X again until the next cold boot.
+  Use `msix=off` to leave it hidden.
 
-- Documentation: one gate for more than one VF on Ada and Blackwell is known (NVIDIA's driver reads
-  TotalVFs from the hardware), and Ada dumps do record config `0x41C` bit 29; only its meaning on
-  Ada is unconfirmed.
+- The Ada plugin framebuffer change lets guests use more of their profile.
+  Previously, each VF's host framebuffer was capped at the card's framebuffer divided by the type's `maxVgpus`, less reserved memory.
+  For RTX6000-Ada-2Q, `maxVgpus` is 24.
+  The 6-byte change at `0xa5f28` (`8b bb d0 29 00 00` → `bf 04 00 00 00 90`) uses 4, the VF count, as the divisor.
+  Ampere never reaches this code.
+
+  Applied after the placement change (`7ddfad45…`) to stock plugin `7e52b76d…`, it produces SHA-256 `aa4fdeb5288b5e56e7d4972466813d78e10cfb428fcf62fb53b84fec718cf07c`.
+  `geforce-sriov-patch ada` adds a fifth row, `plugin-div4`; the driver step applies both plugin rows in order and checks each digest.
+  Rerunning `install` replaces placement-only copies, including on prepared hosts and when repairing the build record.
+  `activate` accepts only the new digest and tells users with older copies to run `sudo geforce-sriov install` again.
+  `doctor` checks the plugin link by the same rule: other files produce warnings after the driver step has run, and information beforehand.
+  Messages and documentation call the result the patched plugin copy.
+
+- Each generation now has one vGPU target, rather than a target per device-table row.
+  Ampere uses RTX A6000 (`10de:2230`); Ada uses RTX 6000 Ada (`10de:26b1`).
+  Both keep the board's own subsystem ID.
+  Version 0.1.0 mapped some dies to other targets.
+  Ada defaults to type 942 (RTX6000-Ada-2Q, 2048 MiB).
+
+- `geforce-sriov devices` prints each generation's target and default type once, then the `DEVICE`, `GEN`, `DIE` and `NAME` columns for each row.
+  It states once that every listed card is supported.
+  `doctor` prints `-> vGPU target 10de:<id> <name>` per card, and the hook logs `presented as <name> (10de:<id>), subsystem kept`.
+  Unlisted cards are refused by `doctor`, `install --device`, `setup`, `activate` and `check` with `<BDF> (10de:<id>) is not in the device table`.
+
+- `activate`, including its boot-unit and dry-run paths, and `check` now share type precedence: `--type N`, then `type_ada` or `type_ampere`, then the generation default.
+  Custom types survive boot-unit and `setup` runs.
+  Mixed hosts can set a type per generation without `--type`.
+  A refused mixed-generation `--type` selection lists the types a run without it would use and adds `Set type_ada= and type_ampere= in /etc/geforce-sriov/config to choose one per generation`.
+
+- `geforce-sriov-patch` usage no longer mentions Blackwell.
+  [Ada](docs/ada.md) documents the hardware VF count: 1 for every Ada row except `28b0`, which reports 16.
+  [Ampere](docs/ampere.md) documents GeForce and workstation boards.
+
+#### Console release and cold power cycles
+
+- First-install console permission now asks `Allow releasing the console of <BDF> after the next boot? [y/N]`.
+  Yes records the grant without releasing anything; `setup` asks again after the power cycle.
+  `install --boot-display-release` prints `Console release: granted; nothing is released now.` and explains the later release, rather than describing one happening immediately.
+  The post-boot question is unchanged.
+
+- After a live install that enables boot units, the next step is: run `doctor`, power the host fully off and on, then run `sudo geforce-sriov setup`.
+  With console release granted, use the listed commands or `setup`.
+  The message no longer suggests a reboot or says that `status` names the next step.
+  `setup` adds only that the same command works after boot.
+
+- Before a prepared boot, `status` now says `power the machine off and on`, not reboot.
+  `uninstall --unload` refusals end with `disable the VFs, or power the machine off and on instead` or `power the machine off and on instead`.
+  `prepare` refuses a module already loaded with other parameters with a message that ends `power the machine off and on to change them`.
+
+- An obsolete NVIDIA boot hold now produces a warning when the installed config grants no console release:
+  `nvidia is held back at boot by <file>, and no console release is granted. activate will refuse. Remove <file> (docs/installation.md#returning-to-automatic-preparation)`.
+  For files other than `nvidia-manual-load.conf`, `doctor` names the two lines to remove instead.
+  `uninstall` leaves the hold in place and prints `<file> still holds nvidia back at boot; remove it if nothing else needs it`.
+  [Returning to automatic preparation](docs/installation.md#returning-to-automatic-preparation) and [Uninstall](docs/installation.md#uninstall) explain its removal.
+
+- If a release grant exists but NVIDIA's driver is already loaded and a card is unprepared, `setup` stops before `prepare` with exit 3:
+  `setup: NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. Create the hold (docs/installation.md#boot-display-card), power the machine off and on, then run setup again.`
+
+- `install` prints `geforce_sriov.skip` only when no console release is granted.
+  Console-release information appears once: at `setup`'s prompt if it asked, otherwise in `install`.
+  `setup` uses `--release-note-shown` to suppress the duplicate.
+
+- If a file in `/etc/modprobe.d/` already holds NVIDIA's driver back, `install` and the closing `setup` block print `nvidia is already held back at boot by <file>.` instead of showing a file to create.
+  They still list the commands required after each boot.
+  This also applies below `DESTDIR` when staging with a console-release grant.
+
+#### Build mismatches and activation refusals
+
+- On a loaded/installed module mismatch, `activate` warns and continues:
+  `geforce-sriov: warning: the running nvidia module (build-id …) is not the installed one (…); power the machine off and on to load it`.
+  It no longer adds "continuing", because an existing vGPU can still cause refusal.
+  `status` prioritizes `next: power the machine off and on (the running nvidia module is not the installed one)` and omits steps leading to activation.
+  While `/run/geforce-sriov/activating` exists, it retains `activate: … exists` but omits `next: stop every VM …`.
+  A prepared card without VFs gets no separate next step.
+
+- A module mismatch now makes `status` exit 1 even when cards are otherwise ready; previously it exited 0.
+  It still prints `next: power the machine off and on (the running nvidia module is not the installed one)`.
+  `check` retains its exit status, and `doctor` retains its warning.
+
+- On an installed host with unready VFs and a loaded module different from the installed driver-step build, `setup` stops after `check`, before `prepare` and `activate`.
+  It exits 3 without changes and prints `setup: the running nvidia module is not the installed one. Power the machine off and on, then run setup again.`
+
+- Refusal because a vGPU already exists now lists affected VFs and their types, one per line, up to the first 8 followed by `and N more`.
+  The list follows `each VF below has a vGPU, and restarting NVIDIA's vGPU daemons would end it:`.
+  It ends with `Stop the VMs that use them, then write 0 to each nvidia/current_vgpu_type, for example:` and one command for all listed VFs:
+  `for f in <BDFs>; do echo 0 > /sys/bus/pci/devices/$f/nvidia/current_vgpu_type; done`.
+  The exit code remains 3.
+
+#### Driver reporting and recovery
+
+- `uninstall` and the driver step's `--restore` report plugin changes:
+  - `pointed <link> back at the stock plugin libnvidia-vgpu.so.580.159.01` when the link pointed at the package's copy.
+  - `removed <path>` for the removed copy.
+  - `left <link>: it points to <target>, which this package did not install` for an unrelated link, which stays unchanged.
+
+- `doctor` says the driver step writes no modprobe file only when `/etc/modprobe.d/geforce-sriov-nvidia.conf` is absent.
+  Otherwise it says `its own file stays until uninstall`.
+  If the driver step fails, `install` prints the cause once, at the end of the displayed log lines.
+
+- After restoration, `uninstall` prints `NVIDIA's module backups stay for these kernels; to put one back, as root:` and a command for each retained kernel backup:
+  `restore <kernel release>: cp /var/lib/geforce-sriov/stock/<kernel release>/nvidia.ko <module path> && depmod -a <kernel release>`.
+  A failed restore prints `cp … && depmod -a <kernel release>` and points to docs/driver-patch.md#reverting for the plugin link and modprobe file.
+
+- VF-count guidance in usage, `devices`, the config warning and the module parameter now explains that above 4 VFs, the module refuses to load if the card's VF layout check fails.
+  Without a config file, `doctor --device BDF` prints `[INFO] config: /etc/geforce-sriov/config absent; the selected devices come from --device` instead of saying no card is selected.
+
+- The README and supported stack state the driver-version rule: `install` accepts only host driver 580.159.01, and other host and guest driver versions are not supported.
+  The closing `Guest drivers:` block in `setup` ends with:
+  - `Every guest driver needs RMSetVgpuGspPluginOffloadMode=0.`
+  - `Use these versions; other versions are not supported.`
+  - `Setting and steps: docs/installation.md#guests.`
+
+### Removed
+
+- Removed `enable`.
+  `activate` creates missing VFs, so it is the only command needed after boot.
+
+- Removed Blackwell device IDs `2b85`, `2c02`, `2c05`, `2d04`, `2d05` and `2f04`.
+  Blackwell cards are now treated as unlisted devices.
+
+- Removed `experimental_vfs` from the module parameters, config, `install` and `prepare`, along with the module's replacement of `pci_read_config_dword()`.
+  Configs containing `experimental_vfs=` or `twin_id=` are refused with `line N: unknown key '<key>'; delete this line`.
 
 ### Known limitations
 
-- `geforce-sriov-patch` makes the Ada host-object and plugin revisions only on copies; building
-  and installing `nvidia.ko` and installing the plugin copy and its link remain your steps.
+- Once `prepare --release-console` releases a card, its framebuffer console stays detached until the next boot.
+
+- Loading `nvidia` binds every NVIDIA card on the host; card selection cannot limit this.
+  Select every card a mixed host will use.
+  The rebuilt `nvidia.ko` applies its VF-count and scheduler revisions to every card bound to it.
+  `bdfs` limits only the kernel module's SR-IOV presentation, identity hook, `prepare` and `activate`.
+
+- Blackwell is not expected to work.
+  Its cards are absent from the device table, and NVIDIA's proprietary 580.159.01 host driver does not support them on a vGPU host.
 
 ## [0.1.0]
 
@@ -83,39 +381,25 @@ Initial release.
 
 ### Added
 
-- `geforce-sriov` CLI: read-only `devices`, `doctor` and `status`; `install`, `prepare`, `enable`
-  and `uninstall`. Up to 8 selected GPUs, all checked before anything changes.
-- `geforce_sriov` kernel module (livepatch, DKMS package `geforce-sriov/0.1.0`): for the listed
-  cards only, presents the card's hidden SR-IOV capability, enables ARI in software and reveals
-  MSI-X on Ampere. Parameters `bdfs`, `vfs`, `ari`, `msix` and `experimental_vfs`.
-- Boot unit `geforce-sriov-prepare.service`: prepares the selected cards once per boot, before
-  NVIDIA's driver binds them.
-- Identity hook `libgeforce_sriov.so`, loaded only into `nvidia-vgpud` through a systemd drop-in:
-  presents each selected card as its professional counterpart (for example RTX 3080 as RTX A6000)
-  so that NVIDIA's daemon offers vGPU types for it.
-- Driver patcher `geforce-sriov-patch` (`inspect`, `apply`, `revert`): a two-byte fix to the
-  user's own copy of NVIDIA's `nv-kernel.o_binary` so that guest GPU work does not stall.
-- Device table of 38 GeForce device IDs across Ampere, Ada and Blackwell.
-- Boot display GPU by explicit grant: `install --boot-display-release BDF`, then
-  `prepare --release-console=BDF` by hand after each boot.
-- VF count setting: `install --vfs N` or `vfs=N` in `/etc/geforce-sriov/config`, default 4.
-- Offline test suite (`make check`).
-
-### Status
-
-Experimental. Measured on one host: two memory-modded RTX 3080 20GB cards (`10de:2206`,
-subsystem `10de:146d`), kernel `7.0.14-16-pve`, NVIDIA vGPU host driver 580.159.01 with
-`nvidia.ko` rebuilt from `geforce-sriov-patch` output, `ari=on` and `msix=on`. The identity hook
-presented both cards as `10de:2230` (RTX A6000) with 23 vGPU types each, and `enable` created
-4 VFs per card. Eight guests (per card 2 Linux and 2 Windows 11, each with a 4 GiB `RTXA6000-4Q`
-vGPU) ran one 30-minute concurrent CUDA and D3D11 workload with no failures recorded; one Linux and
-one Windows guest were restarted while the others kept running.
+- `geforce-sriov` CLI: read-only `devices`, `doctor` and `status`, plus `install`, `prepare`, `enable` and `uninstall`.
+  Supports up to 8 selected GPUs and checks all of them before changing anything.
+- `geforce_sriov` livepatch kernel module, packaged as DKMS `geforce-sriov/0.1.0`.
+  For listed cards only, it exposes hidden SR-IOV, enables ARI in software and reveals MSI-X on Ampere.
+  Parameters: `bdfs`, `vfs`, `ari`, `msix` and `experimental_vfs`.
+- `geforce-sriov-prepare.service` prepares selected cards once per boot, before NVIDIA's driver binds them.
+- Identity hook `libgeforce_sriov.so`, loaded only into `nvidia-vgpud` through a systemd drop-in.
+  It presents selected cards as professional counterparts so the daemon offers vGPU types.
+- `geforce-sriov-patch` with `inspect`, `apply` and `revert`.
+  Its two-byte patch to your own `nv-kernel.o_binary` prevents guest GPU work from stalling.
+- A device table containing 38 GeForce IDs across Ampere, Ada and Blackwell.
+- Explicit boot-display permission through `install --boot-display-release BDF`, followed by `prepare --release-console=BDF` after each boot.
+- VF-count configuration through `install --vfs N` or `vfs=N` in `/etc/geforce-sriov/config`, default 4.
+- An offline test suite, run with `make check`.
 
 ### Known limitations
 
-- Only `10de:2206` with subsystem `10de:146d` has been measured. Every other card in the device
-  table, and every cross-die mapping, is experimental.
-- The VF count defaults to 4: ARI is enabled in software, but ARI decoding in the GPU hardware
-  does not work for now.
-- vGPU types are not filtered by the card's memory; choose types that fit together.
-- NVIDIA's vGPU host driver and the guests' vGPU licence setup are not included; you supply both.
+- VF count defaults to 4.
+  ARI is enabled in software, but GPU hardware ARI decoding does not work.
+- vGPU types are not filtered by physical VRAM; choose profiles that fit together.
+- NVIDIA's vGPU host driver and guest licences are not included.
+  You must supply both.

@@ -10,10 +10,10 @@
  * version file, runs the stand-in daemon (vgpud.c) with LD_PRELOAD="HOOK_SO FAKE_DRIVER_SO",
  * and compares every reply, and every attribution query the fake driver saw the hook send,
  * with what the scenario states. HOOK_SO is the test build of hook/gs_hook.c
- * (-DGS_HOOK_TEST_ENV, the only difference: it honours the two GEFORCE_SRIOV_TEST_* path
- * overrides and logs to stderr instead of syslog). The fake driver checks every query's fd,
- * client, object, command, size, flags, preset status and gpuId chain itself and reports a
- * broken rule as a BAD token, which no expectation contains.
+ * (-DGS_HOOK_TEST_ENV, the only difference: it honours the GEFORCE_SRIOV_TEST_* overrides, two
+ * paths and the name of the next ioctl, and logs to stderr instead of syslog). The fake driver
+ * checks every query's fd, client, object, command, size, flags, preset status and gpuId chain
+ * itself and reports a broken rule as a BAD token, which no expectation contains.
  * Cards are taken from the shared device table, so the tests follow include/gs_devices.h.
  */
 #ifndef _GNU_SOURCE
@@ -34,15 +34,17 @@
 #include "gs_devices.h"
 #include "fixture.h"
 
-#define SUB_A 0x146d10deu /* a board partner subsystem, kept for a wildcard target */
+#define SUB_A 0x146d10deu /* a board partner subsystem, always kept */
 #define OUT_MAX 65536
 #define CLIENT_2 0xc1d00777u
+/* The hook's test-only override of the symbol it looks up as the next ioctl (gs_hook.c). */
+#define NEXT_IOCTL_ENV "GEFORCE_SRIOV_TEST_NEXT_IOCTL"
 
 static const char *hook_so, *fake_so, *vgpud, *vgpu_mgr;
 static char tmp[256];
 static int failures;
 
-/* The cards: A has a wildcard-subsystem target, B a target with a fixed subsystem. */
+/* The cards: A is the first Ampere row, B the first Ada row (another target). */
 static const struct gs_device *card_a, *card_b;
 static unsigned int unknown_id;
 
@@ -61,7 +63,7 @@ static unsigned int devid(unsigned int d)
 	case DEV_X:
 		return unknown_id;
 	case DEV_TA:
-		return card_a->target;
+		return gs_target_of(card_a)->device;
 	}
 	return d;
 }
@@ -502,17 +504,9 @@ static void expect_queries(char *out, size_t len, const char *spec, const struct
 	}
 }
 
-static uint32_t presented_sub(unsigned int dev, uint32_t sub)
-{
-	const struct gs_device *d = gs_device_lookup(dev);
-
-	return d->target_subvendor && d->target_subdevice
-		       ? WORD(d->target_subdevice, d->target_subvendor) : sub;
-}
-
 static uint32_t presented_word(unsigned int dev)
 {
-	return WORD(gs_device_lookup(dev)->target, GS_VENDOR_NVIDIA);
+	return WORD(gs_target_of(gs_device_lookup(dev))->device, GS_VENDOR_NVIDIA);
 }
 
 static uint32_t op_handle(const struct machine *m, const struct op *o)
@@ -585,7 +579,7 @@ static void plan_op(struct plan *p, const struct op *o, const struct machine *m,
 		arg(p, "%#x", o->flags);
 		expect_queries(q, sizeof(q), o->q, m, o->gpu, p->client);
 		want(p, FIX_PCI_LINE, o->change ? presented_word(dev) : word,
-		     o->change ? presented_sub(dev, SUB_A) : SUB_A, FIX_REVISION, word,
+		     SUB_A, FIX_REVISION, word,
 		     eio ? -1 : 0, eio ? EIO : ok,
 		     eio ? FIX_STATUS_UNSET : (unsigned int)(h & FAKE_STATUS_MASK), q);
 		break;
@@ -621,9 +615,9 @@ static void plan_op(struct plan *p, const struct op *o, const struct machine *m,
 		arg(p, "%#x", h_sub(fn_index(m, o->gpu)));
 		arg(p, "%#x", h_sub(fn_index(m, o->gpu2)));
 		want(p, FIX_THREADS_LINE, o->change ? presented_word(dev) : word,
-		     o->change ? presented_sub(dev, SUB_A) : SUB_A,
+		     SUB_A,
 		     o->change2 ? presented_word(dev) : word,
-		     o->change2 ? presented_sub(dev, SUB_A) : SUB_A, THREADS * CALLS, 0u,
+		     SUB_A, THREADS * CALLS, 0u,
 		     per_group * (count_queries(o->q) + count_queries(o->q2)), 0u);
 		break;
 	}
@@ -679,6 +673,7 @@ struct scenario {
 	bool no_hook;        /* preload only the fake driver */
 	const char *log_has;  /* substrings the hook's stderr must contain */
 	const char *log_has2;
+	bool no_next_ioctl;  /* the hook's lookup of the next ioctl fails */
 };
 
 #define OPS(a) .ops = (a), .n_ops = sizeof(a) / sizeof((a)[0])
@@ -704,7 +699,8 @@ static void run(const struct scenario *s)
 	static char got[OUT_MAX], log[OUT_MAX];
 	char dir[300], cfg[400], ver[400], sys[400], table[400], out[400], err[400];
 	char preload[1024], env_cfg[512], env_ver[512], env_sys[512], env_pre[1100], env_tab[512];
-	char *envp[] = { env_pre, env_cfg, env_ver, env_sys, env_tab, NULL };
+	char env_next[64] = NEXT_IOCTL_ENV "=gs_no_such_ioctl";
+	char *envp[] = { env_pre, env_cfg, env_ver, env_sys, env_tab, s->no_next_ioctl ? env_next : NULL, NULL };
 	struct op std[32];
 	const struct op *ops = s->ops;
 	size_t n_ops = s->n_ops;
@@ -795,15 +791,14 @@ static void pick_cards(void)
 {
 	for (unsigned int i = 0; i < GS_DEVICE_COUNT; i++) {
 		const struct gs_device *d = &gs_devices[i];
-		bool fixed_sub = d->target_subvendor && d->target_subdevice;
 
-		if (!card_a && !d->target_subvendor && !d->target_subdevice)
+		if (!card_a && d->generation == GS_AMPERE)
 			card_a = d;
-		if (!card_b && fixed_sub)
+		if (!card_b && d->generation == GS_ADA)
 			card_b = d;
 	}
 	if (!card_a || !card_b)
-		die("the device table needs one wildcard-subsystem and one fixed-subsystem target");
+		die("the device table needs an Ampere and an Ada row");
 	for (unknown_id = 0x1e00; gs_device_lookup(unknown_id); unknown_id++)
 		;
 }
@@ -975,6 +970,11 @@ static const struct op ops_not_in_driver[] = {
 	PCI("0000:03:00.0", false), VIRT("0000:03:00.0", false),
 };
 
+/* A plain non-RM ioctl: the kernel's answer for /dev/null reaches the daemon. */
+static const struct op ops_tty[] = {
+	{ .kind = 't' },
+};
+
 #define F_LIST(...) ((const struct fault[]){ __VA_ARGS__, { 0 } })
 #define G01 "0000:01:00.0"
 
@@ -1003,10 +1003,9 @@ int main(int argc, char **argv)
 	if (!mkdtemp(tmp))
 		die("mkdtemp: %s", strerror(errno));
 	pick_cards();
-	printf("card A %04x -> %04x (subsystem kept), card B %04x -> %04x (subsystem %04x:%04x), "
-	       "unlisted %04x\n",
-	       card_a->device, card_a->target, card_b->device, card_b->target,
-	       card_b->target_subvendor, card_b->target_subdevice, unknown_id);
+	printf("card A %04x -> %04x, card B %04x -> %04x (subsystems kept), unlisted %04x\n",
+	       card_a->device, gs_target_of(card_a)->device, card_b->device, gs_target_of(card_b)->device,
+	       unknown_id);
 
 	for (int i = 1; i <= 9; i++)
 		snprintf(nine + strlen(nine), sizeof(nine) - strlen(nine), "%s0000:%02x:00.0",
@@ -1023,7 +1022,7 @@ int main(int argc, char **argv)
 		{ .name = "active_580_159_01", .config = ON, .version = V580, .map_a = true,
 		  .map_b = true, .log_has = "active for driver 580.159.01" },
 		{ .name = "active_595_open_module_force_host",
-		  .config = "# written by geforce-sriov\nari=on\nmsix=on\nexperimental_vfs=on\nvfs=2\n"
+		  .config = "# written by geforce-sriov\nari=on\nmsix=on\nvfs=2\n"
 			    "identity=on\nidentity_force_host=on\n\n"
 			    "bdfs=0000:02:00.0,0000:01:00.0\nboot_display_release=0000:01:00.0\n"
 			    "sriov_manage=/usr/lib/nvidia/sriov-manage",
@@ -1050,7 +1049,7 @@ int main(int argc, char **argv)
 		  .log_has = "card 0000:04:00.0: 10de:" },
 		{ .name = "force_host_driver_unlisted", .config = FORCE_ON,
 		  .version = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  Fri Apr 24 2026\n",
-		  .log_has = "not a supported build" },
+		  .log_has = "is not supported: every ioctl passes through" },
 		{ .name = "missing_selected_card_skipped",
 		  .config = "identity=on\nbdfs=0000:05:00.0,0000:02:00.0\n", .version = V580,
 		  .map_b = true, .log_has = "cannot read" },
@@ -1236,13 +1235,16 @@ int main(int argc, char **argv)
 		/* Inert: driver. */
 		{ .name = "driver_unlisted_build", .config = ON,
 		  .version = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  Fri Apr 24 2026\n",
-		  .log_has = "driver 580.159.03 is not a supported build" },
+		  .log_has = "driver 580.159.03 is not supported" },
 		{ .name = "driver_version_extra_component", .config = ON,
 		  .version = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.01.1  x\n",
 		  .log_has = "driver version unknown" },
 		{ .name = "driver_version_garbage", .config = ON, .version = "580.159.01\n",
 		  .log_has = "driver version unknown" },
 		{ .name = "driver_version_missing", .config = ON, .log_has = "driver version unknown" },
+		/* No next ioctl: the hook forwards every call to the kernel instead of failing it. */
+		{ .name = "next_ioctl_missing_forwards_to_kernel", .config = ON, .version = V580,
+		  .no_next_ioctl = true, OPS(ops_tty), .log_has = "every ioctl goes straight to the kernel" },
 
 		/* Inert: process. */
 		{ .name = "manager_process", .config = FORCE_ON, .version = V580, .manager = true },

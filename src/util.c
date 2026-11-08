@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,7 +165,10 @@ static int dirname_of(const char *path, char *out, size_t len)
 	return 0;
 }
 
-/* Write a new file next to path, fsync it, rename over path, fsync the directory. */
+/*
+ * Write a new file next to path, fsync it, rename over path, fsync the directory. The temporary name is
+ * unique (mkostemp), so a file left by an earlier run that lost power never blocks the write.
+ */
 int gs_write_file_atomic(const char *path, const void *data, size_t len, mode_t mode)
 {
 	char tmp[GS_PATH_MAX], dir[GS_PATH_MAX];
@@ -171,10 +176,9 @@ int gs_write_file_atomic(const char *path, const void *data, size_t len, mode_t 
 	size_t off = 0;
 	int fd, r;
 
-	if (gs_pathf(tmp, sizeof(tmp), "%s.gs-tmp.%ld", path, (long)getpid()) ||
-	    dirname_of(path, dir, sizeof(dir)))
+	if (gs_pathf(tmp, sizeof(tmp), "%s.gs-tmp.XXXXXX", path) || dirname_of(path, dir, sizeof(dir)))
 		return -ENAMETOOLONG;
-	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	fd = mkostemp(tmp, O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
 	while (off < len) {
@@ -328,6 +332,11 @@ int gs_find_program(const char *name, char *out, size_t len)
 	return -ENOENT;
 }
 
+/* The fixed environment of every program the CLI runs. */
+static char *const run_envp[] = {
+	"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", NULL,
+};
+
 /*
  * Run argv without a shell. argv[0] is an absolute path or a bare program name
  * looked up in the fixed system PATH. Returns the exit status, 128+signal, or
@@ -335,9 +344,6 @@ int gs_find_program(const char *name, char *out, size_t len)
  */
 int gs_run(const char *const argv[])
 {
-	static char *const envp[] = {
-		"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", NULL,
-	};
 	char prog[GS_PATH_MAX];
 	pid_t pid;
 	int status, r;
@@ -350,7 +356,7 @@ int gs_run(const char *const argv[])
 	if (pid < 0)
 		return -errno;
 	if (pid == 0) {
-		execve(prog, (char *const *)argv, envp);
+		execve(prog, (char *const *)argv, run_envp);
 		_exit(127);
 	}
 	while (waitpid(pid, &status, 0) < 0) {
@@ -362,6 +368,82 @@ int gs_run(const char *const argv[])
 	if (WIFSIGNALED(status))
 		return 128 + WTERMSIG(status);
 	return -ECHILD;
+}
+
+/* Milliseconds left until GS_CAPTURE_TIMEOUT_MS after t0; 0 once it has passed. */
+static int capture_left(const struct timespec *t0)
+{
+	struct timespec now;
+	long ms;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	ms = (long)GS_CAPTURE_TIMEOUT_MS - ((long)(now.tv_sec - t0->tv_sec) * 1000L +
+					    (now.tv_nsec - t0->tv_nsec) / 1000000L);
+	return ms > 0 ? (int)ms : 0;
+}
+
+int gs_run_capture(const char *const argv[], char *out, size_t len)
+{
+	char prog[GS_PATH_MAX], rest[512];
+	struct timespec t0;
+	size_t off = 0;
+	int fd[2], status, left;
+	ssize_t n;
+	pid_t pid, done = 0;
+
+	out[0] = '\0';
+	if (gs_find_program(argv[0], prog, sizeof(prog)) || pipe(fd))
+		return -1;
+	fflush(NULL);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	pid = fork();
+	if (pid < 0) {
+		close(fd[0]);
+		close(fd[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		int null = open("/dev/null", O_WRONLY);
+
+		dup2(fd[1], 1);
+		if (null >= 0)
+			dup2(null, 2);
+		close(fd[0]);
+		close(fd[1]);
+		execve(prog, (char *const *)argv, run_envp);
+		_exit(127);
+	}
+	close(fd[1]);
+	/* Read to the end, so a long listing never blocks the child; what does not fit is dropped. */
+	while ((left = capture_left(&t0)) > 0) {
+		struct pollfd p = { .fd = fd[0], .events = POLLIN };
+		int r = poll(&p, 1, left);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		n = off + 1 < len ? read(fd[0], out + off, len - 1 - off) : read(fd[0], rest, sizeof(rest));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		if (off + 1 < len)
+			off += (size_t)n;
+	}
+	close(fd[0]);
+	out[off] = '\0';
+	while (!(done = waitpid(pid, &status, WNOHANG)) && capture_left(&t0) > 0)
+		gs_sleep_ms(20);
+	if (done != pid) {
+		/* Past the deadline: kill it, and never block on a child stuck in the kernel. */
+		kill(pid, SIGKILL);
+		for (unsigned int i = 0; i < 25 && waitpid(pid, &status, WNOHANG) == 0; i++)
+			gs_sleep_ms(20);
+		out[0] = '\0';
+		return -1;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 void gs_sleep_ms(unsigned int ms)

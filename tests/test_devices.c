@@ -33,38 +33,47 @@ static int checks;
 		}                                                            \
 	} while (0)
 
-/* The six vGPU targets and what the stock vgpuConfig.xml <pgpu> says. */
-struct target {
+/*
+ * Every row of the table, written out independently of it: ID, generation,
+ * die and hardware TotalVFs. A wrong, missing or extra row fails.
+ */
+static const struct row {
 	unsigned short id;
 	unsigned char gen;	/* enum gs_generation */
 	const char *die;
-	unsigned short subvendor, subdevice;
+	unsigned short totalvfs;
+} rows[] = {
+	{ 0x2203, GS_AMPERE, "GA102", 16 }, { 0x2204, GS_AMPERE, "GA102", 16 },
+	{ 0x2206, GS_AMPERE, "GA102", 16 }, { 0x2208, GS_AMPERE, "GA102", 16 },
+	{ 0x220a, GS_AMPERE, "GA102", 16 }, { 0x2216, GS_AMPERE, "GA102", 16 },
+	{ 0x2482, GS_AMPERE, "GA104", 16 }, { 0x2484, GS_AMPERE, "GA104", 16 },
+	{ 0x2486, GS_AMPERE, "GA104", 16 }, { 0x2487, GS_AMPERE, "GA104", 16 },
+	{ 0x2488, GS_AMPERE, "GA104", 16 }, { 0x2489, GS_AMPERE, "GA104", 16 },
+	{ 0x24b0, GS_AMPERE, "GA104", 16 },
+	{ 0x2503, GS_AMPERE, "GA106", 16 }, { 0x2504, GS_AMPERE, "GA106", 16 },
+	{ 0x2507, GS_AMPERE, "GA106", 16 }, { 0x2544, GS_AMPERE, "GA106", 16 },
+	{ 0x2571, GS_AMPERE, "GA106", 16 },
+	{ 0x2582, GS_AMPERE, "GA107", 16 }, { 0x2584, GS_AMPERE, "GA107", 16 },
+	{ 0x2684, GS_ADA, "AD102", 1 }, { 0x2685, GS_ADA, "AD102", 1 },
+	{ 0x2689, GS_ADA, "AD102", 1 },
+	{ 0x2702, GS_ADA, "AD103", 1 }, { 0x2704, GS_ADA, "AD103", 1 },
+	{ 0x2705, GS_ADA, "AD103", 1 }, { 0x2709, GS_ADA, "AD103", 1 },
+	{ 0x2782, GS_ADA, "AD104", 1 }, { 0x2783, GS_ADA, "AD104", 1 },
+	{ 0x2786, GS_ADA, "AD104", 1 }, { 0x2788, GS_ADA, "AD104", 1 },
+	{ 0x27b1, GS_ADA, "AD104", 1 }, { 0x27b2, GS_ADA, "AD104", 1 },
+	{ 0x2803, GS_ADA, "AD106", 1 }, { 0x2805, GS_ADA, "AD106", 1 },
+	{ 0x2882, GS_ADA, "AD107", 1 }, { 0x28b0, GS_ADA, "AD107", 16 },
 };
+#define NROWS (sizeof(rows) / sizeof(rows[0]))
 
-static const struct target targets[] = {
-	{ 0x2230, GS_AMPERE, "GA102", 0, 0 },
-	{ 0x25b6, GS_AMPERE, "GA107", 0x10de, 0x157e },
-	{ 0x26b1, GS_ADA, "AD102", 0, 0 },
-	{ 0x27b8, GS_ADA, "AD104", 0, 0 },
-	{ 0x2bb5, GS_BLACKWELL, "GB202", 0x10de, 0x204e },
-	{ 0x2c3a, GS_BLACKWELL, "GB203", 0x10de, 0x21f4 },
-};
-
-static const struct target *find_target(unsigned int id)
-{
-	unsigned int i;
-
-	for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++)
-		if (targets[i].id == id)
-			return &targets[i];
-	return NULL;
-}
+/* The workstation rows: the same hidden SR-IOV block as the GeForce cards of their generation. */
+static const unsigned short workstation[] = { 0x27b1, 0x27b2, 0x28b0, 0x24b0, 0x2571 };
 
 static void test_constants(void)
 {
 	CHECK(GS_DEFAULT_VFS == 4);
 	CHECK(GS_VFS_MAX == 16);
-	CHECK(strcmp(GS_VERSION, "0.1.0") == 0);
+	CHECK(strcmp(GS_VERSION, "0.2.0") == 0);
 	CHECK(GS_MAX_PFS == 8);
 	CHECK(GS_VENDOR_NVIDIA == 0x10de);
 	CHECK(GS_MSIX_HIDE_BIT == 29);
@@ -76,90 +85,95 @@ static void test_constants(void)
 	/* GS_MAX_PFS addresses, GS_MAX_PFS - 1 commas, one NUL. */
 	CHECK(GS_BDF_LIST_STR_SIZE ==
 	      GS_MAX_PFS * (GS_BDF_STR_SIZE - 1) + (GS_MAX_PFS - 1) + 1);
-	CHECK(strcmp(GS_NO_SAME_DIE_MSG,
-		     "No vGPU target on the same die; support is experimental.") == 0);
+	CHECK(GS_GENERATION_COUNT == 2);
 	CHECK(strcmp(gs_generation_name(GS_AMPERE), "Ampere") == 0);
 	CHECK(strcmp(gs_generation_name(GS_ADA), "Ada") == 0);
-	CHECK(strcmp(gs_generation_name(GS_BLACKWELL), "Blackwell") == 0);
 	CHECK(strcmp(gs_generation_name(7), "unknown") == 0);
+}
+
+/* The vGPU target is one per generation, as the stock vgpuConfig.xml <pgpu> names it. */
+static void test_targets(void)
+{
+	unsigned int i;
+
+	CHECK(gs_targets[GS_AMPERE].device == 0x2230);
+	CHECK(strcmp(gs_targets[GS_AMPERE].name, "RTX A6000") == 0);
+	CHECK(gs_targets[GS_ADA].device == 0x26b1);
+	CHECK(strcmp(gs_targets[GS_ADA].name, "RTX 6000 Ada") == 0);
+	/* A target ID is never itself a table key. */
+	for (i = 0; i < GS_GENERATION_COUNT; i++)
+		CHECK(gs_device_lookup(gs_targets[i].device) == NULL);
+	for (i = 0; i < GS_DEVICE_COUNT; i++)
+		CHECK_DEV(&gs_devices[i], gs_target_of(&gs_devices[i]) == &gs_targets[gs_devices[i].generation]);
 }
 
 static void test_table_entries(void)
 {
-	unsigned int i, j, supported = 0;
+	unsigned int i, j, ampere = 0, ada = 0;
 
-	CHECK(GS_DEVICE_COUNT == 38);
+	/* The independent list and the table hold the same rows: same count, each list row found. */
+	CHECK(GS_DEVICE_COUNT == NROWS);
+	CHECK(GS_DEVICE_COUNT == 37);
+	for (i = 0; i < NROWS; i++) {
+		const struct gs_device *d = gs_device_lookup(rows[i].id);
+
+		checks++;
+		if (!d || d->generation != rows[i].gen || strcmp(d->die, rows[i].die) != 0 ||
+		    d->totalvfs != rows[i].totalvfs) {
+			failures++;
+			fprintf(stderr, "FAIL: 10de:%04x is missing or not %s %s with TotalVFs %u\n", rows[i].id,
+				gs_generation_name(rows[i].gen), rows[i].die, rows[i].totalvfs);
+		}
+	}
 	for (i = 0; i < GS_DEVICE_COUNT; i++) {
 		const struct gs_device *d = &gs_devices[i];
-		const struct target *t = find_target(d->target);
 
 		for (j = i + 1; j < GS_DEVICE_COUNT; j++)
 			CHECK_DEV(d, gs_devices[j].device != d->device);
 
 		CHECK_DEV(d, d->die && d->die[0]);
-		CHECK_DEV(d, d->name && strncmp(d->name, "GeForce RTX ", 12) == 0);
-		CHECK_DEV(d, d->target_name && d->target_name[0]);
-		CHECK_DEV(d, d->same_die <= 1 && d->experimental <= 1);
+		CHECK_DEV(d, d->name && (strncmp(d->name, "GeForce RTX ", 12) == 0 ||
+					 strncmp(d->name, "RTX ", 4) == 0));
 		/* The configurable range covers every card's hardware default. */
 		CHECK_DEV(d, d->totalvfs >= 1 && d->totalvfs <= GS_VFS_MAX);
-
-		/* Every target is one of the six stock <pgpu> entries. */
-		CHECK_DEV(d, t != NULL);
-		if (!t)
-			continue;
-		CHECK_DEV(d, t->gen == d->generation);
-		CHECK_DEV(d, d->target_subvendor == t->subvendor);
-		CHECK_DEV(d, d->target_subdevice == t->subdevice);
-		CHECK_DEV(d, d->same_die == (strcmp(d->die, t->die) == 0));
-		/* A target ID is never itself a table key (no pro cards). */
-		CHECK_DEV(d, gs_device_lookup(d->target) == NULL);
+		/* The kernel module has no path for a row without these positions. */
+		CHECK_DEV(d, d->sriov_pos && d->ari_pos && d->msix_pos && d->msix_hide_pos);
 
 		switch (d->generation) {
 		case GS_AMPERE:
+			ampere++;
 			CHECK_DEV(d, d->die[0] == 'G' && d->die[1] == 'A');
 			CHECK_DEV(d, d->sriov_pos == 0xbcc && d->ari_pos == 0xc14);
 			CHECK_DEV(d, d->totalvfs == 16);
 			CHECK_DEV(d, d->msix_pos == 0xc8 && d->msix_hide_pos == 0x41c);
-			CHECK_DEV(d, !gs_sriov_native(d));
 			break;
 		case GS_ADA:
+			ada++;
 			CHECK_DEV(d, d->die[0] == 'A' && d->die[1] == 'D');
 			CHECK_DEV(d, d->sriov_pos == 0xbcc && d->ari_pos == 0xc14);
-			CHECK_DEV(d, d->totalvfs == 1);
-			/* No Ada hide register is known: the module must never write. */
-			CHECK_DEV(d, d->msix_pos == 0xc8 && d->msix_hide_pos == 0);
-			CHECK_DEV(d, d->experimental == 1);
-			CHECK_DEV(d, !gs_sriov_native(d));
-			break;
-		case GS_BLACKWELL:
-			CHECK_DEV(d, d->die[0] == 'G' && d->die[1] == 'B');
-			/* Native SR-IOV only; no guessed ARI/MSI-X offsets. */
-			CHECK_DEV(d, d->sriov_pos == 0x250 && d->ari_pos == 0);
-			CHECK_DEV(d, d->totalvfs == 1);
-			CHECK_DEV(d, d->msix_pos == 0 && d->msix_hide_pos == 0);
-			CHECK_DEV(d, d->experimental == 1);
-			CHECK_DEV(d, gs_sriov_native(d));
+			CHECK_DEV(d, d->totalvfs == 1 || d->totalvfs == 16);
+			/* Same hide register as Ampere: the module clears 0x41C bit 29. */
+			CHECK_DEV(d, d->msix_pos == 0xc8 && d->msix_hide_pos == 0x41c);
 			break;
 		default:
 			CHECK_DEV(d, !"generation out of range");
 		}
-		/* Only the demonstrated cards' ID is not experimental. */
-		if (!d->experimental) {
-			supported++;
-			CHECK_DEV(d, d->device == 0x2206);
-		}
 	}
-	CHECK(supported == 1);
+	CHECK(ampere == 20 && ada == 17);
 }
 
 static void test_lookup(void)
 {
 	static const unsigned short absent[] = {
-		/* Turing GeForce and pro, which are excluded */
+		/* Turing GeForce and pro */
 		0x1e04, 0x1e07, 0x1e87, 0x1f02, 0x2182, 0x21c4, 0x1e30, 0x1eb8,
-		/* professional / datacenter (targets and others) */
+		/* the targets and other professional / datacenter IDs */
 		0x2230, 0x2231, 0x2235, 0x25b6, 0x26b1, 0x26ba, 0x27b8, 0x2bb5,
-		0x2c3a, 0x24b0, 0x2330,
+		0x2c3a, 0x2330,
+		/* next to the workstation rows */
+		0x27b0, 0x27b3, 0x28b1, 0x24b1, 0x2570, 0x2572,
+		/* Blackwell GeForce */
+		0x2b85, 0x2c02, 0x2c05, 0x2d04, 0x2d05, 0x2f04,
 		/* laptop dies and IDs without reviewed evidence */
 		0x2520, 0x2560, 0x25a2, 0x2860, 0x28e0, 0x2757, 0x2c18, 0x2d19,
 		0x2f18, 0x2d98, 0x2b87, 0x2808, 0x2414, 0x24c9,
@@ -170,20 +184,30 @@ static void test_lookup(void)
 	unsigned int i;
 
 	d = gs_device_lookup(0x2206);
-	CHECK(d && d->target == 0x2230 && d->same_die && !d->experimental);
 	CHECK(d && d->generation == GS_AMPERE && strcmp(d->die, "GA102") == 0);
-
-	d = gs_device_lookup(0x2489);
-	CHECK(d && d->target == 0x25b6 && !d->same_die && d->experimental);
+	CHECK(d && gs_target_of(d)->device == 0x2230);
 	d = gs_device_lookup(0x2684);
-	CHECK(d && d->target == 0x26b1 && d->same_die && d->generation == GS_ADA);
-	d = gs_device_lookup(0x2705);
-	CHECK(d && d->target == 0x27b8 && !d->same_die);
-	d = gs_device_lookup(0x2b85);
-	CHECK(d && d->target == 0x2bb5 && d->same_die &&
-	      d->generation == GS_BLACKWELL);
-	d = gs_device_lookup(0x2f04);
-	CHECK(d && d->target == 0x2c3a && !d->same_die);
+	CHECK(d && d->generation == GS_ADA && strcmp(d->die, "AD102") == 0);
+	CHECK(d && gs_target_of(d)->device == 0x26b1);
+	d = gs_device_lookup(0x2786);
+	CHECK(d && d->generation == GS_ADA && gs_target_of(d)->device == 0x26b1);
+
+	/* The workstation rows, with the generation and die of their chip. */
+	d = gs_device_lookup(0x27b1);
+	CHECK(d && d->generation == GS_ADA && strcmp(d->die, "AD104") == 0 &&
+	      strcmp(d->name, "RTX 4500 Ada Generation") == 0);
+	d = gs_device_lookup(0x27b2);
+	CHECK(d && d->generation == GS_ADA && strcmp(d->die, "AD104") == 0 &&
+	      strcmp(d->name, "RTX 4000 Ada Generation") == 0);
+	d = gs_device_lookup(0x28b0);
+	CHECK(d && d->generation == GS_ADA && strcmp(d->die, "AD107") == 0 &&
+	      strcmp(d->name, "RTX 2000 / 2000E Ada Generation") == 0);
+	d = gs_device_lookup(0x24b0);
+	CHECK(d && d->generation == GS_AMPERE && strcmp(d->die, "GA104") == 0 &&
+	      strcmp(d->name, "RTX A4000") == 0);
+	d = gs_device_lookup(0x2571);
+	CHECK(d && d->generation == GS_AMPERE && strcmp(d->die, "GA106") == 0 &&
+	      strcmp(d->name, "RTX A2000 12GB") == 0);
 
 	for (i = 0; i < sizeof(absent) / sizeof(absent[0]); i++) {
 		checks++;
@@ -201,69 +225,59 @@ static void test_vf_limit(void)
 {
 	const struct gs_device *amp = gs_device_lookup(0x2206);
 	const struct gs_device *ada = gs_device_lookup(0x2783);
-	const struct gs_device *bw = gs_device_lookup(0x2c02);
 	unsigned int i, raw, vfs;
-	int exp;
 
-	CHECK(amp && ada && bw);
-	if (!amp || !ada || !bw)
+	CHECK(amp && ada);
+	if (!amp || !ada)
 		return;
 
-	/* The measured 10de:2206: hardware 16, default count 4. */
+	/* The 10de:2206 row: hardware 16, default count 4. */
 	CHECK(amp->totalvfs == 16);
-	CHECK(gs_vf_limit(amp, amp->totalvfs, 1, GS_DEFAULT_VFS) == 4);
+	CHECK(gs_vf_limit(amp, amp->totalvfs, GS_DEFAULT_VFS) == 4);
 
 	/* Ampere, default count: clamp only, never raised. */
-	CHECK(gs_vf_limit(amp, 16, 1, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(amp, 16, 0, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(amp, 4, 1, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(amp, 3, 1, GS_DEFAULT_VFS) == 3);
-	CHECK(gs_vf_limit(amp, 1, 1, GS_DEFAULT_VFS) == 1);
-	CHECK(gs_vf_limit(amp, 0, 1, GS_DEFAULT_VFS) == 0);
+	CHECK(gs_vf_limit(amp, 16, GS_DEFAULT_VFS) == 4);
+	CHECK(gs_vf_limit(amp, 4, GS_DEFAULT_VFS) == 4);
+	CHECK(gs_vf_limit(amp, 3, GS_DEFAULT_VFS) == 3);
+	CHECK(gs_vf_limit(amp, 1, GS_DEFAULT_VFS) == 1);
+	CHECK(gs_vf_limit(amp, 0, GS_DEFAULT_VFS) == 0);
 
 	/* A configured count is presented, never above the hardware value. */
-	CHECK(gs_vf_limit(amp, 16, 1, 2) == 2);
-	CHECK(gs_vf_limit(amp, 16, 1, 1) == 1);
-	CHECK(gs_vf_limit(amp, 16, 1, 8) == 8);
-	CHECK(gs_vf_limit(amp, 16, 1, 16) == 16);
-	CHECK(gs_vf_limit(amp, 8, 1, 16) == 8);
-	CHECK(gs_vf_limit(amp, 0, 1, 16) == 0);
+	CHECK(gs_vf_limit(amp, 16, 2) == 2);
+	CHECK(gs_vf_limit(amp, 16, 1) == 1);
+	CHECK(gs_vf_limit(amp, 16, 8) == 8);
+	CHECK(gs_vf_limit(amp, 16, 16) == 16);
+	CHECK(gs_vf_limit(amp, 8, 16) == 8);
+	CHECK(gs_vf_limit(amp, 0, 16) == 0);
 
-	/* Ada/Blackwell: exactly 1 counts as 4, only with experimental_vfs; 0 stays 0. */
-	CHECK(gs_vf_limit(ada, 1, 1, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(ada, 1, 0, GS_DEFAULT_VFS) == 1);
-	CHECK(gs_vf_limit(ada, 0, 1, GS_DEFAULT_VFS) == 0);
-	CHECK(gs_vf_limit(ada, 0, 0, GS_DEFAULT_VFS) == 0);
-	CHECK(gs_vf_limit(bw, 0, 1, GS_DEFAULT_VFS) == 0);
-	CHECK(gs_vf_limit(ada, 2, 1, GS_DEFAULT_VFS) == 2);
-	CHECK(gs_vf_limit(ada, 32, 0, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(bw, 1, 1, GS_DEFAULT_VFS) == 4);
-	CHECK(gs_vf_limit(bw, 1, 0, GS_DEFAULT_VFS) == 1);
-	CHECK(gs_vf_limit(bw, 3, 1, GS_DEFAULT_VFS) == 3);
-	CHECK(gs_vf_limit(bw, 48, 1, GS_DEFAULT_VFS) == 4);
-	/* The experimental raise follows a lower count but never exceeds 4. */
-	CHECK(gs_vf_limit(ada, 1, 1, 2) == 2);
-	CHECK(gs_vf_limit(ada, 1, 1, 16) == 4);
-	CHECK(gs_vf_limit(bw, 1, 0, 16) == 1);
+	/* Ada: exactly 1 counts as 4; 0 stays 0; other values are only capped by the count. */
+	CHECK(gs_vf_limit(ada, 1, GS_DEFAULT_VFS) == 4);
+	CHECK(gs_vf_limit(ada, 0, GS_DEFAULT_VFS) == 0);
+	CHECK(gs_vf_limit(ada, 2, GS_DEFAULT_VFS) == 2);
+	CHECK(gs_vf_limit(ada, 16, GS_DEFAULT_VFS) == 4);
+	CHECK(gs_vf_limit(ada, 32, GS_DEFAULT_VFS) == 4);
+	/* The raise follows a lower count but never exceeds 4. */
+	CHECK(gs_vf_limit(ada, 1, 2) == 2);
+	CHECK(gs_vf_limit(ada, 1, 16) == 4);
+	CHECK(gs_vf_limit(ada, 16, 16) == 16);
 
 	/*
-	 * No entry, raw value, flag or count ever gives more than the count, nor more
+	 * No entry, raw value or count ever gives more than the count, nor more
 	 * than the raw value except a raw 1 raised to at most 4.
 	 */
 	for (i = 0; i < GS_DEVICE_COUNT; i++)
-		for (exp = 0; exp <= 1; exp++)
-			for (vfs = 1; vfs <= GS_VFS_MAX; vfs++)
-				for (raw = 0; raw <= 0xffff; raw++) {
-					unsigned int v = gs_vf_limit(&gs_devices[i], raw, exp, vfs);
+		for (vfs = 1; vfs <= GS_VFS_MAX; vfs++)
+			for (raw = 0; raw <= 0xffff; raw++) {
+				unsigned int v = gs_vf_limit(&gs_devices[i], raw, vfs);
 
-					if (v > vfs || (raw != 1 && v > raw) || (raw == 1 && v > GS_DEFAULT_VFS)) {
-						checks++;
-						failures++;
-						fprintf(stderr, "FAIL: 10de:%04x raw %u exp %d vfs %u -> %u\n",
-							gs_devices[i].device, raw, exp, vfs, v);
-						return;
-					}
+				if (v > vfs || (raw != 1 && v > raw) || (raw == 1 && v > GS_DEFAULT_VFS)) {
+					checks++;
+					failures++;
+					fprintf(stderr, "FAIL: 10de:%04x raw %u vfs %u -> %u\n",
+						gs_devices[i].device, raw, vfs, v);
+					return;
 				}
+			}
 	checks++;
 }
 
@@ -282,7 +296,7 @@ static void test_vf_count_guard(void)
 	if (!amp)
 		return;
 	for (vfs = 1; vfs <= GS_VFS_MAX; vfs++) {
-		limit = gs_vf_limit(amp, amp->totalvfs, 1, vfs);
+		limit = gs_vf_limit(amp, amp->totalvfs, vfs);
 		CHECK(limit == vfs);
 		if (vfs <= GS_DEFAULT_VFS) {
 			CHECK(gs_vf_geometry_check(limit, 4, 1, 0x03) == GS_GEOM_OK);
@@ -296,9 +310,7 @@ static void test_vf_count_guard(void)
 
 static void test_ext_cap_hdr(void)
 {
-	CHECK(gs_ext_cap_hdr_is(0xc1410010u, GS_EXT_CAP_ID_SRIOV, 1)); /* GA102/AD10x 0xBCC */
-	CHECK(gs_ext_cap_hdr_is(0x2a410010u, GS_EXT_CAP_ID_SRIOV, 1)); /* GB20x 0x250 */
-	CHECK(gs_ext_cap_hdr_is(0x29010010u, GS_EXT_CAP_ID_SRIOV, 1));
+	CHECK(gs_ext_cap_hdr_is(0xc1410010u, GS_EXT_CAP_ID_SRIOV, 1)); /* GA10x/AD10x 0xBCC */
 	CHECK(gs_ext_cap_hdr_is(0xc1c1000eu, GS_EXT_CAP_ID_ARI, 1));   /* hidden ARI 0xC14 */
 	CHECK(!gs_ext_cap_hdr_is(0xc1c10015u, GS_EXT_CAP_ID_SRIOV, 1)); /* ReBAR */
 	CHECK(!gs_ext_cap_hdr_is(0xc1420010u, GS_EXT_CAP_ID_SRIOV, 1)); /* version 2 */
@@ -455,7 +467,7 @@ static void test_vf_geometry(void)
 	/* Several VFs with stride 0 share one function. */
 	CHECK(gs_vf_geometry_check(2, 4, 0, 0x03) == GS_GEOM_STRIDE_ZERO);
 	CHECK(gs_vf_geometry_check(4, 0, 0, 0x03) == GS_GEOM_OFFSET_ZERO);
-	/* Offset 4 / stride 1 as read on the GA102 boards at NumVFs 0; PF + audio at 0-1. */
+	/* Offset 4 / stride 1, as the public config-space dumps show at NumVFs 0; PF + audio at 0-1. */
 	for (n = 1; n <= GS_DEFAULT_VFS; n++)
 		CHECK(gs_vf_geometry_check(n, 4, 1, 0x03) == GS_GEOM_OK);
 	/* Any configured count above 4 is refused there, up to the hardware's 16. */
@@ -551,9 +563,8 @@ static void test_vf_setup_check(void)
 static void test_vf_geometry_states(void)
 {
 	/*
-	 * All fixtures below are made up. "constant" repeats the 4/1 the GA102
-	 * boards read at NumVFs 0 for every NumVFs and both ARI states; no card
-	 * has been measured at NumVFs 1-4 or with the ARI bit set.
+	 * All fixtures below are made up. "constant" repeats the 4/1 the public
+	 * config-space dumps show at NumVFs 0 for every NumVFs and both ARI states.
 	 */
 	static const struct geometry_fixture constant = {
 		"constant 4/1",
@@ -630,54 +641,68 @@ static void test_vf_geometry_states(void)
 }
 
 /*
- * Default (experimental_vfs off): Ada and Blackwell present their hardware
- * count of 1 whatever vfs is; Ampere is unchanged. Opt-in: 1 is raised to
- * vfs, at most 4; Ampere is still unchanged.
+ * Ada presents 4 from a hardware 1 (at most vfs); every other hardware
+ * count, on Ada and on Ampere, is only capped by vfs.
  */
 static void test_default_vf_count(void)
 {
 	unsigned int i, vfs;
 
-	/* The hardware count of every Ada/Blackwell entry is 1, Ampere's is 16. */
 	for (i = 0; i < GS_DEVICE_COUNT; i++) {
 		const struct gs_device *d = &gs_devices[i];
-		int ampere = d->generation == GS_AMPERE;
 
-		CHECK_DEV(d, d->totalvfs == (ampere ? 16 : 1));
 		for (vfs = 1; vfs <= GS_VFS_MAX; vfs++) {
-			unsigned int off = gs_vf_limit(d, d->totalvfs, 0, vfs);
-			unsigned int on = gs_vf_limit(d, d->totalvfs, 1, vfs);
+			unsigned int want = d->generation == GS_ADA && d->totalvfs == 1 ?
+				(vfs < GS_DEFAULT_VFS ? vfs : GS_DEFAULT_VFS) :
+				(vfs < d->totalvfs ? vfs : d->totalvfs);
 
-			if (ampere) {
-				CHECK_DEV(d, off == vfs && on == vfs);
-			} else {
-				CHECK_DEV(d, off == 1);
-				CHECK_DEV(d, on == (vfs < GS_DEFAULT_VFS ? vfs : GS_DEFAULT_VFS));
-			}
+			CHECK_DEV(d, gs_vf_limit(d, d->totalvfs, vfs) == want);
 		}
+		/* With the default count every row presents 4. */
+		CHECK_DEV(d, gs_vf_limit(d, d->totalvfs, GS_DEFAULT_VFS) == GS_DEFAULT_VFS);
 	}
 
-	/* The ceiling behind it: only a raw 1 on Ada/Blackwell is raised, only on request. */
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 1, 0) == 1);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 1, 1) == GS_DEFAULT_VFS);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 1, 0) == 1);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 1, 1) == GS_DEFAULT_VFS);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 0, 1) == 0);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2b85), 2, 1) == 2);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 16, 0) == 16);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 16, 1) == 16);
-	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 1, 1) == 1);
+	/* The ceiling behind it: a raw 1 on Ada only. */
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 1) == GS_DEFAULT_VFS);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 0) == 0);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2684), 2) == 2);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 16) == 16);
+	CHECK(gs_vf_ceiling(gs_device_lookup(0x2206), 1) == 1);
 }
 
 /*
- * The AD104 bring-up (10de:2783, subsystem 1043:8974, closed 580.159.01
- * CPU-RM host stack): raw config 0xBCC = c1410010 (hidden SR-IOV v1),
- * InitialVFs/TotalVFs 1/1, first VF offset 4, stride 1; 0xC14 = c1c1000e
- * (hidden ARI v1, next function 1); PF and audio at functions 0-1; one VF at
- * function 4; nvidia-vgpud shown 10de:27b8 (L4) with the board subsystem.
- * The table must keep reproducing that with the default options.
+ * The workstation rows: 27b1 and 27b2 report TotalVFs 1, 28b0, 24b0 and
+ * 2571 report 16. With the default count each presents 4 VFs, on functions
+ * 4-7 of the GA102/AD104 layout (first VF offset 4, stride 1).
  */
-static void test_ada_measured_config(void)
+static void test_workstation_vfs(void)
+{
+	unsigned int i, limit;
+
+	for (i = 0; i < sizeof(workstation) / sizeof(workstation[0]); i++) {
+		const struct gs_device *d = gs_device_lookup(workstation[i]);
+
+		CHECK(d != NULL);
+		if (!d)
+			continue;
+		CHECK_DEV(d, d->totalvfs == (d->device == 0x27b1 || d->device == 0x27b2 ? 1 : 16));
+		CHECK_DEV(d, d->sriov_pos == 0xbcc && d->ari_pos == 0xc14 && d->msix_pos == 0xc8);
+		limit = gs_vf_limit(d, d->totalvfs, GS_DEFAULT_VFS);
+		CHECK_DEV(d, limit == GS_DEFAULT_VFS);
+		CHECK_DEV(d, gs_vf_geometry_check(limit, 4, 1, 0x03) == GS_GEOM_OK);
+	}
+}
+
+/*
+ * The AD104 row (10de:2783): the public config-space dumps show 0xBCC =
+ * c1410010 (hidden SR-IOV v1), InitialVFs/TotalVFs 1/1, first VF offset 4,
+ * stride 1; 0xC14 = c1c1000e (hidden ARI v1, next function 1); PF and audio
+ * at functions 0-1, so VFs start at function 4. The row presents the RTX
+ * 6000 Ada (10de:26b1) with the board subsystem. The table must keep
+ * reproducing that layout with the default options, which present four VFs
+ * (functions 4-7).
+ */
+static void test_ada_config(void)
 {
 	const struct gs_device *d = gs_device_lookup(0x2783);
 	unsigned int limit;
@@ -685,285 +710,25 @@ static void test_ada_measured_config(void)
 	CHECK(d != NULL);
 	if (!d)
 		return;
-	/* Identity: L4 on the same die, board subsystem kept (wildcard <pgpu>). */
+	/* Identity: the generation's target; the board subsystem is kept (wildcard <pgpu>). */
 	CHECK(d->generation == GS_ADA);
-	CHECK(d->target == 0x27b8 && d->same_die);
-	CHECK(d->target_subvendor == 0 && d->target_subdevice == 0);
-	/* Capabilities at the measured offsets; no MSI-X write, no 32-bit hooks. */
-	CHECK(d->sriov_pos == 0xbcc && !gs_sriov_native(d));
+	CHECK(gs_target_of(d)->device == 0x26b1);
+	/* Capabilities at the table offsets, MSI-X hide bit as on Ampere. */
+	CHECK(d->sriov_pos == 0xbcc);
 	CHECK(gs_ext_cap_hdr_is(0xc1410010u, GS_EXT_CAP_ID_SRIOV, 1));
 	CHECK(d->ari_pos == 0xc14 && gs_ext_cap_hdr_is(0xc1c1000eu, GS_EXT_CAP_ID_ARI, 1));
-	CHECK(d->msix_hide_pos == 0);
-	CHECK(!gs_has_twin_dwords(d) && !gs_expvfs_reaches_driver(d));
-	/* Default options (experimental_vfs off, vfs 4): exactly one VF, at function 4. */
-	limit = gs_vf_limit(d, 1, 0, GS_DEFAULT_VFS);
-	CHECK(limit == 1);
+	CHECK(d->msix_hide_pos == 0x41c);
+	/* Default options (vfs 4): four VFs, at functions 4-7. */
+	limit = gs_vf_limit(d, 1, GS_DEFAULT_VFS);
+	CHECK(limit == GS_DEFAULT_VFS);
 	CHECK(gs_vf_geometry_check(limit, 4, 1, 0x03) == GS_GEOM_OK);
 	CHECK(gs_vf_setup_check(limit, limit, 4, 1, 0x03) == GS_GEOM_OK);
-	/* What NVIDIA's driver reads stays the hardware 1/1. */
-	CHECK(gs_vf_dword(d, 0x00010001u, 0, GS_DEFAULT_VFS) == 0x00010001u);
-}
-
-/*
- * Per-entry twin dwords and the TotalVFs-by-dword flag: GB202 only has twin
- * dwords; every Blackwell entry, and only Blackwell, has vf_dword.
- */
-static void test_twin_and_dword_flags(void)
-{
-	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
-	unsigned int i, twin = 0;
-
-	CHECK(gb202 != NULL);
-	if (!gb202)
-		return;
-	CHECK(gb202->twin_device == 0x2bb5 && gb202->twin_subdevice == 0x204e);
-	CHECK(gs_has_twin_dwords(gb202));
-	CHECK(strcmp(gb202->die, "GB202") == 0);
-
-	for (i = 0; i < GS_DEVICE_COUNT; i++) {
-		const struct gs_device *d = &gs_devices[i];
-
-		if (gs_has_twin_dwords(d)) {
-			twin++;
-			CHECK_DEV(d, d->device == 0x2b85);
-			/* The twin is the vGPU target of the entry. */
-			CHECK_DEV(d, d->twin_device == d->target);
-			CHECK_DEV(d, d->twin_subdevice == d->target_subdevice);
-			CHECK_DEV(d, d->twin_subdevice != 0);
-		} else {
-			CHECK_DEV(d, d->twin_device == 0 && d->twin_subdevice == 0);
-		}
-		CHECK_DEV(d, d->vf_dword <= 1);
-		CHECK_DEV(d, d->vf_dword == (d->generation == GS_BLACKWELL));
-		CHECK_DEV(d, gs_expvfs_reaches_driver(d) == (d->generation == GS_BLACKWELL));
-		/* Ada: the driver reads a BAR0 mirror, no config dword to answer. */
-		if (d->generation == GS_ADA)
-			CHECK_DEV(d, !d->vf_dword && !gs_has_twin_dwords(d));
-	}
-	CHECK(twin == 1);
-}
-
-/* A dword with InitialVFs in bits 15:0 and TotalVFs in bits 31:16. */
-#define VFS_DWORD(initial, total) ((unsigned int)(total) << 16 | (initial))
-
-static void test_vf_dword(void)
-{
-	const struct gs_device *amp = gs_device_lookup(0x2206);
-	const struct gs_device *ada = gs_device_lookup(0x2783);
-	const struct gs_device *bw = gs_device_lookup(0x2c02);
-	unsigned int i, a, b, vfs;
-
-	CHECK(amp && ada && bw);
-	if (!amp || !ada || !bw)
-		return;
-
-	/* Blackwell, hardware 1/1: raised to the count, at most 4, only on request. */
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(4, 4));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 2) == VFS_DWORD(2, 2));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 1) == VFS_DWORD(1, 1));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 1, 16) == VFS_DWORD(4, 4));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 0, 4) == VFS_DWORD(1, 1));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 1), 0, 16) == VFS_DWORD(1, 1));
-	/* Each half on its own: 0 stays 0, 2 or more is only capped by the count. */
-	CHECK(gs_vf_dword(bw, VFS_DWORD(0, 1), 1, 4) == VFS_DWORD(0, 4));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(1, 0), 1, 4) == VFS_DWORD(4, 0));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(0, 0), 1, 4) == 0);
-	CHECK(gs_vf_dword(bw, VFS_DWORD(2, 3), 1, 4) == VFS_DWORD(2, 3));
-	CHECK(gs_vf_dword(bw, VFS_DWORD(48, 48), 1, 4) == VFS_DWORD(4, 4));
-	/* An all-ones read (no device) is never changed. */
-	CHECK(gs_vf_dword(bw, 0xffffffffu, 1, 4) == 0xffffffffu);
-	/* Ada (BAR0 mirror) and Ampere: the dword is never changed. */
-	CHECK(gs_vf_dword(ada, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(1, 1));
-	CHECK(gs_vf_dword(amp, VFS_DWORD(16, 16), 1, 4) == VFS_DWORD(16, 16));
-	CHECK(gs_vf_dword(amp, VFS_DWORD(1, 1), 1, 4) == VFS_DWORD(1, 1));
-
-	/*
-	 * Both halves always equal what the 16-bit reads show (gs_vf_limit()
-	 * with the option on); with the option off, or on any non-Blackwell
-	 * entry, the dword is the hardware value.
-	 */
-	for (i = 0; i < GS_DEVICE_COUNT; i++) {
-		const struct gs_device *d = &gs_devices[i];
-
-		for (vfs = 1; vfs <= GS_VFS_MAX; vfs++)
-			for (a = 0; a <= 70; a++)
-				for (b = 0; b <= 70; b++) {
-					unsigned int raw = VFS_DWORD(a, b);
-					unsigned int want = d->generation == GS_BLACKWELL ?
-						VFS_DWORD(gs_vf_limit(d, a, 1, vfs),
-							  gs_vf_limit(d, b, 1, vfs)) : raw;
-
-					if (gs_vf_dword(d, raw, 1, vfs) != want ||
-					    gs_vf_dword(d, raw, 0, vfs) != raw) {
-						checks++;
-						failures++;
-						fprintf(stderr, "FAIL: 10de:%04x dword %u/%u vfs %u\n",
-							d->device, a, b, vfs);
-						return;
-					}
-				}
-	}
-	checks++;
-}
-
-static void test_twin_id_dword(void)
-{
-	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
-	unsigned int out, where, i;
-
-	CHECK(gb202 != NULL);
-	if (!gb202)
-		return;
-
-	/* Offset 0x00: the card's own ID is shown as the twin's; 10de in the low half. */
-	out = 0x5a5a5a5au;
-	CHECK(gs_twin_id_dword(gb202, 0x00, 0x2b8510deu, &out) == 1 && out == 0x2bb510deu);
-	/* An all-ones read, or an ID that is not the card's own, is left alone. */
-	out = 0x5a5a5a5au;
-	CHECK(gs_twin_id_dword(gb202, 0x00, 0xffffffffu, &out) == 0 && out == 0x5a5a5a5au);
-	CHECK(gs_twin_id_dword(gb202, 0x00, 0x1b8010deu, &out) == 0 && out == 0x5a5a5a5au);
-	CHECK(gs_twin_id_dword(gb202, 0x00, 0x2b851234u, &out) == 0 && out == 0x5a5a5a5au);
-	/* Offset 0x2C: whatever subsystem the board has becomes 10de:204e. */
-	CHECK(gs_twin_id_dword(gb202, 0x2c, 0x53ab1043u, &out) == 1 && out == 0x204e10deu);
-	CHECK(gs_twin_id_dword(gb202, 0x2c, 0x00000000u, &out) == 1 && out == 0x204e10deu);
-	out = 0x5a5a5a5au;
-	CHECK(gs_twin_id_dword(gb202, 0x2c, 0xffffffffu, &out) == 0 && out == 0x5a5a5a5au);
-
-	/* Every other offset, the SR-IOV dwords included, is untouched. */
-	for (where = 0; where < 0x300; where += 4) {
-		if (where == 0x00 || where == 0x2c)
-			continue;
-		out = 0x5a5a5a5au;
-		CHECK(gs_twin_id_dword(gb202, where, 0x2b8510deu, &out) == 0 && out == 0x5a5a5a5au);
-	}
-	out = 0x5a5a5a5au;
-	CHECK(gs_twin_id_dword(gb202, gb202->sriov_pos + GS_SRIOV_VFS_DWORD,
-			       VFS_DWORD(1, 1), &out) == 0 && out == 0x5a5a5a5au);
-
-	/* No other entry has twin dwords: nothing is rewritten at any offset. */
-	for (i = 0; i < GS_DEVICE_COUNT; i++) {
-		const struct gs_device *d = &gs_devices[i];
-
-		if (d == gb202)
-			continue;
-		for (where = 0; where < 0x300; where += 4) {
-			out = 0x5a5a5a5au;
-			CHECK_DEV(d, gs_twin_id_dword(d, where, (unsigned int)d->device << 16 | 0x10de, &out) == 0 &&
-				     out == 0x5a5a5a5au);
-		}
-	}
-}
-
-/* Which offsets the 32-bit read hook rewrites, entry by entry. */
-static void test_dword_offsets(void)
-{
-	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
-	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
-	const struct gs_device *ada = gs_device_lookup(0x2783);
-	const struct gs_device *amp = gs_device_lookup(0x2206);
-	int where;
-
-	CHECK(gb202 && gb203 && ada && amp);
-	if (!gb202 || !gb203 || !ada || !amp)
-		return;
-
-	/* GB202, both options: the two twin dwords and the TotalVFs dword, nothing else. */
-	for (where = 0; where < 0x400; where += 4) {
-		int want = where == 0x00 || where == 0x2c || where == gb202->sriov_pos + 0x0c;
-
-		CHECK(gs_dword_offset_watched(gb202, where, 1, 1) == want);
-		/* Each option alone watches only its own dwords. */
-		CHECK(gs_dword_offset_watched(gb202, where, 1, 0) == (where == 0x00 || where == 0x2c));
-		CHECK(gs_dword_offset_watched(gb202, where, 0, 1) == (where == gb202->sriov_pos + 0x0c));
-		CHECK(gs_dword_offset_watched(gb202, where, 0, 0) == 0);
-		/* GB203: no twin dwords, only the TotalVFs dword. */
-		CHECK(gs_dword_offset_watched(gb203, where, 1, 1) == (where == gb203->sriov_pos + 0x0c));
-		/* Ada and Ampere: nothing, whatever the options. */
-		CHECK(gs_dword_offset_watched(ada, where, 1, 1) == 0);
-		CHECK(gs_dword_offset_watched(amp, where, 1, 1) == 0);
-	}
-}
-
-/* Whether the module replaces pci_read_config_dword() for a list of PFs. */
-static void test_dword_hook_decision(void)
-{
-	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
-	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
-	const struct gs_device *ada = gs_device_lookup(0x2783);
-	const struct gs_device *amp = gs_device_lookup(0x2206);
-	const struct gs_device *l_gb202[] = { gb202 };
-	const struct gs_device *l_gb203[] = { gb203 };
-	const struct gs_device *l_ada[] = { ada };
-	const struct gs_device *l_amp[] = { amp };
-	const struct gs_device *l_mixed[] = { amp, gb203, gb202 };
-	const struct gs_device *l_noTwin[] = { ada, gb203 };
-
-	CHECK(gb202 && gb203 && ada && amp);
-	if (!gb202 || !gb203 || !ada || !amp)
-		return;
-
-	/* Options off: never. */
-	CHECK(gs_dword_hook_decide(l_gb202, 1, 0, 0) == GS_DWORD_HOOK_OFF);
-	CHECK(gs_dword_hook_decide(l_mixed, 3, 0, 0) == GS_DWORD_HOOK_OFF);
-	/* A listed GB202 with either option: the hook. */
-	CHECK(gs_dword_hook_decide(l_gb202, 1, 1, 0) == GS_DWORD_HOOK_ON);
-	CHECK(gs_dword_hook_decide(l_gb202, 1, 0, 1) == GS_DWORD_HOOK_ON);
-	CHECK(gs_dword_hook_decide(l_gb202, 1, 1, 1) == GS_DWORD_HOOK_ON);
-	/* GB203: the TotalVFs dword only, so experimental_vfs yes; twin_id is an error. */
-	CHECK(gs_dword_hook_decide(l_gb203, 1, 0, 1) == GS_DWORD_HOOK_ON);
-	CHECK(gs_dword_hook_decide(l_gb203, 1, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
-	CHECK(gs_dword_hook_decide(l_gb203, 1, 1, 1) == GS_DWORD_HOOK_NO_TWIN_PF);
-	/* Ada and Ampere: no hook (the driver reads a BAR0 mirror, or the count is not raised). */
-	CHECK(gs_dword_hook_decide(l_ada, 1, 0, 1) == GS_DWORD_HOOK_OFF);
-	CHECK(gs_dword_hook_decide(l_amp, 1, 0, 1) == GS_DWORD_HOOK_OFF);
-	CHECK(gs_dword_hook_decide(l_ada, 1, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
-	CHECK(gs_dword_hook_decide(l_amp, 1, 1, 1) == GS_DWORD_HOOK_NO_TWIN_PF);
-	/* One twin PF among others is enough for twin_id. */
-	CHECK(gs_dword_hook_decide(l_mixed, 3, 1, 0) == GS_DWORD_HOOK_ON);
-	CHECK(gs_dword_hook_decide(l_noTwin, 2, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
-	CHECK(gs_dword_hook_decide(l_noTwin, 2, 0, 1) == GS_DWORD_HOOK_ON);
-	/* An empty list needs nothing, except that twin_id has nothing to act on. */
-	CHECK(gs_dword_hook_decide(l_gb202, 0, 0, 1) == GS_DWORD_HOOK_OFF);
-	CHECK(gs_dword_hook_decide(l_gb202, 0, 1, 0) == GS_DWORD_HOOK_NO_TWIN_PF);
-}
-
-/* twin_id refusal reasons per listed PF, and the text a user sees. */
-static void test_twin_refusal(void)
-{
-	const struct gs_device *gb202 = gs_device_lookup(0x2b85);
-	const struct gs_device *gb203 = gs_device_lookup(0x2c02);
-	const struct gs_device *ada = gs_device_lookup(0x2783);
-	int hotplug, bound;
-
-	CHECK(gb202 && gb203 && ada);
-	if (!gb202 || !gb203 || !ada)
-		return;
-
-	/* GB202 with twin_id: refused behind a hotplug port, or with a bound driver. */
-	CHECK(gs_twin_id_refusal(gb202, 1, 0, 0) == GS_TWIN_OK);
-	CHECK(gs_twin_id_refusal(gb202, 1, 1, 0) == GS_TWIN_HOTPLUG_PORT);
-	CHECK(gs_twin_id_refusal(gb202, 1, 0, 1) == GS_TWIN_DRIVER_BOUND);
-	/* Both at once: the port is reported first. */
-	CHECK(gs_twin_id_refusal(gb202, 1, 1, 1) == GS_TWIN_HOTPLUG_PORT);
-	/* Without twin_id, or on a card without twin dwords, nothing is refused. */
-	for (hotplug = 0; hotplug <= 1; hotplug++)
-		for (bound = 0; bound <= 1; bound++) {
-			CHECK(gs_twin_id_refusal(gb202, 0, hotplug, bound) == GS_TWIN_OK);
-			CHECK(gs_twin_id_refusal(gb203, 1, hotplug, bound) == GS_TWIN_OK);
-			CHECK(gs_twin_id_refusal(ada, 1, hotplug, bound) == GS_TWIN_OK);
-		}
-
-	/* The refusal texts docs quote. */
-	CHECK(strcmp(gs_twin_refusal_text(GS_TWIN_HOTPLUG_PORT),
-		     "twin_id refused: the GPU is behind a hotplug-capable port") == 0);
-	CHECK(strcmp(gs_twin_refusal_text(GS_TWIN_DRIVER_BOUND),
-		     "twin_id refused: nvidia (or another driver) is bound to the GPU") == 0);
-	CHECK(gs_twin_refusal_text(GS_TWIN_OK)[0] == '\0');
 }
 
 int main(void)
 {
 	test_constants();
+	test_targets();
 	test_table_entries();
 	test_lookup();
 	test_vf_limit();
@@ -974,13 +739,8 @@ int main(void)
 	test_vf_setup_check();
 	test_vf_geometry_states();
 	test_default_vf_count();
-	test_ada_measured_config();
-	test_twin_and_dword_flags();
-	test_vf_dword();
-	test_twin_id_dword();
-	test_dword_offsets();
-	test_dword_hook_decision();
-	test_twin_refusal();
+	test_workstation_vfs();
+	test_ada_config();
 
 	if (failures) {
 		fprintf(stderr, "test_devices: %d of %d checks failed\n",

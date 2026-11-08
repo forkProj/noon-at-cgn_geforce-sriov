@@ -5,7 +5,7 @@
 #   driver/geforce-sriov-patch     driver patcher      (driver/)
 #   kernel/geforce_sriov.ko        livepatch module    (kernel/Makefile, `make module`)
 
-VERSION := 0.1.0
+VERSION := 0.2.0
 
 CC ?= cc
 CFLAGS ?= -O2 -g
@@ -23,14 +23,14 @@ BOOT_DISPLAY_RELEASE ?=
 VFS ?=
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-CLI_SRCS := src/config.c src/install.c src/lifecycle.c src/pci.c src/sha256.c src/util.c
+CLI_SRCS := src/config.c src/install.c src/lifecycle.c src/pci.c src/setup.c src/sha256.c src/util.c
 CLI_HDRS := include/gs_lifecycle.h include/gs_devices.h include/gs_hook.h
 # Patcher: driver/main.c holds main(); every other driver/*.c is library code that the
-# patcher tests (tests/test_patch*.c, tests/test_elf*.c) link against.
+# patcher tests (tests/test_patch*.c) link against.
 PATCH_MAIN := driver/main.c
 PATCH_LIB := $(filter-out $(PATCH_MAIN),$(wildcard driver/*.c))
 PATCH_HDRS := $(wildcard driver/*.h)
-PATCH_TESTS := $(patsubst %.c,%,$(wildcard tests/test_patch*.c tests/test_elf*.c))
+PATCH_TESTS := $(patsubst %.c,%,$(wildcard tests/test_patch*.c))
 
 TESTS := tests/test_lifecycle tests/test_devices $(PATCH_TESTS)
 
@@ -66,8 +66,8 @@ check test: all $(TESTS)
 	$(MAKE) -C hook check
 
 # Live install: as root, without DESTDIR. Staging only: make install DESTDIR=/tmp/stage.
-# Select GPUs with DEVICES="0000:03:00.0 0000:04:00.0"; grant the boot display GPU among them a
-# console release with BOOT_DISPLAY_RELEASE="0000:04:00.0"; set the VF count per GPU with VFS=N.
+# Select GPUs with DEVICES="0000:01:00.0 0000:02:00.0"; grant the boot display GPU among them a
+# console release with BOOT_DISPLAY_RELEASE="0000:02:00.0"; set the VF count per GPU with VFS=N.
 install: all
 	DESTDIR="$(DESTDIR)" ./geforce-sriov install --prefix "$(PREFIX)" --source "$(CURDIR)" \
 		$(foreach d,$(DEVICES),--device $(d)) \

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * geforce_sriov - livepatch that lets the kernel use the SR-IOV capability of
- * the GeForce physical functions (PFs) named in its bdfs parameter, with at
+ * the NVIDIA physical functions (PFs) named in its bdfs parameter, with at
  * most vfs (default GS_DEFAULT_VFS, 4) virtual functions, never more than the
  * card's hardware TotalVFs. Cards are described only by the reviewed table in
  * include/gs_devices.h.
  *
- * Three exported vmlinux functions are replaced, and a fourth,
- * pci_read_config_dword(), only when twin_id=1 or when experimental_vfs=1
- * lists a PF whose driver reads TotalVFs by dword (Blackwell), in the way
+ * Three exported vmlinux functions are replaced, in the way
  * samples/livepatch/livepatch-sample.c shows. All replacements are written
  * for this module on top of exported PCI accessors; for every device that is
  * not a listed, validated PF they return exactly what the kernel's own
@@ -22,27 +20,26 @@
  *   that offset. With ari=1 and a usable hidden ARI header (see
  *   gs_hidden_ari()), the SR-IOV lookup made by pci_iov_init() turns on ARI
  *   Forwarding in the upstream port when the port supports it. That side
- *   effect is the mechanism that brings ARI to the port: pci_configure_ari()
- *   never calls this function on 7.0.14-16-pve (its lookup is inlined; see
- *   gs_enable_ari_forwarding()). An ARI lookup returns the hidden ARI offset
- *   for the same PFs; on that kernel its caller is pci_scan_slot()'s inlined
- *   next_ari_fn(), which uses it only to find the next function once
+ *   effect is the mechanism that brings ARI to the port: on a kernel whose
+ *   pci_configure_ari() inlines its ARI lookup, it never calls this function
+ *   (see gs_enable_ari_forwarding()). An ARI lookup returns the hidden ARI
+ *   offset for the same PFs; on such a kernel its caller is pci_scan_slot()'s
+ *   inlined next_ari_fn(), which uses it only to find the next function once
  *   forwarding is on. This ARI scheme (forwarding set from the SR-IOV
- *   lookup) is on by default and was hardware-tested only in the documented
- *   configuration; if VF enable does not complete, load with ari=0 (ari=off).
+ *   lookup) is on by default; if VF enable does not complete, load with
+ *   ari=0 (ari=off).
  *
  * pci_read_config_word():
  *   sriov_init() and sriov_enable() read TotalVFs and InitialVFs through this
- *   exported function. For a listed PF whose SR-IOV header validates (hidden
- *   for Ampere/Ada, natively linked for Blackwell; ID and version 1 checked
- *   before every override) those reads return gs_vf_limit(): the vfs
- *   parameter, never more than the hardware value, except that on Ada/
- *   Blackwell exactly 1 counts as 4 when experimental_vfs=1 (default 0; 0
- *   stays 0). This also sizes the VF BAR reservation. User-space config reads
+ *   exported function. For a listed PF whose hidden SR-IOV header validates
+ *   (ID and version 1 checked before every override) those reads return
+ *   gs_vf_limit(): the vfs parameter, never more than the hardware value,
+ *   except that a hardware value of exactly 1 counts as 4 on Ada (0 stays
+ *   0). This also sizes the VF BAR reservation. User-space config reads
  *   (lspci, setpci, sysfs config) go through pci_user_read_config_word() and
  *   still show the hardware values. NVIDIA's driver does not read these
- *   words: it reads 32-bit dwords (Blackwell, below) or a BAR0 mirror (Ada,
- *   which no accessor sees), so on Ada only Linux sees the raised count.
+ *   words: on Ada it reads a BAR0 mirror, which no accessor sees, and gets 4
+ *   from the VF-count revision of the vendor object instead.
  *
  *   The same function guards where the kernel puts the VFs while it sets
  *   up SR-IOV, and only then. sriov_init() (drivers/pci/iov.c) runs
@@ -73,53 +70,30 @@
  *   kernel writes only the ARI bit sriov_init() chose and restores it); a
  *   card that changes its answer after setup, or after a reset, is not
  *   supported. A NumVFs read-back that matches does not show that a card
- *   whose hardware TotalVFs is lower (the experimental Ada/Blackwell path)
- *   really provides that many VFs.
+ *   whose hardware TotalVFs is lower (the Ada path) really provides that
+ *   many VFs.
  *
- * pci_read_config_dword() (only when needed, see above):
- *   NVIDIA's driver reads TotalVFs, the device ID and the subsystem ID of
- *   GB20x with this function. For a listed PF whose table entry has
- *   vf_dword (Blackwell), with experimental_vfs=1, the InitialVFs/TotalVFs
- *   dword at the validated SR-IOV position + 0x0C returns the same counts as
- *   the word reads (gs_vf_dword()). With twin_id=1, for a listed PF whose
- *   table entry has twin dwords (GB202 only), dword 0x00 returns
- *   10de:<twin_device> while the hardware reads the card's own ID, and dword
- *   0x2C returns 10de:<twin_subdevice> (gs_twin_id_dword()): NVIDIA's driver
- *   then sizes the GSP heap and partitions as for the vGPU twin. The hook
- *   cannot tell its callers apart: every in-kernel pci_read_config_dword()
- *   caller (NVIDIA's driver, the PCI core, the PCIe hotplug driver) sees the
- *   twin ID. Every other device, PF and offset (the other SR-IOV dwords
- *   included) gets the hardware value. pdev->device and user-space reads
- *   keep the real ID. twin_id is untested and may make the GPU firmware fail
- *   to start (GS_TWIN_ID_MSG). The module refuses to load with twin_id=1
- *   when none of the listed PFs has twin dwords, when the port above a PF
- *   with twin dwords is hotplug-capable (the hotplug driver compares dwords
- *   0x00 and 0x2C with the enumerated ID and would treat the card as
- *   replaced), and when a driver is bound to such a PF (NVIDIA's driver
- *   keeps the ID it read at GPU start and compares it with later reads, for
- *   instance after a reset, so the answer must not change while it holds the
- *   GPU; see Disable).
- *
- * MSI-X (msix=1): on Ampere, NVIDIA's CYA bit 0x41C[29] unlinks MSI-X from the
+ * MSI-X (msix=1): NVIDIA's CYA bit 0x41C[29] unlinks MSI-X from the
  *   standard chain. At load, for each listed PF whose MSI-X is not linked, the
  *   module validates the MSI-X capability at its table offset, clears that bit,
  *   reads it back and checks that the chain now links MSI-X there. It does not
  *   touch struct pci_dev: the CLI removes and rescans the PF afterwards, and
  *   the PCI core then finds MSI-X on its own. A natively linked MSI-X is left
- *   alone; a die whose hide mechanism is unknown (Ada) is skipped with a
- *   warning; any failed check restores the bit and refuses the load. A PF
- *   reset (FLR, secondary-bus reset, AER recovery) hides MSI-X again and
- *   silently stops the PF's interrupts until the next cold boot (msix=0 avoids it).
+ *   alone. In two cases the load succeeds with MSI-X still hidden, after a
+ *   warning: there is no MSI-X capability at the table's MSI-X offset, or bit
+ *   29 is already clear while MSI-X is not linked. Any other failed check
+ *   restores the bit and refuses the load. A PF reset (FLR, secondary-bus
+ *   reset, AER recovery) hides MSI-X again and silently stops the PF's
+ *   interrupts until the next cold boot (msix=0 avoids it).
  *
  * This module never removes, rescans, resets or binds a device. PCI
  * enumeration runs before modules load, so the CLI must remove and rescan each
  * listed PF after the patch is enabled; then the kernel sees the capability.
  *
  * Disable: echo 0 > /sys/kernel/livepatch/geforce_sriov/enabled, wait for
- * transition=0, then rmmod. Never with VFs enabled, and with twin_id never
- * while NVIDIA's driver is bound to the PF (it compares the ID it read at GPU
- * start with later reads). The MSI-X hide bit is volatile (FLR, secondary-bus
- * reset or a cold boot set it again) and is not set again at unload.
+ * transition=0, then rmmod. Never with VFs enabled. The MSI-X hide bit is
+ * volatile (FLR, secondary-bus reset or a cold boot set it again) and is not
+ * set again at unload.
  *
  * No MODULE_DEVICE_TABLE on purpose: udev must never autoload a livepatch.
  */
@@ -160,9 +134,9 @@
 #error "geforce_sriov needs CONFIG_PCI_IOV"
 #endif
 /*
- * The patch replaces up to four exported PCI functions (drivers/pci/access.c
- * and pci.c) and relies on drivers/pci/iov.c and nvidia.ko calling them, not
- * inlined copies. Linux's LIVEPATCH does not exclude Clang LTO
+ * The patch replaces three exported PCI functions (drivers/pci/access.c and
+ * pci.c) and relies on drivers/pci/iov.c calling them, not inlined copies.
+ * Linux's LIVEPATCH does not exclude Clang LTO
  * (CONFIG_LTO_CLANG, full or thin), which can inline across files, so such a
  * kernel is refused.
  */
@@ -174,10 +148,6 @@ static_assert(GS_VENDOR_NVIDIA == PCI_VENDOR_ID_NVIDIA);
 static_assert(GS_EXT_CAP_ID_SRIOV == PCI_EXT_CAP_ID_SRIOV);
 static_assert(GS_EXT_CAP_ID_ARI == PCI_EXT_CAP_ID_ARI);
 static_assert(GS_CAP_ID_MSIX == PCI_CAP_ID_MSIX);
-static_assert(GS_TWIN_ID_DEVICE_WHERE == PCI_VENDOR_ID);
-static_assert(GS_TWIN_ID_SUBSYS_WHERE == PCI_SUBSYSTEM_VENDOR_ID);
-static_assert(GS_SRIOV_VFS_DWORD == PCI_SRIOV_INITIAL_VF &&
-	      GS_SRIOV_VFS_DWORD + 2 == PCI_SRIOV_TOTAL_VF);
 
 /* ------------------------------------------------------------- parameters */
 
@@ -187,19 +157,11 @@ MODULE_PARM_DESC(ari, "Present the hidden ARI capability of listed function-0 PF
 
 static bool msix = true;
 module_param(msix, bool, 0444);
-MODULE_PARM_DESC(msix, "At load, relink the hidden MSI-X capability of listed PFs where the hide register is known (Ampere) (default Y)");
-
-static bool experimental_vfs;
-module_param(experimental_vfs, bool, 0444);
-MODULE_PARM_DESC(experimental_vfs, "experimental_vfs (default N): " GS_EXPVFS_BODY);
-
-static bool twin_id;
-module_param(twin_id, bool, 0444);
-MODULE_PARM_DESC(twin_id, "twin_id (default N): " GS_TWIN_ID_BODY);
+MODULE_PARM_DESC(msix, "At load, relink the hidden MSI-X capability of listed PFs (default Y)");
 
 static unsigned int vfs = GS_DEFAULT_VFS;
 module_param(vfs, uint, 0444);
-MODULE_PARM_DESC(vfs, "VFs per listed PF, 1-16, at most the card's hardware TotalVFs (default 4: ARI decoding in the GPU does not work for now, so more than 4 VFs are expected not to work). The module refuses to load if the card's VF layout check fails");
+MODULE_PARM_DESC(vfs, "VFs per listed PF, 1-16, at most the card's hardware TotalVFs (default 4: ARI decoding in the GPU does not work, so with more than 4 VFs the module refuses to load if the card's VF layout check fails)");
 static_assert(GS_DEFAULT_VFS == 4 && GS_VFS_MAX == 16); /* the text above */
 
 static char *bdfs = "";
@@ -234,7 +196,7 @@ static u32 gs_req[GS_MAX_PFS];
  * distinct table SR-IOV positions for the read hook, and their NumVFs
  * offsets for the write hook (a separate list, so NumVFs reads are never
  * capped by gs_vf_limit()). Filled once in init before the patch is enabled
- * (the table has two positions).
+ * (the table has one position).
  */
 static const int gs_watch_regs[] = {
 	PCI_SRIOV_TOTAL_VF, PCI_SRIOV_INITIAL_VF,
@@ -244,13 +206,6 @@ static int gs_watch_where[ARRAY_SIZE(gs_watch_regs) * GS_DEVICE_COUNT];
 static unsigned int gs_nwatch_where;
 static int gs_numvf_where[GS_DEVICE_COUNT];
 static unsigned int gs_nnumvf_where;
-/*
- * Offsets the 32-bit read hook may rewrite with the current options, from
- * gs_dword_offset_watched() over the table (at most the two twin dwords and
- * one SR-IOV position per entry).
- */
-static int gs_dword_where[GS_DEVICE_COUNT + 2];
-static unsigned int gs_ndword_where;
 
 static void gs_init_watch_where(void)
 {
@@ -267,28 +222,6 @@ static void gs_init_watch_where(void)
 		for (k = 0; k < ARRAY_SIZE(gs_watch_regs); k++)
 			gs_watch_where[gs_nwatch_where++] = pos + gs_watch_regs[k];
 		gs_numvf_where[gs_nnumvf_where++] = pos + PCI_SRIOV_NUM_VF;
-	}
-}
-
-static void gs_init_dword_where(void)
-{
-	unsigned int i, j, k;
-	int cand[3];
-
-	for (i = 0; i < GS_DEVICE_COUNT; i++) {
-		cand[0] = GS_TWIN_ID_DEVICE_WHERE;
-		cand[1] = GS_TWIN_ID_SUBSYS_WHERE;
-		cand[2] = gs_devices[i].sriov_pos + GS_SRIOV_VFS_DWORD;
-		for (k = 0; k < ARRAY_SIZE(cand); k++) {
-			if (!gs_dword_offset_watched(&gs_devices[i], cand[k],
-						     twin_id, experimental_vfs))
-				continue;
-			for (j = 0; j < gs_ndword_where; j++)
-				if (gs_dword_where[j] == cand[k])
-					break;
-			if (j == gs_ndword_where)
-				gs_dword_where[gs_ndword_where++] = cand[k];
-		}
 	}
 }
 
@@ -334,21 +267,13 @@ static bool gs_ext_hdr_at(struct pci_dev *dev, u16 pos, u16 id)
 }
 
 /*
- * The validated SR-IOV offset of @dev under @e, or 0. Hidden (Ampere, Ada):
- * the chain has no SR-IOV and the table offset holds a v1 header. Native
- * (Blackwell): the chain links SR-IOV exactly at the table offset and that
- * header is version 1.
+ * The validated SR-IOV offset of @dev under @e, or 0: the chain has no
+ * SR-IOV and the table offset holds a v1 header.
  */
 static u16 gs_sriov_pos(struct pci_dev *dev, const struct gs_device *e)
 {
-	u16 linked = pci_find_next_ext_capability(dev, 0, PCI_EXT_CAP_ID_SRIOV);
-
-	if (gs_sriov_native(e)) {
-		if (linked != e->sriov_pos)
-			return 0;
-	} else if (linked) {
+	if (pci_find_next_ext_capability(dev, 0, PCI_EXT_CAP_ID_SRIOV))
 		return 0;
-	}
 	return gs_ext_hdr_at(dev, e->sriov_pos, PCI_EXT_CAP_ID_SRIOV) ?
 	       e->sriov_pos : 0;
 }
@@ -357,9 +282,9 @@ static u16 gs_sriov_pos(struct pci_dev *dev, const struct gs_device *e)
  * Should @dev's hidden ARI capability be presented? Besides the header, its
  * Next Function Number must be non-zero: with ARI Forwarding on,
  * pci_scan_slot() follows it and would stop after function 0, dropping the
- * card's audio function. The GA102 boards read 1 (0xC18 = 00000100); no other
- * card's value is known. Read as a dword so the patched word accessor is
- * not involved.
+ * card's audio function. The public config-space dumps show 1 (0xC18 =
+ * 00000100); the value is checked on every card. Read as a dword so the
+ * patched word accessor is not involved.
  *
  * Never with PCI_SCAN_ALL_PCIE_DEVS (pci=pcie_scan_all or a platform quirk):
  * the rescan then probes slots 1-31 below the port, and with ARI Forwarding
@@ -371,7 +296,7 @@ static bool gs_hidden_ari(struct pci_dev *dev, const struct gs_device *e)
 {
 	u32 cap;
 
-	if (!ari || !e->ari_pos || dev->devfn != 0 ||
+	if (!ari || dev->devfn != 0 ||
 	    pci_has_flag(PCI_SCAN_ALL_PCIE_DEVS) ||
 	    pci_find_next_ext_capability(dev, 0, PCI_EXT_CAP_ID_ARI) ||
 	    !gs_ext_hdr_at(dev, e->ari_pos, PCI_EXT_CAP_ID_ARI) ||
@@ -386,7 +311,7 @@ static bool gs_hidden_ari(struct pci_dev *dev, const struct gs_device *e)
  * function 0 whose ARI capability it can see.
  *
  * pci_configure_ari() runs just before pci_iov_init() during enumeration. On
- * 7.0.14-16-pve its ARI lookup is inlined, so it never reaches the replaced
+ * a kernel where its ARI lookup is inlined, it never reaches the replaced
  * pci_find_ext_capability(), misses the hidden header and leaves the port
  * with ari_enabled = 0. The SR-IOV lookup in pci_iov_init() is the first
  * replaced call after it, and sriov_init() reads pci_ari_enabled() right
@@ -432,7 +357,7 @@ static u16 gs_pci_find_ext_capability(struct pci_dev *dev, int cap)
 	if (pos || (cap != PCI_EXT_CAP_ID_SRIOV && cap != PCI_EXT_CAP_ID_ARI))
 		return pos;
 	e = gs_entry(dev);
-	if (!e || gs_sriov_native(e))
+	if (!e)
 		return 0;
 
 	if (cap == PCI_EXT_CAP_ID_ARI)
@@ -581,62 +506,7 @@ static int gs_pci_read_config_word(const struct pci_dev *dev, int where,
 	    where == pos + PCI_SRIOV_VF_STRIDE)
 		gs_guard_vf_geometry(pdev, e, where, val);
 	else
-		*val = gs_vf_limit(e, *val, READ_ONCE(experimental_vfs), vfs);
-	return ret;
-}
-
-/* Is @where a config dword offset the 32-bit read hook may rewrite? */
-static bool gs_dword_watched(int where)
-{
-	unsigned int i;
-
-	for (i = 0; i < gs_ndword_where; i++)
-		if (where == gs_dword_where[i])
-			return true;
-	return false;
-}
-
-/*
- * pci_read_config_dword(), plus the twin_id dwords and the TotalVFs dword.
- * The disconnect check and the hardware read are those of the kernel's own
- * function; only the value returned for a watched offset of a listed PF
- * changes. Nothing is written or logged: this runs for every in-kernel
- * config dword read, so the offset is tested first. The calls below read
- * other offsets only (the extended capability chain, from 0x100), so the
- * hook never re-enters itself for the offset it rewrites.
- *
- * The twin ID must be the same on every read while NVIDIA's driver holds the
- * GPU: the driver caches the ID at GPU start and compares it with the ID it
- * reads again after a reset to see that config space is alive. The hook is
- * therefore a pure function of the register read and the module state (no
- * per-read state), and the patch must not be disabled while the driver is
- * bound to a listed PF.
- */
-static int gs_pci_read_config_dword(const struct pci_dev *dev, int where,
-				    u32 *val)
-{
-	const struct gs_device *e;
-	unsigned int out;
-	int ret;
-
-	if (pci_dev_is_disconnected(dev)) {
-		PCI_SET_ERROR_RESPONSE(val);
-		return PCIBIOS_DEVICE_NOT_FOUND;
-	}
-	ret = pci_bus_read_config_dword(dev->bus, dev->devfn, where, val);
-	if (ret || !gs_dword_watched(where))
-		return ret;
-
-	e = gs_entry(dev);
-	if (!e)
-		return ret;
-	if (twin_id && gs_twin_id_dword(e, where, *val, &out)) {
-		*val = out;
-		return ret;
-	}
-	if (experimental_vfs && where == e->sriov_pos + GS_SRIOV_VFS_DWORD &&
-	    gs_sriov_pos((struct pci_dev *)dev, e) == e->sriov_pos)
-		*val = gs_vf_dword(e, *val, 1, vfs);
+		*val = gs_vf_limit(e, *val, vfs);
 	return ret;
 }
 
@@ -709,9 +579,10 @@ static int gs_set_msix_hidden(struct pci_dev *pf, const struct gs_device *e,
  * Relink a hidden MSI-X capability by clearing its hide bit; the MSI-X
  * capability itself is not written. Sets *@unhid
  * when it cleared the hide bit. 0 also covers "nothing to do".
+ * The caller holds @pf's device lock.
  */
-static int gs_unhide_msix(struct pci_dev *pf, const struct gs_device *e,
-			  bool *unhid)
+static int gs_unhide_msix_locked(struct pci_dev *pf, const struct gs_device *e,
+				 bool *unhid)
 {
 	u32 cya = 0;
 	u16 flags = 0;
@@ -723,11 +594,6 @@ static int gs_unhide_msix(struct pci_dev *pf, const struct gs_device *e,
 	if (linked) {
 		pci_info(pf, KBUILD_MODNAME ": MSI-X is linked at %#x; nothing to do\n",
 			 linked);
-		return 0;
-	}
-	if (!e->msix_pos || !e->msix_hide_pos) {
-		pci_warn(pf, KBUILD_MODNAME ": MSI-X is not linked and how %s hides it is unknown; MSI-X stays hidden\n",
-			 e->die);
 		return 0;
 	}
 	if (pf->driver) {
@@ -806,6 +672,23 @@ static int gs_unhide_msix(struct pci_dev *pf, const struct gs_device *e,
 	return 0;
 }
 
+/*
+ * gs_unhide_msix_locked() under @pf's device lock, which the driver core
+ * holds while a driver binds or unbinds and sriov_numvfs_store() holds while
+ * VFs are enabled or disabled: from the checks to the read-back, no driver
+ * binds to @pf and no VF is enabled.
+ */
+static int gs_unhide_msix(struct pci_dev *pf, const struct gs_device *e,
+			  bool *unhid)
+{
+	int ret;
+
+	device_lock(&pf->dev);
+	ret = gs_unhide_msix_locked(pf, e, unhid);
+	device_unlock(&pf->dev);
+	return ret;
+}
+
 /* ------------------------------------------------------- load-time checks */
 
 /*
@@ -864,30 +747,8 @@ static int gs_check_pf(struct pci_dev *pf, const struct gs_bdf *b,
 
 	pci_info(pf, KBUILD_MODNAME ": %s %s (%s) subsystem %04x:%04x, vGPU target 10de:%04x %s\n",
 		 e->die, e->name, gs_generation_name(e->generation),
-		 pf->subsystem_vendor, pf->subsystem_device, e->target,
-		 e->target_name);
-	if (!e->same_die)
-		pci_warn(pf, KBUILD_MODNAME ": " GS_NO_SAME_DIE_MSG "\n");
-	if (e->experimental)
-		pci_warn(pf, KBUILD_MODNAME ": EXPERIMENTAL: this device ID is not verified end to end\n");
-	switch (gs_twin_id_refusal(e, twin_id,
-				   pf->bus->self && pf->bus->self->is_hotplug_bridge,
-				   pf->driver != NULL)) {
-	case GS_TWIN_HOTPLUG_PORT:
-		pci_err(pf, KBUILD_MODNAME ": %s\n", GS_TWIN_ID_HOTPLUG_MSG);
-		return -EINVAL;
-	case GS_TWIN_DRIVER_BOUND:
-		pci_err(pf, KBUILD_MODNAME ": %s (%s)\n", GS_TWIN_ID_BOUND_MSG,
-			pf->driver->name);
-		return -EBUSY;
-	case GS_TWIN_OK:
-		break;
-	}
-	if (twin_id && gs_has_twin_dwords(e))
-		pci_warn(pf, KBUILD_MODNAME ": twin_id: %s Shown to the driver: 10de:%04x subsystem 10de:%04x\n",
-			 GS_TWIN_ID_MSG, e->twin_device, e->twin_subdevice);
-	else if (twin_id)
-		pci_info(pf, KBUILD_MODNAME ": twin_id has no effect on this card\n");
+		 pf->subsystem_vendor, pf->subsystem_device,
+		 gs_target_of(e)->device, gs_target_of(e)->name);
 
 	linked = pci_find_next_ext_capability(pf, 0, PCI_EXT_CAP_ID_SRIOV);
 	if (pf->cfg_size < e->sriov_pos + PCI_SRIOV_VF_STRIDE + 2 ||
@@ -905,12 +766,7 @@ static int gs_check_pf(struct pci_dev *pf, const struct gs_bdf *b,
 			e->sriov_pos, hdr);
 		return -EINVAL;
 	}
-	if (gs_sriov_native(e) && linked != e->sriov_pos) {
-		pci_err(pf, KBUILD_MODNAME ": SR-IOV is expected in the chain at %#x, the chain has it at %#x; refusing\n",
-			e->sriov_pos, linked);
-		return -EINVAL;
-	}
-	if (!gs_sriov_native(e) && linked) {
+	if (linked) {
 		pci_err(pf, KBUILD_MODNAME ": SR-IOV is already linked at %#x; this card needs no livepatch; refusing\n",
 			linked);
 		return -EINVAL;
@@ -928,17 +784,16 @@ static int gs_check_pf(struct pci_dev *pf, const struct gs_bdf *b,
 			e->sriov_pos);
 		return -EINVAL;
 	}
-	limit = gs_vf_limit(e, total, experimental_vfs, vfs);
+	limit = gs_vf_limit(e, total, vfs);
 	/*
-	 * Every VF must land on a free function 1-7 of the PF's own slot: on the
-	 * GA102 boards the device decodes only function bits 2:0, so function 8
-	 * and up alias the PF and its audio function, and a VF on a function
-	 * already in use would give the kernel a second device at that address.
-	 * Offset and stride are read with NumVFs as found (0 at load); the GA102
-	 * boards keep 4/1 for every NumVFs, other cards are unknown. The values
-	 * the kernel reads for each NumVFs it writes, 1 to the limit, with its
-	 * own ARI setting, are checked again when it sets up SR-IOV after the
-	 * rescan (gs_guard_vf_geometry()).
+	 * Every VF must land on a free function 1-7 of the PF's own slot: the
+	 * device decodes only function bits 2:0, so function 8 and up alias the
+	 * PF and its audio function, and a VF on a function already in use would
+	 * give the kernel a second device at that address. Offset and stride are
+	 * read with NumVFs as found (0 at load; the public config-space dumps
+	 * show 4/1 there). The values the kernel reads for each NumVFs it
+	 * writes, 1 to the limit, with its own ARI setting, are checked again
+	 * when it sets up SR-IOV after the rescan (gs_guard_vf_geometry()).
 	 */
 	*occupied = gs_slot_occupied(pf);
 	g = gs_vf_geometry_check(limit, offset, stride, *occupied);
@@ -948,20 +803,13 @@ static int gs_check_pf(struct pci_dev *pf, const struct gs_bdf *b,
 			gs_vf_geometry_text(g));
 		return -EINVAL;
 	}
-	pci_info(pf, KBUILD_MODNAME ": SR-IOV %s at %#x: hardware TotalVFs %u, vfs=%u, VF offset %u, stride %u; %u VFs visible after a rescan\n",
-		 gs_sriov_native(e) ? "linked" : "hidden", e->sriov_pos, total,
-		 vfs, offset, stride, limit);
-	if (limit > total)
-		pci_warn(pf, KBUILD_MODNAME ": EXPERIMENTAL: presenting %u VFs where the card reports %u is not verified end to end\n",
-			 limit, total);
-	if (limit > total && gs_expvfs_msg(e))
-		pci_warn(pf, KBUILD_MODNAME ": experimental_vfs: %s\n",
-			 gs_expvfs_msg(e));
+	pci_info(pf, KBUILD_MODNAME ": SR-IOV hidden at %#x: hardware TotalVFs %u, vfs=%u, VF offset %u, stride %u; %u VFs visible after a rescan\n",
+		 e->sriov_pos, total, vfs, offset, stride, limit);
 
-	if (ari && e->ari_pos && pf->devfn == 0 &&
+	if (ari && pf->devfn == 0 &&
 	    pci_has_flag(PCI_SCAN_ALL_PCIE_DEVS))
 		pci_warn(pf, KBUILD_MODNAME ": ARI stays off for this card: pci=pcie_scan_all (or a platform quirk) scans every slot below the port, and hidden ARI would expose function aliases\n");
-	else if (ari && e->ari_pos && pf->devfn == 0 &&
+	else if (ari && pf->devfn == 0 &&
 		 !pci_find_next_ext_capability(pf, 0, PCI_EXT_CAP_ID_ARI) &&
 		 !gs_hidden_ari(pf, e))
 		pci_warn(pf, KBUILD_MODNAME ": ARI stays off for this card: no usable hidden ARI capability at %#x (needs version 1 and a non-zero next function number)\n",
@@ -973,15 +821,10 @@ static int gs_check_pf(struct pci_dev *pf, const struct gs_bdf *b,
 
 /* --------------------------------------------------------------- livepatch */
 
-/* The replaced pci_read_config_dword(), the last entry of gs_funcs[]. */
-#define GS_DWORD_FUNC	3
-static bool gs_dword_hook;
-
 static void gs_post_patch(struct klp_object *obj)
 {
-	pr_info("patch active for %u PF(s): ari=%d msix=%d experimental_vfs=%d twin_id=%d vfs=%u; 32-bit config read hook %s; remove and rescan each PF now\n",
-		gs_nsel, ari, msix, experimental_vfs, twin_id, vfs,
-		gs_dword_hook ? "on" : "off");
+	pr_info("patch active for %u PF(s): ari=%d msix=%d vfs=%u; remove and rescan each PF now\n",
+		gs_nsel, ari, msix, vfs);
 }
 
 static void gs_post_unpatch(struct klp_object *obj)
@@ -999,13 +842,8 @@ static struct klp_func gs_funcs[] = {
 	}, {
 		.old_name = "pci_write_config_word",
 		.new_func = gs_pci_write_config_word,
-	}, {
-		/* cleared in init when no listed PF needs it */
-		.old_name = "pci_read_config_dword",
-		.new_func = gs_pci_read_config_dword,
 	}, { }
 };
-static_assert(ARRAY_SIZE(gs_funcs) == GS_DWORD_FUNC + 2);
 
 static struct klp_object gs_objs[] = {
 	{
@@ -1029,10 +867,9 @@ static int __init geforce_sriov_init(void)
 	const struct gs_device *e[GS_MAX_PFS] = { };
 	bool unhid[GS_MAX_PFS] = { };
 	unsigned int i;
-	int n, ret = 0;
+	int n, ret = 0, ret2;
 
 	gs_init_watch_where();
-	gs_init_dword_where();
 	if (vfs < 1 || vfs > GS_VFS_MAX) {
 		pr_err("vfs must be 1-%u, got %u\n", GS_VFS_MAX, vfs);
 		return -EINVAL;
@@ -1058,25 +895,6 @@ static int __init geforce_sriov_init(void)
 			goto out_put;
 	}
 
-	/*
-	 * The 32-bit read hook is replaced only where a listed PF needs it:
-	 * twin dwords with twin_id, or a TotalVFs dword with experimental_vfs.
-	 */
-	switch (gs_dword_hook_decide(e, (unsigned int)n, twin_id,
-				     experimental_vfs)) {
-	case GS_DWORD_HOOK_NO_TWIN_PF:
-		pr_err("twin_id=1, but none of the listed PFs has twin dwords; " GS_TWIN_ID_ONLY_MSG "\n");
-		ret = -EINVAL;
-		goto out_put;
-	case GS_DWORD_HOOK_ON:
-		gs_dword_hook = true;
-		break;
-	case GS_DWORD_HOOK_OFF:
-		gs_dword_hook = false;
-		memset(&gs_funcs[GS_DWORD_FUNC], 0, sizeof(gs_funcs[0]));
-		break;
-	}
-
 	if (msix) {
 		for (i = 0; i < (unsigned int)n; i++) {
 			ret = gs_unhide_msix(pf[i], e[i], &unhid[i]);
@@ -1095,10 +913,16 @@ static int __init geforce_sriov_init(void)
 	goto out_put;
 
 out_restore:
-	for (i = 0; i < (unsigned int)n; i++)
-		if (unhid[i] && gs_set_msix_hidden(pf[i], e[i], true))
+	for (i = 0; i < (unsigned int)n; i++) {
+		if (!unhid[i])
+			continue;
+		device_lock(&pf[i]->dev);
+		ret2 = gs_set_msix_hidden(pf[i], e[i], true);
+		device_unlock(&pf[i]->dev);
+		if (ret2)
 			pci_err(pf[i], KBUILD_MODNAME ": could not set %#x bit %u again; a cold boot restores it\n",
 				e[i]->msix_hide_pos, GS_MSIX_HIDE_BIT);
+	}
 out_put:
 	for (i = 0; i < (unsigned int)n; i++)
 		pci_dev_put(pf[i]);
@@ -1111,7 +935,7 @@ static void __exit geforce_sriov_exit(void)
 
 module_init(geforce_sriov_init);
 module_exit(geforce_sriov_exit);
-MODULE_DESCRIPTION("Livepatch: SR-IOV, ARI and MSI-X presentation and a VF count (default 4) for listed NVIDIA GeForce PFs (geforce-sriov " GS_VERSION ")");
+MODULE_DESCRIPTION("Livepatch: SR-IOV, ARI and MSI-X presentation and a VF count (default 4) for listed NVIDIA PFs (geforce-sriov " GS_VERSION ")");
 MODULE_VERSION(GS_VERSION);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_INFO(livepatch, "Y");

@@ -8,8 +8,8 @@
 # start of nvidia-vgpud fails, and so does that of every unit that requires it
 # (nvidia-vgpu-mgr): no vGPU type is registered before the selected GPUs are
 # prepared by hand. `geforce-sriov prepare` removes the record once every
-# selected GPU is prepared; then load NVIDIA's driver, run `geforce-sriov
-# enable`, and start nvidia-vgpud.
+# selected GPU is prepared; then load NVIDIA's driver and run `geforce-sriov
+# activate`, which enables the VFs and restarts nvidia-vgpud.
 [Unit]
 After=geforce-sriov-prepare.service
 AssertPathExists=!/run/geforce-sriov/deferred

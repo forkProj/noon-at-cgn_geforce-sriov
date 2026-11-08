@@ -2,9 +2,12 @@
 /* SHA-256 (FIPS 180-4) for the install manifest: uninstall removes only files whose hash still matches. */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "gs_lifecycle.h"
@@ -124,21 +127,40 @@ void gs_sha256_buf(const void *data, size_t len, char hex[65])
 	final(&s, hex);
 }
 
+/*
+ * Strict, for the install manifest: path itself must be a regular file. A symbolic link is never
+ * followed (O_NOFOLLOW): it fails with -ELOOP, so install does not take over and uninstall does not
+ * remove a link put where an installed file was, whatever it points at. A missing path gives
+ * -ENOENT, a directory -EISDIR and any other file type (FIFO, device) -EINVAL. O_NONBLOCK keeps
+ * the open of a FIFO from waiting for a writer.
+ */
 int gs_sha256_file(const char *path, char hex[65])
 {
 	unsigned char buf[65536];
 	struct sha256 s;
-	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	struct stat st;
+	int fd, e;
 
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
 	if (fd < 0)
 		return -errno;
+	if (fstat(fd, &st) < 0)
+		e = errno;
+	else if (S_ISDIR(st.st_mode))
+		e = EISDIR;
+	else if (!S_ISREG(st.st_mode))
+		e = EINVAL;
+	else
+		e = 0;
+	if (e) {
+		close(fd);
+		return -e;
+	}
 	init(&s);
 	for (;;) {
 		ssize_t n = read(fd, buf, sizeof(buf));
 
 		if (n < 0) {
-			int e;
-
 			if (errno == EINTR)
 				continue;
 			e = -errno;
@@ -152,4 +174,19 @@ int gs_sha256_file(const char *path, char hex[65])
 	close(fd);
 	final(&s, hex);
 	return 0;
+}
+
+_Static_assert(GS_PATH_MAX >= PATH_MAX, "realpath() writes up to PATH_MAX bytes");
+
+/*
+ * For the vGPU plugin, which is documented as a link (libnvidia-vgpu.so -> the versioned copy):
+ * path is resolved once with realpath() into real, then real is hashed by gs_sha256_file(), the
+ * same strict open and checks. A link swapped in at real after the resolution is refused, not
+ * followed. A dangling link gives -ENOENT. Read real only when 0 is returned.
+ */
+int gs_sha256_file_resolved(const char *path, char hex[65], char real[GS_PATH_MAX])
+{
+	if (!realpath(path, real))
+		return -errno;
+	return gs_sha256_file(real, hex);
 }

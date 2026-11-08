@@ -1,254 +1,188 @@
-# Device table
+# Supported cards
 
-The device table is `include/gs_devices.h`; the kernel module, the CLI and the identity hook all
-read it. `geforce-sriov devices` prints it from the installed binary. This page is a readable copy
-with the status of each row; if the two ever disagree, the header wins. A listed ID means the tools
-will act on that card, not that it works.
+The device table in `include/gs_devices.h` lists the cards geforce-sriov acts on and how it handles each generation.
+The kernel module, CLI and identity hook all use this table; `geforce-sriov devices` prints it from the installed binary.
+This page is a readable copy.
+If it disagrees with the header, the header takes precedence.
 
-Every entry is one exact PCI device ID (vendor `10de`). There are no ranges. A card whose ID is not
-listed (Turing, laptop parts, professional cards, anything unreleased) is left alone by every
-component.
+- A listed ID means the tools will act on that card when it is selected.
+- Every entry is one exact PCI device ID (vendor `10de`), with no ranges.
+- A card whose ID is not listed is not presented, prepared or activated. The rebuilt `nvidia.ko`
+  still applies to it whenever it is bound to `nvidia` ([Combining generations](#combining-generations)).
+  `doctor`, `install --device` and `setup` refuse it with `<BDF> (10de:<id>) is not in the device
+  table`.
+
+## Generations
+
+```mermaid
+flowchart LR
+    GPU["GPU"] --> AMPERE["Ampere"]
+    GPU --> ADA["Ada"]
+    AMPERE --> A6000["RTX A6000"]
+    ADA --> RTX6000["RTX 6000 Ada"]
+```
+
+| Generation | Presented as | Default vGPU type | Status | Page |
+|---|---|---|---|---|
+| Ampere | RTX A6000, `10de:2230` | 525, RTXA6000-2Q | supported | [Ampere](ampere.md) |
+| Ada | RTX 6000 Ada, `10de:26b1` | 942, RTX6000-Ada-2Q | supported | [Ada](ada.md) |
+
+NVIDIA's vGPU software sees each card as its generation's professional target in the *Presented as* column.
+The card retains its board's subsystem ID: both targets' stock `<pgpu>` entries use subsystem ID `0x0`, which matches any ID.
+
+Blackwell GPUs are not expected to work with the current implementation.
+NVIDIA's proprietary host driver does not support them on a vGPU host ([NVIDIA driver flavour](#nvidia-driver-flavour)).
 
 ## Status of every row
 
-- **Supported** (status `supported` in `geforce-sriov devices`): only device `10de:2206`, the only
-  row with `experimental = 0`. It has been measured with this package on two memory-modded
-  RTX 3080 20GB cards with subsystem `10de:146d` (scope: [What has been verified](../README.md#what-has-been-verified));
-  a stock `2206` RTX 3080 has 10 GB. Other boards that share the ID `2206` are untested.
-- **Experimental** (status `experimental`): every other row. The capability offsets come from
-  public raw config-space dumps of cards with that ID; they show where the capability is, not that
-  SR-IOV or vGPU works there. The kernel module re-reads and validates each header on the running
-  card and does nothing when it does not match.
-- **Cross-die rows** (`same die = no`) have no professional SKU of their own die in NVIDIA's
-  `vgpuConfig.xml`. They are mapped by a heuristic to the same-generation professional
-  target whose largest vGPU profile is nearest a mid-range GeForce framebuffer; the choice is
-  unverified. Every tool prints: `No vGPU target on the same die; support is experimental.`
-  Whether NVIDIA's daemon and driver accept another die's profile table is unknown.
-- **Ada and Blackwell** GeForce cards report TotalVFs = 1, and NVIDIA's driver reads that count
-  from the hardware itself. geforce-sriov therefore presents the card's own count, 1 VF, by
-  default. `experimental_vfs=on` is an opt-in for experiments only: where the hardware value is
-  exactly 1 it presents up to 4 (the configured `vfs`, at most 4); a value of 0 stays 0. On
-  Blackwell this also raises the count NVIDIA's driver sees; on Ada the driver still sees 1, so
-  only Linux shows more VFs. On Blackwell this is untested, and the GPU firmware may still refuse
-  more than 1 VF; on the one measured Ada card only the first VF reached a vGPU
-  ([Ada host stack](ada.md)). The module refuses the load outright if the card's VF offset or
-  stride would place a VF outside functions 1–7. Details: [Ada and Blackwell](#ada-and-blackwell).
-- **Profile memory is not filtered.** The target's vGPU profile table is presented unchanged; it
-  lists the target's profiles, not your card's capacity, so a card can be offered profiles larger
-  than its own memory (for example a 10–12 GB GA102 card presented as the 48 GB RTX A6000). No
-  automatic VRAM check exists. Choose profiles yourself so that all active vGPUs together, plus the
-  driver's own overhead, fit the card's actual memory, not just each profile on its own.
+Every listed card is supported, but the host and guest drivers must match the [supported software stack](installation.md#supported-software-stack).
+`install` accepts only host driver 580.159.01 and refuses other versions.
+Other guest driver versions are not supported.
+On the manual path (`--driver=skip`), other host driver versions are not supported either: `doctor`, `check` and `activate` warn and continue.
+See [Ampere](ampere.md) and [Ada](ada.md) for hardware details.
 
-Exposing SR-IOV is not the same as a working vGPU.
+- `geforce-sriov devices` names the target of each generation once, then lists every row with its
+  device ID, generation, die and name.
+- The capability offsets of each row come from public raw config-space dumps of cards with that ID.
+  The kernel module re-reads and validates each header on the running card and does nothing when it
+  does not match.
 
-Have a card from this table? Whether it works or not, please submit a
-[compatibility report](https://github.com/noon-at-cgn/geforce-sriov/issues/new?template=compatibility-report.yml).
-An `experimental` row changes status only when someone with that card reports a working setup and
-the maintainers confirm it ([what happens to a report](compatibility.md#what-happens-to-a-report)).
+> [!IMPORTANT]
+> Choose vGPU profiles (vGPU types, each with a fixed memory size) that fit your card's physical VRAM.
+> The target's profile table is presented unchanged, so it can offer profiles larger than the card's memory.
+> For example, a 10–12 GB GA102 card is presented as the 48 GB RTX A6000.
+> There is no automatic VRAM check.
+>
+> The combined memory of all running vGPUs must fit in physical VRAM, with room left for the host driver.
+> Four `4Q` vGPUs (16 GB in total) fit a 20 GB card; four `8Q` vGPUs (32 GB) do not ([Choosing a vGPU type](configuration.md#choosing-a-vgpu-type)).
 
-## Different cards in one host
+If you have a card from this table, please submit a
+[compatibility report](https://github.com/noon-at-cgn/geforce-sriov/issues/new?template=compatibility-report.yml)
+whether it works or not.
 
-Every selected card is looked up by its own device ID, so different rows can be selected together
-(up to 8 cards), and identical cards can be selected in part. The identity hook presents each
-selected card under its own row's target and leaves every other GPU as it is; how it tells
-identical cards apart is described in [the technical reference](technical-reference.md#the-identity-hook).
-Only two identical `2206` cards, together and with one of them selected, have been measured.
+## Combining generations
 
-All selected cards share the one installed NVIDIA vGPU-KVM host driver. A row in this table does not
-mean that a given driver build supports that card, or supports it together with the others: each
-card's vGPU target must be supported by the same driver build and flavour. The driver patch exists
-only for the builds in [driver-patch.md](driver-patch.md), and does not apply to GSP-based drivers
-or NVIDIA's open kernel modules; on its own it does not make a driver that runs Ada
-([Ada host stack](ada.md#the-two-nvidiako-changes)) or Blackwell. Blackwell needs the open
-flavour and Ampere was tested with the proprietary one
-([NVIDIA driver flavour](#nvidia-driver-flavour)), so an Ampere and a Blackwell card cannot share
-one host with geforce-sriov today. `geforce-sriov activate` restarts NVIDIA's daemons for the whole
-host, so it refuses while a GPU outside `bdfs` has VFs enabled; VFs of a selected Ampere card are
-allowed, but an Ampere and an Ada card under the one modified Ada module have not been run. Host
-layouts (switches, shared buses, IOMMU groups, BAR space) are covered in
+Ampere and Ada cards can share one host.
+Select up to 8 cards with one `--device` per card.
+Each uses its generation's target, and `activate` and `check` process every selected card.
+
+- One host module and one plugin serve all cards, so every revision any selected generation needs is
+  made ([Which revisions to make](driver-patch.md#which-revisions-to-make)). Loading `nvidia` binds
+  every NVIDIA card on the host, so select every card you will use.
+- The rebuilt `nvidia.ko` applies to every card bound to it, selected or not: its VF-count and
+  scheduler revisions are not per card. The VF-count revision forces 4 virtual functions (VFs, one
+  per vGPU) on every TU/GA/AD card bound to it, whatever its row, so 4 VFs per card is the package
+  maximum, whatever `vfs` the module presents.
+- The selection (`bdfs`) limits what the kernel module presents (SR-IOV), the identity hook, `prepare`
+  and `activate`. A card outside it is bound by NVIDIA's driver but not prepared or activated.
+- `doctor` prints one `[WARN]` when a selection mixes Ada with another generation, and nothing refuses
+  the selection itself.
+- `--type` is refused on a mixed selection (exit 3), because no single type is creatable on both
+  targets. Omit it for the per-generation defaults (525 on Ampere, 942 on Ada).
+- `activate` restarts NVIDIA's daemons for the whole host, so it refuses while a GPU outside `bdfs`
+  has VFs.
+
+For mixed-host startup details, see [Ampere](ampere.md#with-the-other-generation) and [Ada](ada.md#with-the-other-generation).
+
+Host layouts (switches, shared buses, IOMMU groups, BAR space) are covered in
 [the technical reference](technical-reference.md#multiple-gpus-and-pci-topology).
 
 ## Rows
 
-| Device | Die | GeForce product | vGPU target | Target subsystem | Same die | Generation | Status |
-|---|---|---|---|---|---|---|---|
-| `2203` | GA102 | RTX 3090 Ti | `2230` RTX A6000 | any | yes | Ampere | experimental |
-| `2204` | GA102 | RTX 3090 | `2230` RTX A6000 | any | yes | Ampere | experimental |
-| **`2206`** | GA102 | RTX 3080 (measured: memory-modded 20GB, subsystem `10de:146d` only) | `2230` RTX A6000 | any | yes | Ampere | supported |
-| `2208` | GA102 | RTX 3080 Ti | `2230` RTX A6000 | any | yes | Ampere | experimental |
-| `220a` | GA102 | RTX 3080 12GB | `2230` RTX A6000 | any | yes | Ampere | experimental |
-| `2216` | GA102 | RTX 3080 LHR | `2230` RTX A6000 | any | yes | Ampere | experimental |
-| `2482` | GA104 | RTX 3070 Ti | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2484` | GA104 | RTX 3070 | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2486` | GA104 | RTX 3060 Ti | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2487` | GA104 | RTX 3060 | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2488` | GA104 | RTX 3070 LHR | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2489` | GA104 | RTX 3060 Ti LHR | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2503` | GA106 | RTX 3060 | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2504` | GA106 | RTX 3060 LHR | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2507` | GA106 | RTX 3050 | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2544` | GA106 | RTX 3060 | `25b6` A2 | `10de:157e` | **no** | Ampere | experimental |
-| `2582` | GA107 | RTX 3050 8GB | `25b6` A2 | `10de:157e` | yes | Ampere | experimental |
-| `2584` | GA107 | RTX 3050 6GB | `25b6` A2 | `10de:157e` | yes | Ampere | experimental |
-| `2684` | AD102 | RTX 4090 | `26b1` RTX 6000 Ada | any | yes | Ada | experimental; untested; 1 VF |
-| `2685` | AD102 | RTX 4090 D | `26b1` RTX 6000 Ada | any | yes | Ada | experimental; untested; 1 VF |
-| `2689` | AD102 | RTX 4070 Ti SUPER | `26b1` RTX 6000 Ada | any | yes | Ada | experimental; untested; 1 VF |
-| `2702` | AD103 | RTX 4080 SUPER | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2704` | AD103 | RTX 4080 | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2705` | AD103 | RTX 4070 Ti SUPER | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2709` | AD103 | RTX 4070 | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2782` | AD104 | RTX 4070 Ti | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
-| `2783` | AD104 | RTX 4070 SUPER | `27b8` L4 | any | yes | Ada | experimental; one board measured by hand with a host stack this package does not fully provide ([Ada host stack](ada.md)); 1 VF |
-| `2786` | AD104 | RTX 4070 | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
-| `2788` | AD104 | RTX 4060 Ti | `27b8` L4 | any | yes | Ada | experimental; untested; 1 VF |
-| `2803` | AD106 | RTX 4060 Ti | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2805` | AD106 | RTX 4060 Ti 16GB | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2882` | AD107 | RTX 4060 | `27b8` L4 | any | **no** | Ada | experimental; untested; 1 VF |
-| `2b85` | GB202 | RTX 5090 | `2bb5` RTX PRO 6000 Blackwell Server Edition | `10de:204e` | yes | Blackwell | experimental; third-party reports mixed, not verified by geforce-sriov; 1 VF by default; needs the open flavour |
-| `2c02` | GB203 | RTX 5080 | `2c3a` RTX PRO 4500 Blackwell Server Edition | `10de:21f4` | yes | Blackwell | experimental; untested; 1 VF by default; needs the open flavour |
-| `2c05` | GB203 | RTX 5070 Ti | `2c3a` RTX PRO 4500 Blackwell Server Edition | `10de:21f4` | yes | Blackwell | experimental; untested; 1 VF by default; needs the open flavour |
-| `2d04` | GB206 | RTX 5060 Ti | `2c3a` RTX PRO 4500 Blackwell Server Edition | `10de:21f4` | **no** | Blackwell | experimental; untested; 1 VF by default; needs the open flavour |
-| `2d05` | GB206 | RTX 5060 | `2c3a` RTX PRO 4500 Blackwell Server Edition | `10de:21f4` | **no** | Blackwell | experimental; untested; 1 VF by default; needs the open flavour |
-| `2f04` | GB205 | RTX 5070 | `2c3a` RTX PRO 4500 Blackwell Server Edition | `10de:21f4` | **no** | Blackwell | experimental; untested; 1 VF by default; needs the open flavour |
+| Device | Die | Product | Generation |
+|---|---|---|---|
+| `2203` | GA102 | GeForce RTX 3090 Ti | Ampere |
+| `2204` | GA102 | GeForce RTX 3090 | Ampere |
+| `2206` | GA102 | GeForce RTX 3080 | Ampere |
+| `2208` | GA102 | GeForce RTX 3080 Ti | Ampere |
+| `220a` | GA102 | GeForce RTX 3080 12GB | Ampere |
+| `2216` | GA102 | GeForce RTX 3080 LHR | Ampere |
+| `2482` | GA104 | GeForce RTX 3070 Ti | Ampere |
+| `2484` | GA104 | GeForce RTX 3070 | Ampere |
+| `2486` | GA104 | GeForce RTX 3060 Ti | Ampere |
+| `2487` | GA104 | GeForce RTX 3060 | Ampere |
+| `2488` | GA104 | GeForce RTX 3070 LHR | Ampere |
+| `2489` | GA104 | GeForce RTX 3060 Ti LHR | Ampere |
+| `24b0` | GA104 | RTX A4000 | Ampere |
+| `2503` | GA106 | GeForce RTX 3060 | Ampere |
+| `2504` | GA106 | GeForce RTX 3060 LHR | Ampere |
+| `2507` | GA106 | GeForce RTX 3050 | Ampere |
+| `2544` | GA106 | GeForce RTX 3060 | Ampere |
+| `2571` | GA106 | RTX A2000 12GB | Ampere |
+| `2582` | GA107 | GeForce RTX 3050 8GB | Ampere |
+| `2584` | GA107 | GeForce RTX 3050 6GB | Ampere |
+| `2684` | AD102 | GeForce RTX 4090 | Ada |
+| `2685` | AD102 | GeForce RTX 4090 D | Ada |
+| `2689` | AD102 | GeForce RTX 4070 Ti SUPER | Ada |
+| `2702` | AD103 | GeForce RTX 4080 SUPER | Ada |
+| `2704` | AD103 | GeForce RTX 4080 | Ada |
+| `2705` | AD103 | GeForce RTX 4070 Ti SUPER | Ada |
+| `2709` | AD103 | GeForce RTX 4070 | Ada |
+| `2782` | AD104 | GeForce RTX 4070 Ti | Ada |
+| `2783` | AD104 | GeForce RTX 4070 SUPER | Ada |
+| `2786` | AD104 | GeForce RTX 4070 | Ada |
+| `2788` | AD104 | GeForce RTX 4060 Ti | Ada |
+| `27b1` | AD104 | RTX 4500 Ada Generation | Ada |
+| `27b2` | AD104 | RTX 4000 Ada Generation | Ada |
+| `2803` | AD106 | GeForce RTX 4060 Ti | Ada |
+| `2805` | AD106 | GeForce RTX 4060 Ti 16GB | Ada |
+| `2882` | AD107 | GeForce RTX 4060 | Ada |
+| `28b0` | AD107 | RTX 2000 / 2000E Ada Generation | Ada |
 
-"Target subsystem: any" means the target's stock `<pgpu>` entry has subsystem ID `0x0`, so the card's
-real subsystem is kept. The third-party reports for `2b85` are listed under
-[Third-party reports](#third-party-reports); the status of Ada and Blackwell rows is explained
-under [Ada and Blackwell](#ada-and-blackwell).
+The workstation rows (`24b0`, `2571`, `27b1`, `27b2`, `28b0`) carry the same hidden SR-IOV block as
+the GeForce cards of their generation and are handled the same way. The Ada rows are explained in
+[Ada](ada.md).
 
 ## Capability positions per generation
+
+The kernel module exposes capabilities hidden in the card's PCI config space.
+The table lists their positions and the register bit that hides MSI-X.
 
 | Generation | SR-IOV | ARI | MSI-X | MSI-X hide bit |
 |---|---|---|---|---|
 | Ampere | hidden at `0xBCC` (TotalVFs 16, first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` | `0x41C` bit 29 |
-| Ada | hidden at `0xBCC` (TotalVFs 1, first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` expected | `0x41C` bit 29 is set in Ada dumps, but its meaning there is unconfirmed; not written |
-| Blackwell | linked natively at `0x250` (TotalVFs 1, first VF offset 2, stride 1) | linked natively at `0x248`; kernel's own discovery | kernel's own discovery | none assumed |
+| Ada | hidden at `0xBCC` (TotalVFs 1 as most Ada cards report it, 16 on the RTX 2000 Ada; the host module's VF-count revision makes NVIDIA's driver report 4; first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` | `0x41C` bit 29 |
 
-The VF count is a normal SR-IOV setting: `install --vfs N` or `vfs=N` in the config chooses it, from
-1 up to the card's hardware default, and `enable` enables every presented VF. The default is 4 on
-Ampere. The reason: ARI is enabled in software (with `ari=on` the module presents the card's ARI
-capability and turns on ARI forwarding in the bridge above it), but ARI decoding in the GPU hardware
-does not work for now. The default may change if ARI decoding is made to work. On Ada and Blackwell
-the default is the card's own count, 1 ([Ada and Blackwell](#ada-and-blackwell)).
-On every card the module checks the layout the card itself reports (first VF offset and stride):
-it refuses to load, or the kernel sets up no SR-IOV on that card, when a VF would land on the PF's
-own function, two VFs would share a function, or a VF would land beyond function 7 or on a function
-another device already uses, and also when the card's NumVFs register does not read back the value
-the kernel wrote during setup.
+The VF count is a standard SR-IOV setting.
+Set it with `install --vfs N` or `vfs=N` in the config, from 1 up to the card's ceiling.
+If the card has no enabled VFs, `activate` enables every presented VF.
 
-## Ada and Blackwell
+- The default is 4. ARI is enabled in software (the module presents the card's ARI capability and
+  turns on ARI forwarding in the bridge above it), but ARI decoding in the GPU hardware does not
+  work, so above 4 VFs the module refuses to load when the card's VF layout check fails.
+- The ceiling is the card's hardware default, except on an Ada card that reports 1: its ceiling is 4,
+  set by the host module's VF-count revision. `doctor` then reports "hardware default 1,
+  geforce-sriov presents 4".
 
-Only Ampere is confirmed to work with this package. NVIDIA's stock vGPU host drivers run Ada and
-Blackwell on GSP firmware. One Ada card, an RTX 4070 SUPER (`10de:2783`), ran vGPU guests on one
-host with a modified, CPU-only (GSP off) NVIDIA host stack that this package does not fully provide;
-what was measured and what is missing is in [Ada host stack](ada.md). Everything else below comes
-from NVIDIA's public driver source, public config-space dumps and the third-party reports below.
+The module also checks each card's reported first VF offset and stride.
+It refuses to load, or the kernel sets up no SR-IOV on that card, when:
 
-| | Ada (AD10x) | Blackwell (GB20x) |
-|---|---|---|
-| VFs by default | 1, the card's own count | 1, the card's own count |
-| With `experimental_vfs=on` | Linux shows up to 4 VFs, but NVIDIA's driver still sees 1 (it reads the count through a BAR0 mirror that the module cannot change). On the measured RTX 4070 SUPER only the first VF reached a vGPU; the others failed with `NV_ERR_OUT_OF_RANGE` | Linux and NVIDIA's driver see up to 4 VFs. Untested: the GPU firmware may still refuse more than 1 VF |
-| `twin_id` | not available | RTX 5090 (`2b85`) only ([below](#twin_id-rtx-5090-only)) |
-| NVIDIA driver flavour | proprietary 580.159.01 with GSP off and a modified module, measured by hand on one card ([Ada host stack](ada.md)); the open flavour is not supported | open flavour needed, which geforce-sriov does not support yet ([below](#nvidia-driver-flavour)) |
-| Status | experimental; `2783` measured by hand on one board, every other Ada card untested | experimental; RTX 5090 third-party reports mixed, not verified by geforce-sriov; other cards untested |
+- a VF would land on the function of the PF (the card itself), or two VFs would share a function
+- a VF would land beyond function 7 or on a function another device already uses
+- the card's NumVFs register does not read back the value the kernel wrote during setup
 
-**Why 1 VF by default.** NVIDIA's driver does not use the count Linux sees. On these cards it reads
-TotalVFs from the hardware itself and accepts vGPUs only up to that count. On Blackwell it reads it
-with a 32-bit config read, which the module changes when `experimental_vfs=on`; on Ada it reads it
-through a BAR0 mirror, which no config hook sees.
-
-### NVIDIA driver flavour
+## NVIDIA driver flavour
 
 NVIDIA's vGPU host package can install its kernel module in two flavours, proprietary and open.
-geforce-sriov's driver patch and install path support only the proprietary flavour for now.
+geforce-sriov's driver patch and install path support only the proprietary flavour.
 
-- **Ampere:** the proprietary flavour is the tested one. The open flavour always starts the GSP
-  firmware, and on Ampere it was measured to fail at GPU start (`RmInitAdapter failed!
-  (0x62:0x56:…)`, with the open flavour of 580.178.05 and 595.91.04).
-- **Blackwell:** needs the open flavour. The proprietary 580.159.01 object does not support these
-  GPUs on a vGPU host; NVIDIA's message for it reads `… installed in this vGPU host system is not
-  supported by proprietary nvidia.ko`. Blackwell therefore cannot be completed with this package yet.
-- **Ada:** NVIDIA's proprietary 580.159.01 host module refuses Ada at probe. With that check
-  bypassed by a two-byte change and `NVreg_EnableGpuFirmware=0`, it ran on the CPU without GSP on
-  the one measured RTX 4070 SUPER ([Ada host stack](ada.md)). `geforce-sriov-patch ada apply` makes
-  that change on a copy, after `geforce-sriov-patch apply`
-  ([Ada revisions](driver-patch.md#ada-revisions)); building and installing the module remain your
-  step. The open flavour, which always uses GSP, ran Linux guests on that card only with further
-  lab-only workarounds, still showed scheduler stalls, and is not supported.
+- Ampere: uses the proprietary flavour. The open flavour always starts the GSP firmware, and on
+  Ampere it fails at GPU start (`RmInitAdapter failed! (0x62:0x56:…)`).
+- Ada: uses the proprietary 580.159.01 module with GSP off; the open flavour is not supported
+  ([Ada](ada.md#host-stack)).
+- Blackwell: the proprietary 580.159.01 object does not support these GPUs on a vGPU host
+  (`… installed in this vGPU host system is not supported by proprietary nvidia.ko`).
 
-This is what NVIDIA's driver source and the measured Ampere and Ada results lead to expect;
-NVIDIA's host documentation does not state it.
-
-### Per-VF BARs on Blackwell
-
-Public bug reports of an RTX 5090 and an RTX 5080 show three 64-bit prefetchable BARs per VF:
-256 KiB, 256 MiB and 32 MiB. Four VFs need about 1.1 GiB of bridge window on top of the card's own
-BARs; one VF about 290 MiB. The card's BAR1 is resizable (up to 32 GiB on an RTX 5090), and the
-VFs' 256 MiB BAR has its own resizable BAR capability, so the firmware's *Above 4G decoding* and
-*Resizable BAR* settings change how much window space is left. A third-party report needed
-`pci=realloc` even for one VF. `doctor`, `status` and `prepare` check only that the BARs are
-assigned, not their sizes, so the larger Blackwell VF BARs are not reported as an error.
-
-### twin_id (RTX 5090 only)
-
-> [!WARNING]
-> `twin_id` is experimental and untested. It may make the GPU firmware fail to start. It is off by
-> default.
-
-With `twin_id=on`, the kernel module answers in-kernel 32-bit reads of config dwords `0x00` and
-`0x2C` of each listed RTX 5090 (`10de:2b85`) with the RTX PRO 6000 Blackwell Server Edition ID:
-device `10de:2bb5`, subsystem `10de:204e`. NVIDIA's driver reads these dwords when it first opens
-the GPU, before it starts the GPU firmware. For that ID it reserves a larger firmware heap
-(1370 MiB instead of 581 MiB) and 48 VF partitions instead of 32.
-
-- It applies only to the listed RTX 5090 cards and only to those two dwords. Every in-kernel reader
-  of them sees the twin ID: NVIDIA's driver, and also the kernel's PCI core and its hotplug
-  driver. User space (`lspci`, sysfs) still shows `2b85`. Every other read, device and offset is
-  unchanged.
-- The module refuses to load with `twin_id=1`:
-  - when none of the listed cards is an RTX 5090 (on the other listed cards `twin_id` has no
-    effect);
-  - when a listed RTX 5090 is behind a hotplug-capable port (`twin_id refused: the GPU is behind a
-    hotplug-capable port`): the kernel's hotplug driver compares these dwords with the ID it
-    found at boot and would treat the card as replaced;
-  - when a driver is bound to a listed RTX 5090 (`twin_id refused: nvidia (or another driver) is
-    bound to the GPU`): NVIDIA's driver keeps the ID it read at first open and compares it after a
-    reset. `prepare` already refuses a card bound to `nvidia`, so on the normal path the module
-    loads before NVIDIA's driver binds the card.
-- It does not change the VF count (`experimental_vfs` does), the vGPU types offered, or the
-  placement problem of the 96 GB type table on a 32 GB card ([Third-party reports](#third-party-reports)).
-- It does not exist for Ada (the driver reads the ID through a BAR0 mirror) or for the other
-  Blackwell cards (the ID changes nothing when their firmware starts).
-- The module's parameters are fixed while it is loaded. Do not disable or unload it while
-  NVIDIA's driver is bound to the card: after a reset the driver compares the ID it read at start
-  with a new read.
-
-### Third-party reports
-
-Two public projects report results on an RTX 5090. Neither is verified by geforce-sriov.
-
-- [olealgoritme/blackwell-vgpu-unlock](https://github.com/olealgoritme/blackwell-vgpu-unlock)
-  reports one VF on an RTX 5090 with vGPU host driver 580.159.01 in the open flavour, and compute
-  (CUDA) in a Linux guest only. Graphics, Windows guests and more than one VF are listed as not
-  working. It uses the card's own single VF, presents the card as `10de:2bb5` subsystem `10de:204e`
-  (the same mapping as geforce-sriov's identity hook), needs `pci=realloc`, and patches NVIDIA's
-  open driver object so that the 96 GB type table still gets placement IDs on the 32 GB card.
-  geforce-sriov has no such patch.
-- [bird/vgpu-unlock-blackwell](https://github.com/bird/vgpu-unlock-blackwell) reports an
-  RTX 5090 attempt on driver 595.58.03 that stopped with a GSP RPC timeout (Xid 119), and explains
-  it with "fused" registers on consumer silicon. NVIDIA's public source does not support that
-  explanation: the quoted register `0x111424` is the GSP core's own error-information register,
-  which the driver reads in its timeout report, and the quoted code means a timeout, not a fused-off
-  target. The flow also differs from NVIDIA's: no VF is enabled, the vGPU types are self-made and
-  several driver checks are patched out.
-
-Results on your own card are welcome as a
-[compatibility report](https://github.com/noon-at-cgn/geforce-sriov/issues/new?template=compatibility-report.yml).
+This follows from NVIDIA's driver source and from the Ampere and Ada host stacks
+([Ampere](ampere.md#host-stack), [Ada](ada.md#host-stack)). NVIDIA's host
+documentation does not state it.
 
 ## Excluded
 
-- **Turing:** NVIDIA does not support SR-IOV on Turing
-  ([validated platforms](https://docs.nvidia.com/vgpu/20.0/grid-vgpu-release-notes-red-hat-el-kvm/validated-platforms.html)).
-- **Laptop GPUs:** not listed; Blackwell laptop dies show no SR-IOV capability in public
-  config-space dumps.
-- **Professional cards:** they have NVIDIA's own vGPU support and are never modified.
+- Turing: NVIDIA does not support SR-IOV on Turing
+  ([NVIDIA's list of supported platforms](https://docs.nvidia.com/vgpu/20.0/grid-vgpu-release-notes-red-hat-el-kvm/validated-platforms.html)).
+- Blackwell: see [Generations](#generations).
+- Laptop GPUs: not listed.
+- Other professional cards: they have NVIDIA's own vGPU support and are not in the device table, so
+  no component presents, prepares or activates them. The rebuilt `nvidia.ko` still applies to them
+  when they are bound to `nvidia`.

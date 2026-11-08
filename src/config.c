@@ -52,7 +52,7 @@ int gs_parse_addr_list(const char *key, const char *value, struct gs_addr *out, 
 		memcpy(item, p, len);
 		item[len] = '\0';
 		if (gs_addr_parse(item, &b)) {
-			snprintf(err, errlen, "%s: '%s' is not a full PCI address dddd:bb:ss.f as /sys/bus/pci/devices names it (lowercase hex; a domain longer than 4 digits has no leading zero; at most %x)",
+			snprintf(err, errlen, "%s: '%s' is not a full PCI address dddd:bb:ss.f as in /sys/bus/pci/devices (lowercase hex; a domain over 4 digits has no leading zero; at most %x)",
 				 key, item, GS_PCI_DOMAIN_MAX);
 			return -1;
 		}
@@ -107,8 +107,6 @@ void gs_config_defaults(struct gs_config *cfg)
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->ari = GS_SW_ON;
 	cfg->msix = GS_SW_ON;
-	cfg->experimental_vfs = GS_SW_OFF;
-	cfg->twin_id = GS_SW_OFF;
 	cfg->identity = GS_SW_OFF;
 	cfg->identity_force_host = GS_SW_OFF;
 	snprintf(cfg->sriov_manage, sizeof(cfg->sriov_manage), "%s", GS_SRIOV_MANAGE_DEFAULT);
@@ -117,6 +115,13 @@ void gs_config_defaults(struct gs_config *cfg)
 unsigned int gs_config_vfs(const struct gs_config *cfg)
 {
 	return cfg->vfs ? cfg->vfs : GS_DEFAULT_VFS;
+}
+
+unsigned int gs_config_vgpu_type(const struct gs_config *cfg, unsigned int generation)
+{
+	unsigned int set = generation == GS_ADA ? cfg->type_ada : cfg->type_ampere;
+
+	return set ? set : gs_vgpu_type_default(generation);
 }
 
 int gs_parse_vfs(const char *value, unsigned int *out)
@@ -139,7 +144,7 @@ int gs_parse_vfs(const char *value, unsigned int *out)
 
 int gs_vfs_check(const struct gs_device *e, const struct gs_config *cfg, char *why, size_t len)
 {
-	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs, cfg->experimental_vfs == GS_SW_ON);
+	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs);
 	unsigned int vfs = gs_config_vfs(cfg);
 
 	if (cfg->vfs && cfg->vfs > ceiling) {
@@ -147,12 +152,12 @@ int gs_vfs_check(const struct gs_device *e, const struct gs_config *cfg, char *w
 			snprintf(why, len, "vfs=%u is above the hardware default of 10de:%04x, %u VFs", cfg->vfs,
 				 e->device, e->totalvfs);
 		else
-			snprintf(why, len, "vfs=%u is above the %u VFs experimental_vfs=on presents on 10de:%04x (hardware default %u)",
+			snprintf(why, len, "vfs=%u is above the %u VFs geforce-sriov presents on 10de:%04x (hardware default %u)",
 				 cfg->vfs, ceiling, e->device, e->totalvfs);
 		return -1;
 	}
 	if ((vfs < ceiling ? vfs : ceiling) > GS_DEFAULT_VFS) {
-		snprintf(why, len, "vfs=%u is above the default of %u: ARI decoding in the GPU does not work for now, so more than %u VFs are expected not to work (the module refuses to load if the card's VF layout check fails)",
+		snprintf(why, len, "vfs=%u is above the default of %u: ARI decoding in the GPU does not work, so above %u VFs the module refuses to load when the card's VF layout check fails",
 			 vfs, GS_DEFAULT_VFS, GS_DEFAULT_VFS);
 		return 1;
 	}
@@ -161,17 +166,14 @@ int gs_vfs_check(const struct gs_device *e, const struct gs_config *cfg, char *w
 
 void gs_vfs_describe(const struct gs_device *e, const struct gs_config *cfg, char *buf, size_t len)
 {
-	int exp = cfg->experimental_vfs == GS_SW_ON;
-	unsigned int ceiling = gs_vf_ceiling(e, e->totalvfs, exp);
 	char how[32];
 
 	if (cfg->vfs)
 		snprintf(how, sizeof(how), "vfs=%u", cfg->vfs);
 	else
 		snprintf(how, sizeof(how), "default");
-	snprintf(buf, len, "hardware default %u, geforce-sriov presents %u (%s%s)", e->totalvfs,
-		 gs_vf_limit(e, e->totalvfs, exp, gs_config_vfs(cfg)), how,
-		 ceiling > e->totalvfs ? ", experimental_vfs=on" : "");
+	snprintf(buf, len, "hardware default %u, geforce-sriov presents %u (%s)", e->totalvfs,
+		 gs_vf_limit(e, e->totalvfs, gs_config_vfs(cfg)), how);
 }
 
 static int valid_key(const char *k, size_t n)
@@ -189,10 +191,11 @@ static int valid_key(const char *k, size_t n)
 	return 1;
 }
 
-enum { K_BDFS, K_RELEASE, K_ARI, K_MSIX, K_EXPVFS, K_TWIN_ID, K_VFS, K_IDENTITY, K_FORCE_HOST, K_SRIOV_MANAGE, K_COUNT };
+enum { K_BDFS, K_RELEASE, K_ARI, K_MSIX, K_VFS, K_IDENTITY, K_FORCE_HOST, K_SRIOV_MANAGE, K_TYPE_ADA, K_TYPE_AMPERE,
+       K_COUNT };
 static const char *const keys[K_COUNT] = {
-	"bdfs", "boot_display_release", "ari", "msix", "experimental_vfs", "twin_id", "vfs", "identity",
-	"identity_force_host", "sriov_manage",
+	"bdfs", "boot_display_release", "ari", "msix", "vfs", "identity", "identity_force_host", "sriov_manage",
+	"type_ada", "type_ampere",
 };
 
 int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *err, size_t errlen)
@@ -252,7 +255,11 @@ int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *e
 				break;
 		}
 		if (k == K_COUNT) {
-			if (memmem(line, klen, "vf", 2))
+			/* Switches geforce-sriov does not have: the line is deleted, not converted. */
+			if ((klen == 16 && memcmp(line, "experimental_vfs", klen) == 0) ||
+			    (klen == 7 && memcmp(line, "twin_id", klen) == 0))
+				snprintf(err, errlen, "line %u: unknown key '%.*s'; delete this line", lineno, (int)klen, line);
+			else if (memmem(line, klen, "vf", 2))
 				snprintf(err, errlen, "line %u: unknown key '%.*s'; the VF count key is vfs (vfs=1..%u, default %u)",
 					 lineno, (int)klen, line, GS_VFS_MAX, GS_DEFAULT_VFS);
 			else
@@ -282,12 +289,9 @@ int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *e
 		}
 		case K_ARI:
 		case K_MSIX:
-		case K_EXPVFS:
-		case K_TWIN_ID:
 		case K_IDENTITY:
 		case K_FORCE_HOST: {
 			int *dst = k == K_ARI ? &cfg->ari : k == K_MSIX ? &cfg->msix :
-				   k == K_EXPVFS ? &cfg->experimental_vfs : k == K_TWIN_ID ? &cfg->twin_id :
 				   k == K_IDENTITY ? &cfg->identity : &cfg->identity_force_host;
 
 			if (gs_parse_switch(value, dst)) {
@@ -309,6 +313,14 @@ int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *e
 				return -1;
 			}
 			snprintf(cfg->sriov_manage, sizeof(cfg->sriov_manage), "%s", value);
+			break;
+		case K_TYPE_ADA:
+		case K_TYPE_AMPERE:
+			if (gs_parse_vgpu_type(value, k == K_TYPE_ADA ? &cfg->type_ada : &cfg->type_ampere)) {
+				snprintf(err, errlen, "line %u: %s must be a vGPU type ID from 1 to %u, as nvidia/creatable_vgpu_types lists it",
+					 lineno, keys[k], GS_VGPU_TYPE_MAX);
+				return -1;
+			}
 			break;
 		}
 	}
@@ -377,7 +389,7 @@ int gs_config_render(const struct gs_config *cfg, char *buf, size_t len)
 	} while (0)
 
 	EMIT("# geforce-sriov configuration: key=value, no spaces; see docs.\n");
-	EMIT("# bdfs: the GPUs (physical function .0) that prepare/enable may act on.\n");
+	EMIT("# bdfs: the GPUs (physical function .0) that prepare/activate may act on.\n");
 	if (cfg->nbdfs) {
 		EMIT("bdfs=");
 		for (i = 0; i < cfg->nbdfs; i++)
@@ -396,14 +408,22 @@ int gs_config_render(const struct gs_config *cfg, char *buf, size_t len)
 	}
 	EMIT("ari=%s\n", cfg->ari == GS_SW_OFF ? "off" : "on");
 	EMIT("msix=%s\n", cfg->msix == GS_SW_OFF ? "off" : "on");
-	EMIT("experimental_vfs=%s\n", cfg->experimental_vfs == GS_SW_ON ? "on" : "off");
-	EMIT("twin_id=%s\n", cfg->twin_id == GS_SW_ON ? "on" : "off");
 	if (cfg->vfs)
 		EMIT("vfs=%u\n", cfg->vfs);
 	EMIT("identity=%s\n", cfg->identity == GS_SW_ON ? "on" : "off");
 	EMIT("identity_force_host=%s\n", cfg->identity_force_host == GS_SW_ON ? "on" : "off");
 	if (strcmp(cfg->sriov_manage, GS_SRIOV_MANAGE_DEFAULT) != 0)
 		EMIT("sriov_manage=%s\n", cfg->sriov_manage);
+	EMIT("# type_ada, type_ampere: the vGPU type ID activate sets on each VF of an Ada or Ampere card\n"
+	     "# and check expects (default %u on Ada, %u on Ampere).\n", GS_VGPU_TYPE_ADA, GS_VGPU_TYPE_AMPERE);
+	if (cfg->type_ada)
+		EMIT("type_ada=%u\n", cfg->type_ada);
+	else
+		EMIT("#type_ada=%u\n", GS_VGPU_TYPE_ADA);
+	if (cfg->type_ampere)
+		EMIT("type_ampere=%u\n", cfg->type_ampere);
+	else
+		EMIT("#type_ampere=%u\n", GS_VGPU_TYPE_AMPERE);
 #undef EMIT
 	return (int)off;
 }

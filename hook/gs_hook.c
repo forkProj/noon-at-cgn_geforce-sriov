@@ -13,10 +13,11 @@
  * build and a selected card resolves to a table entry, every ioctl passes through unchanged.
  * See hook/README.md.
  *
- * Adapted from the vgpu-toolkit hook (Rust), itself trimmed from a fork of vgpu_unlock-rs
- * (https://github.com/mbilker/vgpu_unlock-rs, MIT, Copyright (c) 2021 Jonathan Johansson,
- * Copyright (c) 2021 Matt Bilker), which builds on DualCoder's vgpu_unlock
- * (https://github.com/DualCoder/vgpu_unlock). Licence and notices: hook/LICENSE.
+ * Adapted from earlier unpublished code by the same copyright holder, which was itself trimmed
+ * from a fork of vgpu_unlock-rs 2.5.0 (https://github.com/mbilker/vgpu_unlock-rs, MIT,
+ * Copyright (c) 2021 Jonathan Johansson, Copyright (c) 2021 Matt Bilker), which builds on
+ * DualCoder's vgpu_unlock (https://github.com/DualCoder/vgpu_unlock). Licence and notices:
+ * hook/LICENSE.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -34,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h> /* checks the interposer against libc's ioctl prototype */
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -47,6 +49,11 @@
 #define QUERY_STATUS_UNSET 0xffffffffu
 /* id_holders() reasons: a whole sysfs entry name (up to NAME_MAX) plus the text around it. */
 #define REASON_LEN (NAME_MAX + 64)
+/*
+ * Test build only (read through test_env_or()): the symbol looked up as the next ioctl. A name
+ * no library defines stands for a failed lookup (hook/tests/run_hook_tests.c sets it).
+ */
+#define GS_HOOK_TEST_ENV_NEXT_IOCTL "GEFORCE_SRIOV_TEST_NEXT_IOCTL"
 
 typedef int (*ioctl_fn)(int, unsigned long, ...);
 
@@ -57,8 +64,6 @@ struct card {
 	uint8_t slot;
 	unsigned short device;
 	unsigned short target;
-	unsigned short sub_vendor; /* 0 with sub_device 0: keep the real subsystem */
-	unsigned short sub_device;
 	/*
 	 * At startup every NVIDIA physical function with this device ID was a mapped card, so a
 	 * reply whose GPU the driver cannot name may be rewritten by its device ID, once a fresh
@@ -625,24 +630,17 @@ static size_t build_cards(const struct config *cfg)
 		}
 
 		struct card *c = &hook.cards[hook.n_cards++];
-		bool set_sub = gd->target_subvendor && gd->target_subdevice;
+		const struct gs_target *t = gs_target_of(gd);
 
 		c->domain = b->domain;
 		c->bus = (uint8_t)b->bus;
 		c->slot = (uint8_t)(b->devfn >> 3);
 		c->device = gd->device;
-		c->target = gd->target;
-		c->sub_vendor = set_sub ? gd->target_subvendor : 0;
-		c->sub_device = set_sub ? gd->target_subdevice : 0;
+		c->target = t->device;
 		c->id_unique = false; /* until mark_shared_ids() */
 		memcpy(c->name, name, sizeof(name));
-		hook_log(LOG_INFO, "card %s: %s (10de:%04x, %s) presented as %s (10de:%04x), subsystem %s",
-			 name, gd->name, gd->device, gd->die, gd->target_name, gd->target,
-			 set_sub ? "set from the table" : "kept");
-		if (!gd->same_die)
-			hook_log(LOG_WARNING, "card %s: %s", name, GS_NO_SAME_DIE_MSG);
-		else if (gd->experimental)
-			hook_log(LOG_WARNING, "card %s: this device is experimental", name);
+		hook_log(LOG_INFO, "card %s: %s (10de:%04x, %s) presented as %s (10de:%04x), subsystem kept",
+			 name, gd->name, gd->device, gd->die, t->name, t->device);
 	}
 	if (hook.n_cards)
 		mark_shared_ids();
@@ -681,7 +679,7 @@ static void decide(void)
 	for (size_t i = 0; i < GS_HOOK_DRIVER_VERSION_COUNT; i++)
 		supported |= strcmp(version, gs_hook_driver_versions[i]) == 0;
 	if (!supported) {
-		hook_log(LOG_ERR, "driver %s is not a supported build: every ioctl passes through",
+		hook_log(LOG_ERR, "driver %s is not supported: every ioctl passes through",
 			 version);
 		return;
 	}
@@ -704,14 +702,30 @@ static void decide(void)
 		 version, hook.force_host ? "forced to HOST for mapped cards only" : "unchanged");
 }
 
+/* The kernel's ioctl, used when dlsym() finds no next ioctl: -1 with errno set, as libc's wrapper returns. */
+static int sys_ioctl(int fd, unsigned long request, ...)
+{
+	va_list ap;
+	void *argp;
+
+	va_start(ap, request);
+	argp = va_arg(ap, void *);
+	va_end(ap);
+	return (int)syscall(SYS_ioctl, fd, request, argp);
+}
+
 static void hook_init(void)
 {
 	char comm[64];
 	ssize_t n;
 
-	hook.next = (ioctl_fn)dlsym(RTLD_NEXT, "ioctl");
+	hook.next = (ioctl_fn)dlsym(RTLD_NEXT, test_env_or(GS_HOOK_TEST_ENV_NEXT_IOCTL, "ioctl"));
 	if (!hook.next) {
-		hook_log(LOG_ERR, "dlsym(RTLD_NEXT, \"ioctl\") failed: %s", dlerror());
+		const char *why = dlerror();
+
+		hook_log(LOG_ERR, "dlsym(RTLD_NEXT, \"ioctl\") failed (%s): every ioctl goes straight to the kernel",
+			 why ? why : "no error text");
+		hook.next = sys_ioctl;
 		return;
 	}
 	n = read_path("/proc/self/comm", comm, sizeof(comm) - 1);
@@ -854,8 +868,6 @@ static uint32_t nvidia_word(unsigned short device)
 static void present(void *params, struct gs_pci_info *info, const struct card *c)
 {
 	info->pci_device_id = nvidia_word(c->target);
-	if (c->sub_device)
-		info->pci_sub_system_id = ((uint32_t)c->sub_device << 16) | c->sub_vendor;
 	memcpy(params, info, sizeof(*info)); /* revision and pciExtDeviceId kept */
 }
 
@@ -880,7 +892,6 @@ static void on_pci_info(int fd, const struct gs_nvos54 *io)
 	}
 	if (subdevice_addr(fd, io->h_client, io->h_object, &a, &e)) {
 		struct card *c = card_at(&a);
-		uint32_t before_sub = info.pci_sub_system_id;
 
 		if (!c) {
 			if (!atomic_exchange(&logged_pci_other, true))
@@ -898,8 +909,7 @@ static void on_pci_info(int fd, const struct gs_nvos54 *io)
 		present(params, &info, c);
 		if (!atomic_exchange(&c->logged_rewrite, true))
 			hook_log(LOG_INFO, "GET_PCI_INFO: card %s 10de:%04x presented as 10de:%04x, "
-				 "subsystem %08x -> %08x", c->name, c->device, c->target,
-				 before_sub, info.pci_sub_system_id);
+				 "subsystem %08x kept", c->name, c->device, c->target, info.pci_sub_system_id);
 		return;
 	}
 	query_error_text(&e, why, sizeof(why));
@@ -1016,10 +1026,6 @@ GS_HOOK_EXPORT int ioctl(int fd, unsigned long request, ...)
 	va_end(ap);
 
 	pthread_once(&hook_once, hook_init);
-	if (!hook.next) {
-		errno = ENOSYS;
-		return -1;
-	}
 	errno = err;
 	ret = hook.next(fd, request, argp);
 	if (ret < 0 || !hook.active || request != GS_NV_ESC_RM_CONTROL || !argp)

@@ -1,18 +1,20 @@
 # Glossary
 
+Terms used in the guides and reference pages.
+
 | Term | Meaning |
 |---|---|
-| **PF** (physical function) | The card itself as the PCI bus sees it, for example `0000:03:00.0` |
+| **PF** (physical function) | The card itself as the PCI bus sees it, for example `0000:01:00.0` |
 | **BDF** | A PCI address in the form `domain:bus:device.function`, as in `/sys/bus/pci/devices` |
 | **SR-IOV** | A PCIe feature that lets one device appear as several lightweight devices |
-| **VF** (virtual function) | One of those lightweight devices; each can back one vGPU. geforce-sriov presents 4 per card by default (`vfs`), because ARI decoding in the GPU hardware does not work yet, and on Ada and Blackwell the card's own 1 ([Ada and Blackwell](devices.md#ada-and-blackwell)) |
-| **ARI** | A PCIe addressing extension that allows more functions per device. The module enables it in software: it reveals the card's hidden ARI and turns on ARI forwarding in the bridge above it (`ari=on`). ARI decoding in the GPU hardware does not work for now |
-| **MSI-X** | A way for a device to send interrupts. The module reveals the card's hidden MSI-X on Ampere (`msix=on`) |
-| **vGPU** | NVIDIA's software that gives each VM a slice of one GPU, with a fixed memory size per type |
-| **mdev** (mediated device) | Legacy vGPU, on GPUs without SR-IOV, creates each vGPU as a Linux mediated device on the physical function. With geforce-sriov each VM gets a VF instead; the Proxmox VE `hostpci` line names the vGPU type on that VF with `mdev=<type>`, for example `mdev=nvidia-527` ([SR-IOV note](../README.md#how-it-works)) |
-| **IOMMU** | The hardware that keeps each VM's device access separate; must be enabled |
-| **Livepatch** | A kernel feature that changes a running kernel's functions without a reboot; used here only for the listed cards |
-| **DKMS** | Rebuilds out-of-tree kernel modules automatically for each new kernel |
-| **Boot display** | The card the firmware uses for the boot screen (`boot_vga` is `1` in sysfs); see [The boot display GPU](boot-display.md) |
-| **GSP** | The GPU System Processor, a processor on the GPU that runs part of NVIDIA's driver as firmware. NVIDIA's stock vGPU host driver uses it on Ada and Blackwell, not on Ampere. The measured Ada stack turns it off (`NVreg_EnableGpuFirmware=0`, *CPU-RM*); see [Ada host stack](ada.md) |
-| **Driver flavour** | NVIDIA's Linux kernel module comes as a proprietary and an open flavour; see [NVIDIA driver flavour](devices.md#nvidia-driver-flavour) |
+| **VF** (virtual function) | One of those lightweight devices. Each can back one vGPU. By default 4 are presented per card (`vfs`), which is the most any card presents |
+| **ARI** | A PCIe addressing extension that allows more functions per device. The module reveals the card's hidden ARI and turns on ARI forwarding in the bridge above it (`ari=on`). ARI decoding in the GPU hardware does not work, which is why 4 VFs is the default |
+| **MSI-X** | A way for a device to send interrupts. The module reveals the card's hidden MSI-X (`msix=on`) |
+| **vGPU** | NVIDIA's software that gives each VM a slice of one GPU. Each vGPU has a type, also called a profile (for example `RTXA6000-4Q`), which fixes its memory size |
+| **mdev** (mediated device) | How legacy vGPU creates each vGPU on GPUs without SR-IOV. Here each VM gets a VF instead, attached as a plain VFIO PCI device with the vGPU type already set on the VF ([Create a VM](installation.md#create-a-vm)) |
+| **IOMMU** | The hardware that keeps each VM's device access separate. It must be enabled |
+| **Livepatch** | A kernel feature that changes a running kernel's functions without a reboot. Used here only for the listed cards |
+| **DKMS** | A framework that rebuilds out-of-tree kernel modules automatically for each new kernel |
+| **Boot display** | The GPU that displays BIOS/UEFI startup messages before Linux loads and the local text console (login prompt) on its connected monitor. Its `boot_vga` is `1` in sysfs. See [Boot display card](installation.md#boot-display-card) |
+| **GSP** | The GPU System Processor, which runs part of NVIDIA's driver as firmware. NVIDIA's stock vGPU host driver uses it on Ada, not on Ampere. The Ada host stack runs the driver without it (`NVreg_EnableGpuFirmware=0`, *CPU-RM*) ([Ada host stack](ada.md#host-stack)) |
+| **Driver flavour** | NVIDIA's Linux kernel module comes in a proprietary and an open flavour ([NVIDIA driver flavour](devices.md#nvidia-driver-flavour)) |
