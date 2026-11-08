@@ -17,12 +17,12 @@ static void usage(FILE *f)
 		"Read-only:\n"
 		"  devices\n"
 		"      List the device table.\n"
-		"  doctor [--device BDF]... [--boot-display-release BDF]...\n"
+		"  doctor [--device BDF]... [--boot-display-release BDF]... [--hold-nvidia]\n"
 		"         [--sysfs-root PATH] [--config FILE]\n"
-		"         [--nvidia-source DIR] [--driver-file PATH]\n"
+		"         [--nvidia-source DIR] [--driver-file PATH] [--disable-d3cold]\n"
 		"      Check the host and show what prepare would do. --nvidia-source,\n"
-		"      --driver-file and --boot-display-release judge the host as install\n"
-		"      will leave it.\n"
+		"      --driver-file, --boot-display-release, --hold-nvidia and\n"
+		"      --disable-d3cold judge the host as install will leave it.\n"
 		"  status [--device BDF]... [--sysfs-root PATH] [--config FILE]\n"
 		"      Show the module, guard and SR-IOV state of each selected GPU and the\n"
 		"      next step. Exit 0 only when each one was prepared this boot and passes\n"
@@ -38,7 +38,8 @@ static void usage(FILE *f)
 		"\n"
 		"Changing the system (root, live /sys only):\n"
 		"  setup [--device BDF]... [--boot-display-release BDF]... [--vfs N]\n"
-		"        [--driver=skip] [--interactive | --no-prompt]\n"
+		"        [--driver=skip] [--hold-nvidia] [--disable-d3cold]\n"
+		"        [--interactive | --no-prompt]\n"
 		"        [--nvidia-source DIR] [--driver-file PATH] [--accept-nvidia-license]\n"
 		"      The guided path from a clean host to a ready VF: it runs the next steps\n"
 		"      for the host's state, tells you when to power the machine off and on,\n"
@@ -50,8 +51,9 @@ static void usage(FILE *f)
 		"      ignored.\n"
 		"  install [--prefix PATH] [--destdir PATH] [--source DIR] [--vfs N]\n"
 		"          [--device BDF]... [--boot-display-release BDF]...\n"
-		"          [--ari=on|off] [--msix=on|off] [--driver=skip]\n"
+		"          [--ari=on|off] [--msix=on|off] [--driver=skip] [--hold-nvidia]\n"
 		"          [--nvidia-source DIR] [--driver-file PATH] [--accept-nvidia-license]\n"
+		"          [--disable-d3cold]\n"
 		"      Install the built tree. With DESTDIR (environment or --destdir), only\n"
 		"      stage the files below it.\n"
 		"  prepare [--ari=on|off] [--msix=on|off] [--release-console=BDF]... [--boot]\n"
@@ -79,6 +81,8 @@ static void usage(FILE *f)
 		"(details: docs/installation.md#one-command-from-a-clean-host):\n"
 		"  --device BDF               a GPU to use (physical function dddd:bb:ss.0)\n"
 		"  --boot-display-release BDF grant a console release to the boot display GPU\n"
+		"  --hold-nvidia              prevent nvidia from loading at boot for the boot display GPU\n"
+		"  --disable-d3cold           keep a laptop GPU powered when idle (D3cold off)\n"
 		"  --vfs N                    VFs per GPU (default %u; doctor shows the maximum)\n"
 		"  --driver=skip              leave NVIDIA's files untouched\n"
 		"  --nvidia-source DIR        kernel tree, default " GS_NVIDIA_SRC "\n"
@@ -202,7 +206,7 @@ static int parse_driver_file(const char *v, const char **out)
 	return 0;
 }
 
-/* --driver-file and --accept-nvidia-license of install and setup. */
+/* --driver-file, --accept-nvidia-license, --hold-nvidia and --disable-d3cold of install and setup. */
 static int parse_package_opt(int argc, char **argv, int *i, struct gs_install_opts *o, int *matched)
 {
 	const char *v;
@@ -212,6 +216,14 @@ static int parse_package_opt(int argc, char **argv, int *i, struct gs_install_op
 		return parse_driver_file(v, &o->driver_file);
 	if (strcmp(argv[*i], "--accept-nvidia-license") == 0) {
 		o->accept_nvidia_license = 1;
+		return 0;
+	}
+	if (strcmp(argv[*i], "--hold-nvidia") == 0) {
+		o->hold_nvidia = 1;
+		return 0;
+	}
+	if (strcmp(argv[*i], "--disable-d3cold") == 0) {
+		o->disable_d3cold = 1;
 		return 0;
 	}
 	*matched = 0;
@@ -248,6 +260,10 @@ static int check_install_opts(const struct gs_install_opts *o)
 		return bad("--driver-file installs NVIDIA's files and --driver=skip leaves them untouched; give one");
 	if (o->accept_nvidia_license && !o->driver_file)
 		return bad("--accept-nvidia-license needs --driver-file PATH, NVIDIA's vGPU host .run package");
+	/* --device replaces the selection and its grants, so a hold then needs a grant given with it. */
+	if (o->hold_nvidia && o->ndevices && !o->nrelease)
+		return bad("--hold-nvidia requires --boot-display-release BDF for a boot display GPU\n"
+			   "with a console-release grant.");
 	return 0;
 }
 
@@ -334,6 +350,10 @@ static int diag_main(int argc, char **argv, int status)
 		} else if (!status && (v = opt_value(argc, argv, &i, "--driver-file"))) {
 			if ((r = parse_driver_file(v, &o.driver_file)))
 				return r;
+		} else if (!status && strcmp(argv[i], "--hold-nvidia") == 0) {
+			o.hold_nvidia = 1;
+		} else if (!status && strcmp(argv[i], "--disable-d3cold") == 0) {
+			o.disable_d3cold = 1;
 		} else {
 			return unknown_opt(argv[i], 0);
 		}
@@ -431,6 +451,9 @@ int main(int argc, char **argv)
 			if (strcmp(argv[i], "--release-note-shown") == 0) {
 				/* setup passes it after its console-release question, which explained the grant */
 				o.release_note_shown = 1;
+			} else if (strcmp(argv[i], "--hold-note-shown") == 0) {
+				/* setup passes it when it prints the hold notice itself after install */
+				o.hold_note_shown = 1;
 			} else if ((v = opt_value(argc, argv, &i, "--device"))) {
 				if ((r = parse_device("--device", v, o.devices, &o.ndevices)))
 					return r;

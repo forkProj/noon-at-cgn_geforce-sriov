@@ -281,6 +281,9 @@ When restoring fails, `uninstall` exits 1, keeps the driver-step script `geforce
 
 - Run `geforce-sriov-driver --restore` after fixing the failure.
 - Copy the kernel's backup over `nvidia.ko`, run `depmod -a <kernel release>`, and do the rest of the steps below.
+- If `geforce-sriov-driver` changed since install, `uninstall` does not run it.
+  Check the file, or restore the installed copy with `geforce-sriov install` and run `uninstall` again.
+  Alternatively, copy the backup as described above.
 
 To revert by hand:
 

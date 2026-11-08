@@ -192,10 +192,10 @@ static int valid_key(const char *k, size_t n)
 }
 
 enum { K_BDFS, K_RELEASE, K_ARI, K_MSIX, K_VFS, K_IDENTITY, K_FORCE_HOST, K_SRIOV_MANAGE, K_TYPE_ADA, K_TYPE_AMPERE,
-       K_COUNT };
+       K_D3COLD, K_COUNT };
 static const char *const keys[K_COUNT] = {
 	"bdfs", "boot_display_release", "ari", "msix", "vfs", "identity", "identity_force_host", "sriov_manage",
-	"type_ada", "type_ampere",
+	"type_ada", "type_ampere", "d3cold",
 };
 
 int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *err, size_t errlen)
@@ -322,6 +322,14 @@ int gs_config_parse(const char *text, size_t len, struct gs_config *cfg, char *e
 				return -1;
 			}
 			break;
+		case K_D3COLD:
+			/* Consent only: off is the one value, and no key means no consent. */
+			if (strcmp(value, "off") != 0) {
+				snprintf(err, errlen, "line %u: d3cold must be off (leave the key out for no consent)", lineno);
+				return -1;
+			}
+			cfg->d3cold_off = 1;
+			break;
 		}
 	}
 	/* A console release is granted only for a selected GPU. */
@@ -406,6 +414,10 @@ int gs_config_render(const struct gs_config *cfg, char *buf, size_t len)
 			EMIT("%s%s", i ? "," : "", cfg->boot_display_release[i].str);
 		EMIT("\n");
 	}
+	if (cfg->d3cold_off)
+		EMIT("# d3cold=off: consent to keep a laptop GPU powered when idle (prepare sets its\n"
+		     "# d3cold_allowed to 0); `install --disable-d3cold` writes it.\n"
+		     "d3cold=off\n");
 	EMIT("ari=%s\n", cfg->ari == GS_SW_OFF ? "off" : "on");
 	EMIT("msix=%s\n", cfg->msix == GS_SW_OFF ? "off" : "on");
 	if (cfg->vfs)

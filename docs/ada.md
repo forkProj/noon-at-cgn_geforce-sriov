@@ -5,6 +5,7 @@
 | Item | Value |
 |---|---|
 | Device IDs | Every Ada row in [devices.md](devices.md#rows). Tested card: `10de:2783` (RTX 4070 SUPER, AD104) |
+| Laptop GPUs | Supported through the same path as the desktop cards ([Laptop support](laptops.md)). No laptop GPU has been tested |
 | Presented as | RTX 6000 Ada, `10de:26b1` |
 | VFs per card | 4 |
 | Host driver | NVIDIA vGPU software 19.5, host driver 580.159.01, vGPU-KVM proprietary build, CPU-side mode with `NVreg_EnableGpuFirmware=0`, GSP not used |
@@ -26,7 +27,7 @@
 - The scheduler revision is the same two-byte change Ampere uses.
   Without it, a PMU-service callback disables the GPU's runlist scheduler and guest work stalls.
 - The RM reads an Ada card's VF total from the hardware and accepts vGPUs only up to that count.
-  Every Ada row reports 1 except `28b0`, which reports 16.
+  Every Ada row with a public dump reports 1, except `28b0`, which reports 16.
   The VF count revision replaces a 16-bit load inside `kbifCacheVFInfo` with the constant 4.
 - Without the plugin revision, the stock plugin makes `nvidia-vgpu-mgr` abort the vGPU configuration (`0x1f`) on Ada, and the instance does not start.
 
@@ -236,6 +237,6 @@ NVIDIA Control Panel and GPU-Z report guest driver 539.19.
 
 ## Known limits
 
-- Four VFs per card is the package maximum.
+- `vfs` accepts values from 1 to the card's ceiling (16 on Ampere and `28b0`, 4 on other Ada cards); NVIDIA's patched driver uses at most 4 VFs per card.
   The VFs take functions 4 to 7 of the card's slot, and ARI decoding in the GPU beyond function 7 does not work.
 - The open flavour and the GSP route are not supported.

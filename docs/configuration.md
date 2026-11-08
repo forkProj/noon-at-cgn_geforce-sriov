@@ -29,9 +29,11 @@ The configuration file holds your card selection, feature switches, VF count and
 | `sriov_manage` | absolute path | `/usr/lib/nvidia/sriov-manage` | NVIDIA's VF tool, which `activate` runs to create the VFs of a card that has none |
 | `type_ada` | vGPU type ID | `942` | The vGPU type that `activate` sets on each VF of an Ada card and that `check` expects ([Choosing a vGPU type](#choosing-a-vgpu-type)) |
 | `type_ampere` | vGPU type ID | `525` | The same for an Ampere card |
+| `d3cold` | `off` | none (no consent) | Records consent to keep the selected laptop GPUs powered. Without it, `prepare` refuses the run if a laptop GPU is selected. `install --disable-d3cold` writes the key; any value other than `off` is refused ([Consent](laptops.md#consent)) |
 
 The ceiling for `vfs` is the card's hardware default, except on an Ada card that reports 1.
 On those Ada cards, the VF-count revision of the host module sets the ceiling to 4.
+NVIDIA's patched driver uses at most 4 VFs per card.
 `doctor` shows both counts, for example "hardware default 1, geforce-sriov presents 4 (default)".
 
 `experimental_vfs` and `twin_id` are not valid keys.
@@ -130,6 +132,10 @@ Options:
 
 - `--device BDF`, repeatable.
 - `--boot-display-release BDF`, repeatable, each also given as `--device`: judge that boot display card with the console release `install` will grant.
+- `--hold-nvidia`: assess the hold file as if `install --hold-nvidia` had written it.
+  Requires a console release already granted in the config or planned with `--boot-display-release`; otherwise, `doctor` exits 2.
+- `--disable-d3cold`: assess the selected laptop GPUs as if D3cold consent were recorded by `install --disable-d3cold`.
+  Requires at least one laptop GPU among those assessed; otherwise, `doctor` exits 2.
 - `--sysfs-root PATH`.
 - `--config FILE`.
 - `--nvidia-source DIR` or `--driver-file PATH`: judge the host as `install` with that option will leave it.
@@ -196,6 +202,7 @@ Options:
 
 - `--device BDF`, repeatable.
 - `--boot-display-release BDF`, repeatable.
+- `--hold-nvidia`.
 - `--vfs N`.
 - `--driver=skip`.
 - `--driver-file PATH`.
@@ -218,14 +225,20 @@ It asks when its input is a terminal or with `--interactive`; `--no-prompt` neve
 - If the picked cards include the boot display, it asks `Allow releasing the console of BDF after the next boot? [y/N]`.
   Yes records the grant without releasing anything; no leaves the card out.
   After the power cycle, `setup` asks again before releasing the console.
+- After the IMPORTANT notice, `setup` asks whether to create the hold file that prevents `nvidia` from loading at boot.
+- If any selected GPU is a laptop GPU, `setup` shows the D3cold notice and asks whether to disable D3cold for the selected laptop GPUs; the default is no.
+  Answering yes passes `--disable-d3cold` to `doctor` and `install`; declining stops `setup` with exit 3 before any step ([Consent](laptops.md#consent)).
+  If `setup` cannot prompt, you must pass `--disable-d3cold`; otherwise, it stops the same way.
 
 #### Installed host
 
 Run the same command again after the power cycle.
 On an installed host:
 
-- First-install options (`--driver-file`, `--vfs`, `--boot-display-release`, `--nvidia-source`, `--driver=skip`) print a note and are ignored.
+- First-install options (`--driver-file`, `--vfs`, `--boot-display-release`, `--hold-nvidia`, `--nvidia-source`, `--driver=skip`) print a note and are ignored.
 - A `--device` selection that differs from the configured `bdfs` is refused.
+- If a laptop GPU is selected and the config lacks D3cold consent, `setup` asks for it before `doctor`.
+  Accepting or passing `--disable-d3cold` runs `install --driver=skip --disable-d3cold` and ends the run; declining stops `setup` with exit 3.
 - If the cards are not ready and the loaded `nvidia` module is not the installed build, `setup` stops before `prepare` and `activate`.
   It exits 3, changes nothing and prints `setup: the running nvidia module is not the installed one. Power the machine off and on, then run setup again.`
 
@@ -238,18 +251,24 @@ When the config grants a console release (`boot_display_release`), the cards are
 - No prints those commands and exits 0.
 - With `--no-prompt`, without a terminal or at the end of input, it prints those commands and refuses (exit 3).
 
-If NVIDIA's driver is already loaded, it stops before `prepare` (exit 3) and says to create the hold and power the machine off and on.
+If `nvidia` is already loaded, `setup` tells you to create `/etc/modprobe.d/nvidia-manual-load.conf` with the two required lines, power the machine off and on, and run `setup` again.
 See [Boot display card](installation.md#boot-display-card).
 
 ### install
 
 `geforce-sriov install` installs files, selects cards, sets the VF count, patches and installs NVIDIA's module and plugin, and enables the boot units.
-It writes the vGPU drop-in and config only after the driver step succeeds.
+After the driver step succeeds, installation writes the vGPU drop-in and config.
+With `--hold-nvidia`, it also writes `/etc/modprobe.d/nvidia-manual-load.conf`.
 
 Options:
 
 - `--device BDF`, repeatable.
 - `--boot-display-release BDF`, repeatable.
+- `--hold-nvidia`: creates `/etc/modprobe.d/nvidia-manual-load.conf` to prevent `nvidia` from loading at boot.
+  Requires a console-release grant.
+- `--disable-d3cold`: records D3cold consent as `d3cold=off` for the selected laptop GPUs.
+  Requires at least one selected laptop GPU.
+  Passing `--device` without this option removes consent from the config.
 - `--vfs N`.
 - `--driver=skip`.
 - `--driver-file PATH`: NVIDIA's `.run` package.
@@ -262,11 +281,13 @@ Options:
 
 Its output ends with the next step: check `doctor`, power the machine fully off and on, then run `setup`.
 With a console-release grant, use the listed commands or `setup`.
+If no hold is present in `/etc/modprobe.d/`, installation displays a framed IMPORTANT notice that names the file to create and its two lines.
 See [Install details](technical-reference.md#install-details), [One command from a clean host](installation.md#one-command-from-a-clean-host) and [`--driver`](#--driver).
 
 ### prepare
 
 `geforce-sriov prepare` prepares the selected cards now.
+If a laptop GPU is selected, the config must contain `d3cold=off`; otherwise, `prepare` refuses the run (exit 3) without changes ([Consent](laptops.md#consent)).
 
 - `--ari=on|off` and `--msix=on|off` override the config for this run.
 - `--release-console=BDF` is repeatable.
@@ -329,6 +350,7 @@ It exits 0 only when every VF of every selected card:
 - Is on `nvidia`.
 - Has `power/control=on`.
 - Has `runtime_status=active`.
+- On a laptop GPU, answers a config read at offset `0x08`.
 - Has the expected type: `--type N`, else `type_ada` or `type_ampere` from the config, else 942 on Ada and 525 on Ampere.
 
 Otherwise it exits 1, or 3 for a configuration or selection it refuses.
@@ -350,13 +372,14 @@ Removal reports:
 
 - The plugin copy it removes: `removed <path>`.
 - A link to a file this package did not install stays: `left <link>: it points to <target>, which this package did not install`.
-- A file in `/etc/modprobe.d/` that still holds `nvidia` back is named but not removed, whether restoration succeeds or fails.
+- A hold created by `setup` or `install --hold-nvidia` is removed if unchanged; any other file in `/etc/modprobe.d/` that holds `nvidia` back is named but not removed.
 
 Once the stock module is back, it removes the running kernel's backup and the empty `build/` and `stock/` directories.
 It removes `/var/lib/geforce-sriov/` when nothing is left in it.
 For each other kernel whose backup stays, it prints a `restore <kernel release>: cp … && depmod -a <kernel release>` line.
 
-If restoration fails, it exits 1, keeps `geforce-sriov-driver` and every backup, and prints `NVIDIA's module was not restored: <reason>` with the two ways to finish by hand.
+If restoration fails, `uninstall` exits 1, keeps `geforce-sriov-driver` and every backup, and prints `NVIDIA's module was not restored: <reason>` with two ways to finish by hand.
+If `geforce-sriov-driver` changed since install, `uninstall` does not run it, exits 1 and keeps the script and every backup.
 See [Remove the package](recovery.md#remove-the-package) for the removal order and `--unload` safety conditions.
 
 ### Driver patcher

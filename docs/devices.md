@@ -43,9 +43,8 @@ See [Ampere](ampere.md) and [Ada](ada.md) for hardware details.
 
 - `geforce-sriov devices` names the target of each generation once, then lists every row with its
   device ID, generation, die and name.
-- The capability offsets of each row come from public raw config-space dumps of cards with that ID.
-  The kernel module re-reads and validates each header on the running card and does nothing when it
-  does not match.
+- The capability offsets of each row come from public raw config-space dumps of cards with that ID, except the laptop and embedded rows without a dump, which use their generation's offsets ([Laptop support](laptops.md#ids-without-a-dump)).
+  The kernel module re-reads and validates each header on the running card and does nothing when it does not match.
 
 > [!IMPORTANT]
 > Choose vGPU profiles (vGPU types, each with a fixed memory size) that fit your card's physical VRAM.
@@ -69,10 +68,9 @@ Each uses its generation's target, and `activate` and `check` process every sele
 - One host module and one plugin serve all cards, so every revision any selected generation needs is
   made ([Which revisions to make](driver-patch.md#which-revisions-to-make)). Loading `nvidia` binds
   every NVIDIA card on the host, so select every card you will use.
-- The rebuilt `nvidia.ko` applies to every card bound to it, selected or not: its VF-count and
-  scheduler revisions are not per card. The VF-count revision forces 4 virtual functions (VFs, one
-  per vGPU) on every TU/GA/AD card bound to it, whatever its row, so 4 VFs per card is the package
-  maximum, whatever `vfs` the module presents.
+- The rebuilt `nvidia.ko` applies to every card bound to it, selected or not: its VF-count and scheduler revisions are not per card.
+  The VF-count revision forces 4 virtual functions (VFs, one per vGPU) on every TU/GA/AD card bound to it, whatever its row.
+  `vfs` accepts values from 1 to the card's ceiling (16 on Ampere and `28b0`, 4 on other Ada cards); NVIDIA's patched driver uses at most 4 VFs per card.
 - The selection (`bdfs`) limits what the kernel module presents (SR-IOV), the identity hook, `prepare`
   and `activate`. A card outside it is bound by NVIDIA's driver but not prepared or activated.
 - `doctor` prints one `[WARN]` when a selection mixes Ada with another generation, and nothing refuses
@@ -103,14 +101,53 @@ Host layouts (switches, shared buses, IOMMU groups, BAR space) are covered in
 | `2487` | GA104 | GeForce RTX 3060 | Ampere |
 | `2488` | GA104 | GeForce RTX 3070 LHR | Ampere |
 | `2489` | GA104 | GeForce RTX 3060 Ti LHR | Ampere |
+| `249c` | GA104 | GeForce RTX 3080 Laptop GPU | Ampere |
+| `249d` | GA104 | GeForce RTX 3070 Laptop GPU | Ampere |
+| `24a0` | GA104 | GeForce RTX 3070 Ti Laptop GPU | Ampere |
 | `24b0` | GA104 | RTX A4000 | Ampere |
+| `24b6` | GA104 | RTX A5000 Laptop GPU | Ampere |
+| `24b7` | GA104 | RTX A4000 Mobile | Ampere |
+| `24b8` | GA104 | RTX A3000 Mobile | Ampere |
+| `24b9` | GA104 | RTX A3000 12GB Laptop GPU | Ampere |
+| `24ba` | GA104 | RTX A4500 Laptop GPU | Ampere |
+| `24bb` | GA104 | RTX A3000 Laptop GPU | Ampere |
+| `24dc` | GA104 | GeForce RTX 3080 Laptop GPU | Ampere |
+| `24dd` | GA104 | GeForce RTX 3070 Laptop GPU | Ampere |
+| `24e0` | GA104 | GeForce RTX 3070 Ti Laptop GPU | Ampere |
 | `2503` | GA106 | GeForce RTX 3060 | Ampere |
 | `2504` | GA106 | GeForce RTX 3060 LHR | Ampere |
 | `2507` | GA106 | GeForce RTX 3050 | Ampere |
+| `2520` | GA106 | GeForce RTX 3060 Laptop GPU | Ampere |
+| `2523` | GA106 | GeForce RTX 3050 Ti Laptop GPU | Ampere |
 | `2544` | GA106 | GeForce RTX 3060 | Ampere |
+| `2560` | GA106 | GeForce RTX 3060 Laptop GPU | Ampere |
+| `2563` | GA106 | GeForce RTX 3050 Ti Mobile / Max-Q | Ampere |
 | `2571` | GA106 | RTX A2000 12GB | Ampere |
 | `2582` | GA107 | GeForce RTX 3050 8GB | Ampere |
 | `2584` | GA107 | GeForce RTX 3050 6GB | Ampere |
+| `25a0` | GA107 | GeForce RTX 3050 Ti Laptop GPU | Ampere |
+| `25a2` | GA107 | GeForce RTX 3050 Laptop GPU | Ampere |
+| `25a5` | GA107 | GeForce RTX 3050 Mobile | Ampere |
+| `25a6` | GA107 | GeForce MX570 | Ampere |
+| `25a7` | GA107 | GeForce MX570 | Ampere |
+| `25a9` | GA107 | GeForce RTX 2050 | Ampere |
+| `25ab` | GA107 | GeForce RTX 3050 4GB Laptop GPU | Ampere |
+| `25ac` | GA107 | GeForce RTX 3050 6GB Laptop GPU | Ampere |
+| `25ad` | GA107 | GeForce RTX 2050 | Ampere |
+| `25b8` | GA107 | RTX A2000 Mobile | Ampere |
+| `25b9` | GA107 | RTX A1000 Laptop GPU | Ampere |
+| `25ba` | GA107 | RTX A2000 8GB Laptop GPU | Ampere |
+| `25bb` | GA107 | RTX A500 Laptop GPU | Ampere |
+| `25bc` | GA107 | RTX A1000 6GB Laptop GPU | Ampere |
+| `25bd` | GA107 | RTX A500 Laptop GPU | Ampere |
+| `25e0` | GA107 | GeForce RTX 3050 Ti Mobile | Ampere |
+| `25e2` | GA107 | GeForce RTX 3050 Mobile | Ampere |
+| `25e5` | GA107 | GeForce RTX 3050 Mobile | Ampere |
+| `25ec` | GA107 | GeForce RTX 3050 6GB Laptop GPU | Ampere |
+| `25ed` | GA107 | GeForce RTX 2050 | Ampere |
+| `25f9` | GA107 | RTX A1000 Embedded GPU | Ampere |
+| `25fa` | GA107 | RTX A2000 Embedded GPU | Ampere |
+| `25fb` | GA107 | RTX A500 Embedded GPU | Ampere |
 | `2684` | AD102 | GeForce RTX 4090 | Ada |
 | `2685` | AD102 | GeForce RTX 4090 D | Ada |
 | `2689` | AD102 | GeForce RTX 4070 Ti SUPER | Ada |
@@ -118,20 +155,41 @@ Host layouts (switches, shared buses, IOMMU groups, BAR space) are covered in
 | `2704` | AD103 | GeForce RTX 4080 | Ada |
 | `2705` | AD103 | GeForce RTX 4070 Ti SUPER | Ada |
 | `2709` | AD103 | GeForce RTX 4070 | Ada |
+| `2717` | AD103 | GeForce RTX 4090 Laptop GPU | Ada |
+| `2730` | AD103 | RTX 5000 Ada Generation Laptop GPU | Ada |
+| `2757` | AD103 | GeForce RTX 4090 Laptop GPU | Ada |
+| `2770` | AD103 | RTX 5000 Ada Generation Embedded GPU | Ada |
 | `2782` | AD104 | GeForce RTX 4070 Ti | Ada |
 | `2783` | AD104 | GeForce RTX 4070 SUPER | Ada |
 | `2786` | AD104 | GeForce RTX 4070 | Ada |
 | `2788` | AD104 | GeForce RTX 4060 Ti | Ada |
+| `27a0` | AD104 | GeForce RTX 4080 Max-Q / Mobile | Ada |
 | `27b1` | AD104 | RTX 4500 Ada Generation | Ada |
 | `27b2` | AD104 | RTX 4000 Ada Generation | Ada |
+| `27ba` | AD104 | RTX 4000 Ada Generation Laptop GPU | Ada |
+| `27bb` | AD104 | RTX 3500 Ada Generation Laptop GPU | Ada |
+| `27e0` | AD104 | GeForce RTX 4080 Laptop GPU | Ada |
+| `27fb` | AD104 | RTX 3500 Ada Generation Embedded GPU | Ada |
 | `2803` | AD106 | GeForce RTX 4060 Ti | Ada |
 | `2805` | AD106 | GeForce RTX 4060 Ti 16GB | Ada |
+| `2820` | AD106 | GeForce RTX 4070 Laptop GPU | Ada |
+| `2838` | AD106 | RTX 3000 Ada Generation Laptop GPU | Ada |
+| `2860` | AD106 | GeForce RTX 4070 Laptop GPU | Ada |
 | `2882` | AD107 | GeForce RTX 4060 | Ada |
+| `28a0` | AD107 | GeForce RTX 4060 Laptop GPU | Ada |
+| `28a1` | AD107 | GeForce RTX 4050 Laptop GPU | Ada |
 | `28b0` | AD107 | RTX 2000 / 2000E Ada Generation | Ada |
+| `28b8` | AD107 | RTX 2000 Ada Laptop GPU | Ada |
+| `28b9` | AD107 | RTX 1000 Ada Generation Laptop GPU | Ada |
+| `28ba` | AD107 | RTX 500 Ada Generation Laptop GPU | Ada |
+| `28bb` | AD107 | RTX 500 Ada Generation Laptop GPU | Ada |
+| `28e0` | AD107 | GeForce RTX 4060 Laptop GPU | Ada |
+| `28e1` | AD107 | GeForce RTX 4050 Laptop GPU | Ada |
+| `28e3` | AD107 | GeForce RTX 3050 A Laptop GPU | Ada |
 
-The workstation rows (`24b0`, `2571`, `27b1`, `27b2`, `28b0`) carry the same hidden SR-IOV block as
-the GeForce cards of their generation and are handled the same way. The Ada rows are explained in
-[Ada](ada.md).
+The desktop workstation rows (`24b0`, `2571`, `27b1`, `27b2`, `28b0`) carry the same hidden SR-IOV block as the GeForce cards of their generation and are handled the same way.
+The laptop and embedded rows, including workstation parts, take the same path with added power guards; see [Laptop support](laptops.md).
+The Ada rows are explained in [Ada](ada.md).
 
 ## Capability positions per generation
 
@@ -141,7 +199,7 @@ The table lists their positions and the register bit that hides MSI-X.
 | Generation | SR-IOV | ARI | MSI-X | MSI-X hide bit |
 |---|---|---|---|---|
 | Ampere | hidden at `0xBCC` (TotalVFs 16, first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` | `0x41C` bit 29 |
-| Ada | hidden at `0xBCC` (TotalVFs 1 as most Ada cards report it, 16 on the RTX 2000 Ada; the host module's VF-count revision makes NVIDIA's driver report 4; first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` | `0x41C` bit 29 |
+| Ada | hidden at `0xBCC` (TotalVFs 1 as most Ada cards report it, 16 on the RTX 2000 / 2000E Ada Generation (`28b0`); the host module's VF-count revision makes NVIDIA's driver report 4; first VF offset 4, stride 1) | hidden at `0xC14` | `0xC8` | `0x41C` bit 29 |
 
 The VF count is a standard SR-IOV setting.
 Set it with `install --vfs N` or `vfs=N` in the config, from 1 up to the card's ceiling.
@@ -182,7 +240,6 @@ documentation does not state it.
 - Turing: NVIDIA does not support SR-IOV on Turing
   ([NVIDIA's list of supported platforms](https://docs.nvidia.com/vgpu/20.0/grid-vgpu-release-notes-red-hat-el-kvm/validated-platforms.html)).
 - Blackwell: see [Generations](#generations).
-- Laptop GPUs: not listed.
 - Other professional cards: they have NVIDIA's own vGPU support and are not in the device table, so
   no component presents, prepares or activates them. The rebuilt `nvidia.ko` still applies to them
   when they are bound to `nvidia`.

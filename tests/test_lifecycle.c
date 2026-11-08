@@ -582,8 +582,8 @@ static void test_cli_readonly(void)
 	      "status takes no --boot-display-release: %d\n%s", rc, out);
 	free(out);
 	rc = run_cli(&out, NULL, (const char *const[]){ "--help", NULL });
-	CHECK(rc == 0 && contains(out, "  doctor [--device BDF]... [--boot-display-release BDF]...\n"),
-	      "help lists doctor --boot-display-release:\n%s", out);
+	CHECK(rc == 0 && contains(out, "  doctor [--device BDF]... [--boot-display-release BDF]... [--hold-nvidia]\n"),
+	      "help lists doctor --boot-display-release and --hold-nvidia:\n%s", out);
 	free(out);
 
 	fixture("cli-prepared", gpu_with_audio, 0, "0/4", root, sizeof(root));
@@ -957,6 +957,8 @@ static void test_install_link_kept(void)
 }
 
 static char dkms_log[GS_PATH_MAX], dkms_scratch[GS_PATH_MAX];
+/* The root the step's old source trees are below and its install manifest (""/absent: an empty root). */
+static char dkms_root[GS_PATH_MAX], dkms_manifest[GS_PATH_MAX];
 static const char *dkms_fail; /* the dkms build that fails: "trial", "build" or NULL */
 static int dkms_systemctl_rc;
 
@@ -993,8 +995,8 @@ static int dkms_run(const char *const argv[])
 	return 0;
 }
 
-/* gs_dkms_step in a child with dkms_run; its exit status, output and command log. */
-static int run_dkms_step(int registered, char **out, char **log)
+/* gs_dkms_step in a child with dkms_run and the `dkms status` output status; its exit status, output and command log. */
+static int run_dkms_step(int registered, const char *status, char **out, char **log)
 {
 	int pipefd[2], rc;
 	pid_t pid;
@@ -1009,7 +1011,7 @@ static int run_dkms_step(int registered, char **out, char **log)
 		dup2(pipefd[1], 1);
 		dup2(pipefd[1], 2);
 		close(pipefd[0]);
-		rc = gs_dkms_step(dkms_run, registered, dkms_scratch);
+		rc = gs_dkms_step(dkms_run, registered, status, dkms_scratch, dkms_root, dkms_manifest);
 		fflush(stdout);
 		fflush(stderr);
 		_exit(rc);
@@ -1023,7 +1025,8 @@ static int run_dkms_step(int registered, char **out, char **log)
 /*
  * install's DKMS step. A reinstall of the same version builds the new tree in a scratch DKMS tree first:
  * when that fails, nothing is removed. Only after it succeeds is the registered module removed; a failure
- * after that disables the boot units and names what was removed and the way back.
+ * after that disables the boot units and names what was removed and the way back. An upgrade does the
+ * same with the other versions `dkms status` lists, so that no old version stays registered.
  */
 static void test_dkms_step(void)
 {
@@ -1040,17 +1043,20 @@ static void test_dkms_step(void)
 
 	gs_pathf(dkms_scratch, sizeof(dkms_scratch), "%s/dkms-scratch", tmp);
 	gs_pathf(dkms_log, sizeof(dkms_log), "%s/dkms.log", tmp);
+	/* No /usr/src below it and no manifest: the step's commands only. */
+	gs_pathf(dkms_root, sizeof(dkms_root), "%s/dkms-root-empty", tmp);
+	gs_pathf(dkms_manifest, sizeof(dkms_manifest), "%s/dkms-root-empty/installed-files", tmp);
 	gs_mkdir_p(dkms_scratch, 0755);
 	dkms_fail = NULL;
 	dkms_systemctl_rc = 0;
 
-	rc = run_dkms_step(0, &out, &log);
+	rc = run_dkms_step(0, NULL, &out, &log);
 	CHECK(rc == 0 && log && strcmp(log, real) == 0, "first install: add, build, install, no trial: %d\n%s\n%s", rc, out,
 	      log ? log : "");
 	free(out);
 	free(log);
 
-	rc = run_dkms_step(1, &out, &log);
+	rc = run_dkms_step(1, "geforce-sriov/" GS_VERSION ", 6.8.12-4-pve, x86_64: installed\n", &out, &log);
 	snprintf(want, sizeof(want), "%s%s%s", trial, removal, real);
 	CHECK(rc == 0 && log && strcmp(log, want) == 0,
 	      "reinstall: the trial build in a scratch tree, then remove, add, build, install: %d\n%s\n%s", rc, out,
@@ -1065,7 +1071,7 @@ static void test_dkms_step(void)
 	CHECK(d && !left, "reinstall: the scratch tree is removed");
 
 	dkms_fail = "trial";
-	rc = run_dkms_step(1, &out, &log);
+	rc = run_dkms_step(1, NULL, &out, &log);
 	CHECK(rc == GS_EXIT_FAIL && log && strcmp(log, trial) == 0 &&
 	      contains(out, "geforce-sriov: " GS_DKMS_NAME "/" GS_VERSION " does not build for the running kernel (DKMS's "
 			    "output is above). Nothing\nwas removed: the module installed earlier stays registered and loads "
@@ -1076,7 +1082,7 @@ static void test_dkms_step(void)
 	free(log);
 
 	dkms_fail = "build";
-	rc = run_dkms_step(1, &out, &log);
+	rc = run_dkms_step(1, NULL, &out, &log);
 	snprintf(want, sizeof(want), "%s%sdkms add " DKMS_MV "\ndkms build " DKMS_MV "\n%s", trial, removal, disable);
 	CHECK(rc == GS_EXIT_FAIL && log && strcmp(log, want) == 0 &&
 	      contains(out, "and `dkms remove " GS_DKMS_NAME "/" GS_VERSION " --all` had already removed the module installed "
@@ -1088,7 +1094,7 @@ static void test_dkms_step(void)
 	free(out);
 	free(log);
 	dkms_systemctl_rc = 1;
-	rc = run_dkms_step(1, &out, &log);
+	rc = run_dkms_step(1, NULL, &out, &log);
 	CHECK(rc == GS_EXIT_FAIL && contains(log, disable) &&
 	      contains(out, "Disabling " GS_UNIT_PREPARE " and " GS_UNIT_ACTIVATE " failed: the next boot's prepare fails to "
 			    "load the module unless you run `systemctl disable " GS_UNIT_PREPARE " " GS_UNIT_ACTIVATE "`.\n"
@@ -1098,7 +1104,7 @@ static void test_dkms_step(void)
 	free(log);
 	dkms_systemctl_rc = 0;
 
-	rc = run_dkms_step(0, &out, &log);
+	rc = run_dkms_step(0, NULL, &out, &log);
 	CHECK(rc == GS_EXIT_FAIL && !contains(log, "systemctl") && !contains(log, "--dkmstree") &&
 	      contains(out, "DKMS could not add/build/install " GS_DKMS_NAME "/" GS_VERSION " for the running kernel; files are "
 			    "installed, `geforce-sriov uninstall` removes them\n"),
@@ -1106,7 +1112,220 @@ static void test_dkms_step(void)
 	free(out);
 	free(log);
 	dkms_fail = NULL;
+
+	/* An upgrade: 0.2.0 registered for two kernels is removed once, after the trial build, before the add. */
+	rc = run_dkms_step(0, "geforce-sriov/0.2.0, 6.8.12-4-pve, x86_64: installed\n"
+			      "geforce-sriov/0.2.0, 6.8.12-9-pve, x86_64: installed\n", &out, &log);
+	snprintf(want, sizeof(want), "%sdkms remove " GS_DKMS_NAME "/0.2.0 --all\n%s", trial, real);
+	CHECK(rc == 0 && log && strcmp(log, want) == 0 &&
+	      contains(out, "\n== " GS_DKMS_NAME "/0.2.0 is registered: a trial build of " GS_DKMS_NAME "/" GS_VERSION " in "),
+	      "upgrade: the trial build, then the old version removed, then add, build, install: %d\n%s\n%s", rc, out,
+	      log ? log : "");
+	free(out);
+	free(log);
+
+	/* The full `dkms status` text of a host that has 0.2.0 installed (captured on a DKMS 3.4.3 host): only 0.2.0. */
+	rc = run_dkms_step(0, "arctic-fan-controller/1.0, 7.0.14-16-pve, x86_64: installed\n"
+			      "geforce-sriov/0.2.0, 7.0.14-16-pve, x86_64: installed\n"
+			      "gpu-unlock/1.0.0, 7.0.14-11-pve, x86_64: installed\n"
+			      "gpu-unlock/1.0.0, 7.0.14-16-pve, x86_64: installed\n"
+			      "nv-sriov-cap/1.0, 7.0.14-16-pve, x86_64: installed\n"
+			      "nvidia/580.159.01, 7.0.14-16-pve, x86_64: installed (Differences between built and installed modules)\n",
+		      &out, &log);
+	snprintf(want, sizeof(want), "%sdkms remove " GS_DKMS_NAME "/0.2.0 --all\n%s", trial, real);
+	CHECK(rc == 0 && log && strcmp(log, want) == 0,
+	      "real dkms status text: only the old geforce-sriov version is removed: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+
+	/* DKMS 2 and 3 lines, an added-only version, this version too; other modules and other lines ignored. */
+	rc = run_dkms_step(1, "geforce-sriov, 0.1.9, 6.8.12-4-pve, x86_64: installed\n"
+			      "geforce-sriov/0.2.0: added\n"
+			      "geforce-sriov-extra/9.9: added\n"
+			      "nvidia/580.159.01, 6.8.12-4-pve, x86_64: installed\n"
+			      "Warning: geforce-sriov/0.0.1: unknown\n"
+			      "geforce-sriov/" GS_VERSION ", 6.8.12-4-pve, x86_64: installed", &out, &log);
+	snprintf(want, sizeof(want), "%sdkms remove " GS_DKMS_NAME "/0.1.9 --all\ndkms remove " GS_DKMS_NAME
+		 "/0.2.0 --all\n%s%s", trial, removal, real);
+	CHECK(rc == 0 && log && strcmp(log, want) == 0,
+	      "upgrade over several versions: each removed once, this one last: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+
+	dkms_fail = "trial";
+	rc = run_dkms_step(0, "geforce-sriov/0.2.0, 6.8.12-4-pve, x86_64: installed\n", &out, &log);
+	CHECK(rc == GS_EXIT_FAIL && log && strcmp(log, trial) == 0 && contains(out, "Nothing\nwas removed"),
+	      "upgrade, the trial fails: the old version stays: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+
+	dkms_fail = "build";
+	rc = run_dkms_step(0, "geforce-sriov/0.2.0, 6.8.12-4-pve, x86_64: installed\n", &out, &log);
+	snprintf(want, sizeof(want), "%sdkms remove " GS_DKMS_NAME "/0.2.0 --all\ndkms add " DKMS_MV "\ndkms build " DKMS_MV
+		 "\n%s", trial, disable);
+	CHECK(rc == GS_EXIT_FAIL && log && strcmp(log, want) == 0 &&
+	      contains(out, "and `dkms remove " GS_DKMS_NAME "/0.2.0 --all` had already removed the module installed "
+			    "earlier.\nSo that the next boot does not try to load it, "),
+	      "upgrade, the real build fails after the removal: units disabled, the removal named: %d\n%s\n%s", rc, out,
+	      log ? log : "");
+	free(out);
+	free(log);
+	dkms_fail = NULL;
+
+	/*
+	 * Nine other versions (the step removes eight; the ninth built for two kernels), one too long, two with a
+	 * character DKMS names never have: one warning per version with the command, one for the names not echoed.
+	 */
+	{
+		char status[4096] = "", ver[96];
+
+		for (int k = 1; k <= 9; k++) {
+			snprintf(ver, sizeof(ver), "geforce-sriov/0.1.%d, 6.8.12-4-pve, x86_64: installed\n", k);
+			strcat(status, ver);
+		}
+		strcat(status, "geforce-sriov/0.1.9, 6.8.12-9-pve, x86_64: installed\n");
+		strcat(status, "geforce-sriov/1.2.3456789012345678901234567890123456789012345678901234567890123456789: added\n");
+		strcat(status, "geforce-sriov/1.0$x: added\n");
+		strcat(status, "geforce-sriov/1.0\x1b[31m: added\n");
+		rc = run_dkms_step(0, status, &out, &log);
+		CHECK(rc == 0 && count_of(log, "dkms remove ") == 8 && !contains(log, "/0.1.9 ") &&
+		      count_of(out, "geforce-sriov: warning: DKMS also holds geforce-sriov version 0.1.9, which install does not "
+				    "remove; remove it yourself: dkms remove geforce-sriov/0.1.9 --all\n") == 1 &&
+		      contains(out, "remove it yourself: dkms remove geforce-sriov/1.2.34567890123456789012345678901234567890123456"
+				    "78901234567890123456789 --all\n") &&
+		      count_of(out, "geforce-sriov: warning: DKMS also holds a geforce-sriov version whose name install does not "
+				    "accept, so install does not remove it; find it with `dkms status -m geforce-sriov` and remove it "
+				    "with `dkms remove geforce-sriov/<version> --all`\n") == 1 &&
+		      !contains(out, "$x") && !contains(out, "\x1b"),
+		      "versions install cannot remove: one warning each, unaccepted names not echoed: %d\n%s\n%s", rc, out,
+		      log ? log : "");
+		free(out);
+		free(log);
+	}
 #undef DKMS_MV
+}
+
+static void cleanup(const char *path);
+
+/* One file of an old source tree below dkms_root, with its manifest line appended to lines. */
+static void old_tree_file(const char *path, const char *text, char *lines, size_t len)
+{
+	char p[GS_PATH_MAX], sha[65];
+	size_t at = strlen(lines);
+
+	gs_pathf(p, sizeof(p), "%s%s", dkms_root, path);
+	writef(p, "%s", text);
+	gs_sha256_buf(text, strlen(text), sha);
+	snprintf(lines + at, len - at, "f %s %s\n", sha, path);
+}
+
+/*
+ * A host after the 0.2.0 install: its source tree /usr/src/geforce-sriov-0.2.0 (dir at that path below
+ * dkms_root; a link to it when link is set), this version's tree and the CLI, all in the manifest.
+ */
+static void old_tree_host(const char *name, int link)
+{
+	char lines[8192] = "", dir[GS_PATH_MAX], p[GS_PATH_MAX];
+	const char *old = "/usr/src/" GS_DKMS_NAME "-0.2.0";
+
+	gs_pathf(dkms_root, sizeof(dkms_root), "%s/%s", tmp, name);
+	cleanup(dkms_root);
+	gs_pathf(dkms_manifest, sizeof(dkms_manifest), "%s" GS_MANIFEST, dkms_root);
+	gs_pathf(dir, sizeof(dir), "%s%s", dkms_root, old);
+	snprintf(lines, sizeof(lines), "d - /usr/src/" GS_DKMS_NAME "-0.2.0\nd - /usr/src/" GS_DKMS_NAME "-0.2.0/include\n");
+	old_tree_file("/usr/bin/geforce-sriov", "cli\n", lines, sizeof(lines));
+	old_tree_file("/usr/src/" GS_DKMS_NAME "-0.2.0/dkms.conf", "PACKAGE_VERSION=\"0.2.0\"\n", lines, sizeof(lines));
+	old_tree_file("/usr/src/" GS_DKMS_NAME "-0.2.0/geforce_sriov.c", "/* 0.2.0 */\n", lines, sizeof(lines));
+	old_tree_file("/usr/src/" GS_DKMS_NAME "-0.2.0/include/gs_devices.h", "/* 0.2.0 table */\n", lines,
+		      sizeof(lines));
+	old_tree_file("/usr/src/" GS_DKMS_NAME "-" GS_VERSION "/dkms.conf", "PACKAGE_VERSION=\"" GS_VERSION "\"\n", lines,
+		      sizeof(lines));
+	writef(dkms_manifest, "%s", lines);
+	if (link) {
+		gs_pathf(p, sizeof(p), "%s/elsewhere", dkms_root);
+		if (rename(dir, p))
+			die(p);
+		link_to(p, dir);
+	}
+}
+
+/*
+ * An upgrade's old source tree /usr/src/geforce-sriov-<old>: removed once this version is installed,
+ * kept when the install fails, when it holds a file the manifest does not record, or when it is a link.
+ */
+static void test_dkms_old_tree(void)
+{
+	static const char status[] = "geforce-sriov/0.2.0, 6.8.12-4-pve, x86_64: installed\n";
+	char old[GS_PATH_MAX], want[2 * GS_PATH_MAX], *out, *log, *before, *after;
+	int rc;
+
+	dkms_fail = NULL;
+	dkms_systemctl_rc = 0;
+
+	/* Installed: the old tree and its manifest entries go; one line says so. */
+	old_tree_host("dkms-old-removed", 0);
+	gs_pathf(old, sizeof(old), "%s/usr/src/" GS_DKMS_NAME "-0.2.0", dkms_root);
+	rc = run_dkms_step(0, status, &out, &log);
+	after = slurp(dkms_manifest);
+	snprintf(want, sizeof(want), "removed %s, the source of " GS_DKMS_NAME "/0.2.0, which DKMS no longer holds\n", old);
+	CHECK(rc == 0 && contains(out, want) && count_of(out, "removed ") == 1 && !gs_exists(old) &&
+	      !contains(after, "-0.2.0") && contains(after, " /usr/bin/geforce-sriov\n") &&
+	      contains(after, " /usr/src/" GS_DKMS_NAME "-" GS_VERSION "/dkms.conf\n"),
+	      "old tree after a successful upgrade: removed, its entries dropped: %d\n%s\n%s", rc, out, after ? after : "");
+	free(out);
+	free(log);
+	free(after);
+
+	/* The new version fails to build after the old one left DKMS: the old tree and the manifest stay. */
+	old_tree_host("dkms-old-failed", 0);
+	gs_pathf(old, sizeof(old), "%s/usr/src/" GS_DKMS_NAME "-0.2.0", dkms_root);
+	before = slurp(dkms_manifest);
+	dkms_fail = "build";
+	rc = run_dkms_step(0, status, &out, &log);
+	dkms_fail = NULL;
+	after = slurp(dkms_manifest);
+	CHECK(rc == GS_EXIT_FAIL && contains(log, "dkms remove " GS_DKMS_NAME "/0.2.0 --all\n") && gs_exists(old) &&
+	      !contains(out, "removed /") && before && after && strcmp(before, after) == 0,
+	      "old tree, the install fails: kept, the manifest unchanged: %d\n%s", rc, out);
+	free(out);
+	free(log);
+	free(before);
+	free(after);
+
+	/* A file the manifest does not record: the whole tree stays, a warning, the install succeeds. */
+	old_tree_host("dkms-old-foreign", 0);
+	gs_pathf(old, sizeof(old), "%s/usr/src/" GS_DKMS_NAME "-0.2.0", dkms_root);
+	gs_pathf(want, sizeof(want), "%s/include/notes.txt", old);
+	writef(want, "mine\n");
+	before = slurp(dkms_manifest);
+	rc = run_dkms_step(0, status, &out, &log);
+	after = slurp(dkms_manifest);
+	{
+		char msg[4 * GS_PATH_MAX];
+
+		snprintf(msg, sizeof(msg), "geforce-sriov: warning: kept %s: %s was not installed by geforce-sriov\n", old, want);
+		CHECK(rc == 0 && gs_exists(want) && contains(out, msg) && !contains(out, "removed /") && before && after &&
+		      strcmp(before, after) == 0, "old tree with a foreign file: kept whole, a warning only: %d\n%s", rc, out);
+	}
+	gs_pathf(want, sizeof(want), "%s/dkms.conf", old);
+	CHECK(gs_exists(want), "old tree with a foreign file: its own files stay too");
+	free(out);
+	free(log);
+	free(before);
+	free(after);
+
+	/* A link in the tree's place, to a copy of the tree: neither the link nor its target is touched. */
+	old_tree_host("dkms-old-link", 1);
+	gs_pathf(old, sizeof(old), "%s/usr/src/" GS_DKMS_NAME "-0.2.0", dkms_root);
+	rc = run_dkms_step(0, status, &out, &log);
+	snprintf(want, sizeof(want), "geforce-sriov: warning: kept %s: it is a symbolic link, not the directory install "
+		 "wrote\n", old);
+	CHECK(rc == 0 && contains(out, want) && !contains(out, "removed /") && gs_exists(old),
+	      "old tree replaced by a link: refused, a warning only: %d\n%s", rc, out);
+	gs_pathf(want, sizeof(want), "%s/elsewhere/include/gs_devices.h", dkms_root);
+	CHECK(gs_exists(want), "old tree replaced by a link: the target's files stay");
+	free(out);
+	free(log);
 }
 
 /* The "N failure(s), M warning(s)" tally that ends doctor's output; -1 when absent. */
@@ -1829,6 +2048,34 @@ static void card_config(const char *root, const struct fx_topo *k, int msix, siz
 		die(p);
 }
 
+/*
+ * A laptop GPU's 4 KiB config space at k->pf: 10de:device; capabilities 0x60 power management (D0) -> 0x68 MSI ->
+ * 0x78 PCI Express -> 0xc8 MSI-X, linked when msix; 0x41C bit 29 set while MSI-X is hidden; the hidden SR-IOV
+ * header at 0xBCC, with VF Enable as vfe. alive 0: all-ones, as a powered-off (D3cold) card reads.
+ */
+static void laptop_config(const char *root, const struct fx_topo *k, unsigned int device, int alive, int msix, int vfe)
+{
+	unsigned char cfg[4096];
+	char p[GS_PATH_MAX];
+
+	memset(cfg, alive ? 0 : 0xff, sizeof(cfg));
+	if (alive) {
+		cfg[0] = 0xde, cfg[1] = 0x10, cfg[2] = (unsigned char)device, cfg[3] = (unsigned char)(device >> 8);
+		cfg[0x06] = 0x10;
+		cfg[0x34] = 0x60;
+		cfg[0x60] = 0x01, cfg[0x61] = 0x68;
+		cfg[0x68] = 0x05, cfg[0x69] = 0x78;
+		cfg[0x78] = 0x10, cfg[0x79] = msix ? 0xc8 : 0x00;
+		cfg[0xc8] = 0x11;
+		cfg[0x41c + 3] = msix ? 0x00 : 0x20;
+		cfg[0xbcc] = 0x10, cfg[0xbce] = 0x41, cfg[0xbcf] = 0xc1;
+		cfg[0xbd4] = vfe ? 1 : 0;
+	}
+	gs_pathf(p, sizeof(p), "%s/devices/%s/%s/config", root, k->bridge_path, k->pf);
+	if (gs_write_file_atomic(p, cfg, sizeof(cfg), 0644))
+		die(p);
+}
+
 enum { FW_BOUND = 1, FW_PLATFORM = 2, FW_EFI = 4 };
 
 /* The firmware framebuffer sysfb creates, its fb0/card0, and fbcon, as on a host booted on this card. */
@@ -1933,6 +2180,10 @@ static struct {
 	int systemctl_rc;      /* exit status of every systemctl command */
 	int state_not_dir;     /* the nvidia bind replaces the state directory with a file: the guard's lstat fails, ENOTDIR */
 	const char *types;     /* every VF's creatable_vgpu_types after the re-probe; NULL: its generation's list */
+	const char *stays_suspended; /* a write of on to a path ending in this leaves runtime_status as it is */
+	int cold;              /* 0000:03:00.0 reads all-ones (config and vendor) until on is written to its power/control */
+	int bind_auto;         /* NVIDIA's probe sets the PF it binds to power/control=auto (runtime D3 on a notebook) */
+	int bridge_auto_at_load; /* loading the module puts bridge 0000:00:02.0 back to auto (a udev or TLP rule) */
 } sim;
 
 /*
@@ -2035,9 +2286,18 @@ static int sim_write(const char *path, const char *value)
 		return -EIO;
 	if (ends_with(r, "/power/control")) {
 		writef(path, "%s\n", value);
-		if (strcmp(value, "on") == 0) {
+		if (strcmp(value, "on") == 0 && !(sim.stays_suspended && ends_with(r, sim.stays_suspended))) {
 			gs_pathf(p, sizeof(p), "%.*s/runtime_status", (int)(strlen(path) - 8), path);
 			writef(p, "active\n");
+			if (sim.cold && strcmp(r, "bus/pci/devices/0000:03:00.0/power/control") == 0) {
+				unsigned int device = 0;
+
+				gs_pathf(p, sizeof(p), "%s/bus/pci/devices/0000:03:00.0/device", sim.root);
+				gs_read_hex(p, &device);
+				gs_pathf(p, sizeof(p), "%s/bus/pci/devices/0000:03:00.0/vendor", sim.root);
+				writef(p, "0x10de\n");
+				laptop_config(sim.root, &topo_default, device, 1, 0, 0);
+			}
 		}
 		return 0;
 	}
@@ -2068,6 +2328,10 @@ static int sim_write(const char *path, const char *value)
 			return -errno;
 		if (strcmp(r, "bus/pci/drivers/nvidia/bind") == 0) {
 			sim_register_vfs(value);
+			if (sim.bind_auto) {
+				gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/power/control", sim.root, value);
+				writef(p, "auto\n");
+			}
 			if (sim.state_not_dir) {
 				gs_pathf(p, sizeof(p), "%s.moved", sim.state);
 				if (rename(sim.state, p))
@@ -2127,6 +2391,10 @@ static int sim_write(const char *path, const char *value)
 				die("sim rescan");
 			gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s", sim.root, names[i]);
 			link_to(orig, p);
+			/* A rescan makes a new device: D3cold is allowed again. */
+			gs_pathf(p, sizeof(p), "%s/d3cold_allowed", orig);
+			if (gs_exists(p))
+				writef(p, "1\n");
 			gs_pathf(p, sizeof(p), "%s/simple-framebuffer.0", orig);
 			cleanup(p);
 			if (ends_with(names[i], ".0") && contains(bdfs, names[i]) &&
@@ -2169,6 +2437,10 @@ static int sim_run(const char *const argv[])
 	}
 	if (strcmp(argv[0], "modprobe") != 0 || sim.modprobe_fail)
 		return 1;
+	if (sim.bridge_auto_at_load) {
+		gs_pathf(p, sizeof(p), "%s/devices/pci0000:00/0000:00:02.0/power/control", sim.root);
+		writef(p, "auto\n");
+	}
 	/* Like the module: vfs defaults to GS_DEFAULT_VFS when modprobe does not pass it. */
 	gs_pathf(p, sizeof(p), "%s/module/%s/parameters/vfs", sim.root, GS_MODULE_NAME);
 	writef(p, "%u\n", GS_DEFAULT_VFS);
@@ -2334,11 +2606,36 @@ static void test_release_config(void)
 	indent "geforce-sriov prepare --release-console=" bdf "\n" indent "modprobe --ignore-install nvidia\n" \
 	indent "geforce-sriov activate\n" indent "geforce-sriov check\n"
 #define RELEASE_STEPS_04(indent) RELEASE_STEPS("0000:04:00.0", indent)
-#define RELEASE_HOLD_04 \
-	"/etc/modprobe.d/nvidia-manual-load.conf containing\n" \
+/* gs_hold_notice: its common part, then the end when install writes the file (ASK) and when the user does (HAND). */
+#define HOLD_RULE "========================================================================\n"
+#define HOLD_NOTICE \
+	HOLD_RULE \
+	"IMPORTANT: This GPU is also used for the host display.\n" \
+	"\n" \
+	"When setup releases this GPU's Linux console, the monitor may go blank\n" \
+	"or freeze on the last frame. You will have no local text console until\n" \
+	"the next boot.\n" \
+	"\n" \
+	"Set up and test SSH or serial console access before proceeding.\n" \
+	"You will need it to manage the host after setup.\n" \
+	"\n" \
+	"This GPU requires manual setup after every boot.\n" \
+	"To keep NVIDIA's driver from loading before setup, create:\n" \
+	"\n" \
+	"  /etc/modprobe.d/nvidia-manual-load.conf\n" \
+	"\n" \
+	"With the following contents:\n" \
+	"\n" \
 	"  blacklist nvidia\n" \
 	"  install nvidia /bin/false\n" \
-	"and keep nvidia-persistenced, nvidia-vgpu-mgr and similar services disabled.\n" \
+	"\n" \
+	"Without this file, NVIDIA's driver may load first and cause setup to fail.\n" \
+	"If that happens, another cold power cycle is required before you retry.\n"
+#define HOLD_NOTICE_ASK HOLD_NOTICE "To revert, run `geforce-sriov uninstall`.\n" HOLD_RULE
+#define HOLD_NOTICE_HAND HOLD_NOTICE "To revert, delete the file.\n" HOLD_RULE
+#define RELEASE_HOLD_04 \
+	HOLD_NOTICE_HAND \
+	"Keep nvidia-persistenced, nvidia-vgpu-mgr and similar services disabled.\n" \
 	GS_RELEASE_STEPS_LEAD "\n" RELEASE_STEPS_04("  ") \
 	"  or run geforce-sriov setup, which asks, then runs them\n" \
 	"Details: docs/installation.md#boot-display-card\n"
@@ -2383,13 +2680,19 @@ static void test_release_cli(void)
 							 "0000:03:00.0", "--device", "0000:04:00.0",
 							 "--boot-display-release", "0000:04:00.0", NULL });
 	CHECK(rc == 0 && count_of(out, RELEASE_HOLD_04) == 1 && pos_of(out, RELEASE_HOLD_04) > pos_of(out, "staged below ") &&
+	      count_of(out, "IMPORTANT:") == 1 &&
 	      count_of(out, "Console release:") == 1 && pos_of(out, "Console release:") < pos_of(out, "staged below "),
-	      "staged grant: the hold and the commands after each boot once, in the closing block; the console note once, "
-	      "before it: %d\n%s", rc, out);
+	      "staged grant: the hold notice and the commands after each boot once, in the closing block; the console note "
+	      "once, before it: %d\n%s", rc, out);
 	/* The grant is recorded at install; the release, and what it stops, come after the power cycle. */
-	CHECK(contains(out, "Console release: granted; nothing is released now. After the power cycle, the commands\n"
-			    "below or `geforce-sriov setup`, which asks again first, release the console. That stops the\n"
-			    "local display on that GPU until the following boot, and the monitor may keep the last frame\n") &&
+	CHECK(contains(out, "Console release: granted; nothing is released now.\n"
+			    "After the power cycle, run the commands below or `geforce-sriov setup`\n"
+			    "to release the console. `geforce-sriov setup` asks again before releasing it.\n"
+			    "The monitor may go blank or freeze on the last frame. You will have no\n"
+			    "local text console until the following boot.\n"
+			    "Set up and test SSH or a serial console before you power cycle.\n"
+			    "Without that access, you cannot see the result or fix a problem.\n"
+			    "See docs/installation.md#what-the-opt-in-changes.\n") &&
 	      !contains(out, "stays detached until the next boot"),
 	      "staged grant: the note says nothing is released now:\n%s", out);
 	free(out);
@@ -2400,9 +2703,18 @@ static void test_release_cli(void)
 	CHECK(rc == 0 && count_of(out, RELEASE_HOLD_04) == 1 && !contains(out, "Console release:"),
 	      "staged grant after setup's question: no console note: %d\n%s", rc, out);
 	free(out);
+	/* setup prints the hold notice itself after install: install leaves it out and keeps the rest. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", "--device", "0000:04:00.0",
+							 "--boot-display-release", "0000:04:00.0", "--hold-note-shown", NULL });
+	CHECK(rc == 0 && !contains(out, "IMPORTANT:") && !contains(out, "echo ") &&
+	      contains(out, "\nKeep nvidia-persistenced, nvidia-vgpu-mgr and similar services disabled.\n"
+			    GS_RELEASE_STEPS_LEAD "\n" RELEASE_STEPS_04("  ")),
+	      "staged grant, --hold-note-shown: no hold notice, the rest kept: %d\n%s", rc, out);
+	free(out);
 	/* The staged tree already holds nvidia back: the closing block names its file, as on the target host, instead of the one to create. */
 	{
-		static const char want[] = "nvidia is already held back at boot by /etc/modprobe.d/nvidia-manual-load.conf.\n"
+		static const char want[] = "nvidia is held back at boot by /etc/modprobe.d/nvidia-manual-load.conf.\n"
 					   GS_RELEASE_STEPS_LEAD "\n" RELEASE_STEPS_04("  ");
 		char hold[GS_PATH_MAX];
 
@@ -2411,7 +2723,7 @@ static void test_release_cli(void)
 		rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
 								 "0000:03:00.0", "--device", "0000:04:00.0",
 								 "--boot-display-release", "0000:04:00.0", NULL });
-		CHECK(rc == 0 && count_of(out, want) == 1 && !contains(out, hold) && !contains(out, "create\n") &&
+		CHECK(rc == 0 && count_of(out, want) == 1 && !contains(out, hold) && !contains(out, "IMPORTANT:") &&
 		      !contains(out, "nvidia-persistenced"),
 		      "staged grant with the hold in place: the file named once, the commands kept: %d\n%s", rc, out);
 		free(out);
@@ -2443,6 +2755,99 @@ static void test_release_cli(void)
 	CHECK(rc == 0 && contains(text, "bdfs=0000:03:00.0,0000:04:00.0\n") && !contains(text, "boot_display_release"),
 	      "--device without the flag drops the grant: %s", text ? text : "(missing)");
 	free(text);
+}
+
+/* What was written to the temporary file f, which is closed. */
+static char *stream_text(FILE *f)
+{
+	long n;
+	char *s;
+
+	if (fflush(f) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET))
+		die("tmpfile");
+	s = malloc((size_t)n + 1);
+	if (!s || fread(s, 1, (size_t)n, f) != (size_t)n)
+		die("tmpfile");
+	s[n] = '\0';
+	fclose(f);
+	return s;
+}
+
+/* An environment variable set to value, or unset when value is NULL. */
+static void set_env(const char *name, const char *value)
+{
+	if (value ? setenv(name, value, 1) : unsetenv(name))
+		die(name);
+}
+
+/* The hold notice is red on a terminal only: escapes around the unchanged text, never in a file or pipe. */
+static void test_hold_notice_color(void)
+{
+	static const char red[] = "\033[31m", reset[] = "\033[0m";
+	const char *have_term = getenv("TERM"), *have_no_color = getenv("NO_COLOR");
+	char *term = have_term ? strdup(have_term) : NULL, *no_color = have_no_color ? strdup(have_no_color) : NULL;
+	char head[sizeof(red)] = "", *s;
+	size_t n = 0;
+	FILE *f, *tty = NULL;
+	int m, fd = -1;
+
+	if ((have_term && !term) || (have_no_color && !no_color))
+		die("strdup");
+	set_env("TERM", "xterm");
+	set_env("NO_COLOR", NULL);
+	for (int by_hand = 0; by_hand < 2; by_hand++) {
+		if (!(f = tmpfile()))
+			die("tmpfile");
+		CHECK(gs_color(f) == 0, "a file is not a terminal");
+		gs_hold_notice(f, by_hand);
+		s = stream_text(f);
+		CHECK(strcmp(s, by_hand ? HOLD_NOTICE_HAND : HOLD_NOTICE_ASK) == 0, "not a terminal: plain:\n%s", s);
+		free(s);
+	}
+
+	if (!(f = tmpfile()))
+		die("tmpfile");
+	gs_hold_notice_color(f, 1, 1);
+	s = stream_text(f);
+	n = strlen(s);
+	CHECK(n == strlen(red) + strlen(HOLD_NOTICE_HAND) + strlen(reset) && strncmp(s, red, strlen(red)) == 0 &&
+	      strncmp(s + strlen(red), HOLD_NOTICE_HAND, strlen(HOLD_NOTICE_HAND)) == 0 &&
+	      strcmp(s + n - strlen(reset), reset) == 0,
+	      "colour forced: red, the unchanged text, the reset:\n%s", s);
+	free(s);
+
+	/* The stream written to decides, not standard output: a pseudo-terminal takes colour. */
+	m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0 || grantpt(m) || unlockpt(m) || !ptsname(m) || (fd = open(ptsname(m), O_RDWR | O_NOCTTY)) < 0 ||
+	    !(tty = fdopen(fd, "w")))
+		die("pseudo-terminal");
+	CHECK(gs_color(tty) == 1, "a terminal, TERM=xterm, NO_COLOR unset: colour");
+	set_env("NO_COLOR", "");
+	CHECK(gs_color(tty) == 1, "NO_COLOR empty: colour");
+	set_env("NO_COLOR", "1");
+	CHECK(gs_color(tty) == 0, "NO_COLOR set: no colour");
+	set_env("NO_COLOR", NULL);
+	set_env("TERM", "dumb");
+	CHECK(gs_color(tty) == 0, "TERM=dumb: no colour");
+	set_env("TERM", "xterm");
+	gs_hold_notice(tty, 0);
+	fflush(tty);
+	n = 0;
+	while (n < sizeof(red) - 1) {
+		ssize_t got = read(m, head + n, sizeof(red) - 1 - n);
+
+		if (got <= 0)
+			die("pseudo-terminal read");
+		n += (size_t)got;
+	}
+	CHECK(strcmp(head, red) == 0, "the notice on a terminal starts red");
+	fclose(tty);
+	close(m);
+
+	set_env("TERM", term);
+	set_env("NO_COLOR", no_color);
+	free(term);
+	free(no_color);
 }
 
 static void test_display_inspect(void)
@@ -2732,6 +3137,605 @@ static void test_prepare_msix_message(void)
 	rc = run_prepare(&cfg, 1, NULL, &out);
 	CHECK(rc == 0 && !contains(out, "MSI-X"), "64-byte config: no MSI-X line: %d\n%s", rc, out);
 	free(out);
+}
+
+static void sim_writef(const char *rel, const char *text);
+
+#define PF_DEV "devices/pci0000:00/0000:00:02.0/0000:03:00.0/"
+#define BRIDGE_DEV "devices/pci0000:00/0000:00:02.0/"
+#define BRIDGE_CTL "0000:00:02.0/power/control"
+#define PF_CTL "W bus/pci/devices/0000:03:00.0/power/control"
+
+/* doctor on the simulated host with this config, modprobe.d and unit directory. */
+static int run_doctor_sim(const char *conf, const char *mpd, const char *units, char **out)
+{
+	struct gs_diag_opts d;
+
+	memset(&d, 0, sizeof(d));
+	d.sysroot = sim.root;
+	d.config_path = conf;
+	d.modprobe_dir = mpd;
+	d.unit_dir = units;
+	d.run_dir = sim.run;
+	return run_diag(gs_cmd_doctor, &d, out);
+}
+
+/* The PF's power/control, d3cold_allowed and the bridge's power/control read back as before doctor. */
+static int laptop_power_untouched(const char *pc, const char *d3, const char *bridge)
+{
+	char *a = sim_text(PF_DEV "power/control"), *b = sim_text(PF_DEV "d3cold_allowed"), *c = sim_text(BRIDGE_DEV "power/control");
+	int same = a && b && c && strcmp(a, pc) == 0 && strcmp(b, d3) == 0 && strcmp(c, bridge) == 0;
+
+	free(a);
+	free(b);
+	free(c);
+	return same;
+}
+
+/*
+ * Desktop rows. A PF whose runtime_status is absent or active is left alone: nothing written to it, no new line, the
+ * bridge given back after the rescan as before. A suspended one is woken and checked by the config read before
+ * anything else, and its bridge gets its old setting back; one that does not come back is refused, all given back.
+ */
+static void test_prepare_power_state(void)
+{
+	static const char ctl[] = "W bus/pci/devices/0000:03:00.0/power/control";
+	char root[GS_PATH_MAX], *out, *log, *text;
+	struct gs_config cfg;
+	long bon, pon, bback;
+	int rc;
+
+	cfg_of(&cfg, "bdfs=0000:03:00.0\n");
+
+	/* No runtime_status file: nothing written to the PF, nothing said, the bridge restored after the rescan. */
+	two_cards("prep-pm-absent", 0, -1, root, sizeof(root));
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == 0 && !contains(log, ctl) && !contains(log, "d3cold") && !contains(out, "runtime_status") &&
+	      !contains(out, "laptop") && pos_of(log, BRIDGE_CTL " auto\n") > pos_of(log, "/rescan 1\n") &&
+	      contains(log, "R modprobe"), "desktop, runtime_status absent: as before: %d\n%s\n%s", rc, out, log);
+	free(out);
+	free(log);
+
+	/* active: the same. */
+	two_cards("prep-pm-active", 0, -1, root, sizeof(root));
+	sim_writef(PF_DEV "power/control", "auto\n");
+	sim_writef(PF_DEV "power/runtime_status", "active\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == 0 && !contains(log, ctl) && !contains(log, "d3cold") && !contains(out, "runtime_status") &&
+	      !contains(out, "laptop") && pos_of(log, BRIDGE_CTL " auto\n") > pos_of(log, "/rescan 1\n"),
+	      "desktop, runtime_status active: as before: %d\n%s\n%s", rc, out, log);
+	free(out);
+	free(log);
+
+	/* suspended: bridge, then the PF, then the config read (10de:2206 in D0), the bridge given back, then the module. */
+	two_cards("prep-pm-wakes", 0, -1, root, sizeof(root));
+	card_config(root, &topo_default, 1, 256);
+	sim_writef(PF_DEV "power/control", "auto\n");
+	sim_writef(PF_DEV "power/runtime_status", "suspended\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	text = sim_text(PF_DEV "power/control");
+	bon = pos_of(log, BRIDGE_CTL " on\n");
+	pon = pos_of(log, ctl);
+	bback = pos_of(log, BRIDGE_CTL " auto\n");
+	CHECK(rc == 0 &&
+	      contains(out, "0000:03:00.0: was runtime_status=suspended: power/control auto -> on, config reads 10de:2206 in D0\n") &&
+	      bon >= 0 && bon < pon && pon < bback && bback < pos_of(log, "R modprobe") && !contains(log, "d3cold") &&
+	      contains(log, "W bus/pci/devices/0000:03:00.0/remove 1") && text && strcmp(text, "on\n") == 0,
+	      "desktop, suspended: woken and checked, its bridge given back, then prepared: %d\n%s\n%s", rc, out, log);
+	free(out);
+	free(log);
+	free(text);
+
+	/* suspended and never back (all-ones config): refused before the module, everything given back. */
+	two_cards("prep-pm-stays", 0, -1, root, sizeof(root));
+	laptop_config(root, &topo_default, 0x2206, 0, 0, 0);
+	sim_writef(PF_DEV "power/control", "auto\n");
+	sim_writef(PF_DEV "power/runtime_status", "suspended\n");
+	sim.stays_suspended = "0000:03:00.0/power/control";
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	text = sim_text(PF_DEV "power/control");
+	CHECK(rc == GS_EXIT_REFUSED &&
+	      contains(out, "geforce-sriov: refused, nothing changed: 0000:03:00.0 is powered down (runtime_status was "
+			    "suspended) and did not come back within 5 s of power/control=on: its config space reads ffff:ffff, "
+			    "not 10de:2206 (runtime_status suspended). Switch the laptop to its discrete GPU (dGPU or discrete "
+			    "mode in the firmware setup), or stop whatever powers the GPU off (for example bbswitch), then run "
+			    "prepare again\n") &&
+	      pos_of(log, BRIDGE_CTL " on\n") < pos_of(log, PF_CTL " on\n") &&
+	      pos_of(log, PF_CTL " on\n") < pos_of(log, PF_CTL " auto\n") &&
+	      pos_of(log, PF_CTL " auto\n") < pos_of(log, BRIDGE_CTL " auto\n") && !contains(log, "R modprobe") &&
+	      !contains(log, "/remove") && text && strcmp(text, "auto\n") == 0 && !sim_exists("state/" GS_ATTEMPT_NAME) &&
+	      !sim_exists("run/" GS_PREPARED_NAME),
+	      "desktop, suspended, never back: refused, all given back: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+	free(text);
+}
+
+static const struct fx_fn laptop_gpu[] = {
+	{ "0000:03:00.0", "28e0", "030000", NULL },
+	{ "0000:03:00.1", "22be", "040300", "snd_hda_intel" },
+	{ NULL, NULL, NULL, NULL },
+};
+
+/*
+ * A laptop RTX 4060 (10de:28e0, a laptop row) at 0000:03:00.0 behind bridge 0000:00:02.0, before prepare: power/control
+ * auto, runtime_status status, d3cold_allowed 1. cold: off in D3cold, so its config space, and in this stub even its
+ * vendor attribute, read all-ones until on is written to its power/control (sim.cold).
+ */
+static void laptop_host(const char *name, const char *status, int cold, char *root, size_t len)
+{
+	snprintf(root, len, "%s/%s", tmp, name);
+	make_card(root, &topo_default, laptop_gpu, 0, NULL);
+	card_resource(root, &topo_default, 0x380000000000ULL);
+	make_proc(root, 0);
+	memset(&sim, 0, sizeof(sim));
+	gs_copy(sim.root, sizeof(sim.root), root);
+	gs_pathf(sim.proc, sizeof(sim.proc), "%s/proc", root);
+	gs_pathf(sim.state, sizeof(sim.state), "%s/state", root);
+	gs_pathf(sim.run, sizeof(sim.run), "%s/run", root);
+	sim_writef(PF_DEV "power/control", "auto\n");
+	sim_writef(PF_DEV "power/runtime_status", status);
+	sim_writef(PF_DEV "d3cold_allowed", "1\n");
+	laptop_config(root, &topo_default, 0x28e0, !cold, 0, 0);
+	if (cold) {
+		sim_writef(PF_DEV "vendor", "0xffff\n");
+		sim.cold = 1;
+	}
+}
+
+/*
+ * Laptop rows in prepare, with MSI-X at its default (unhidden by the module) and with msix=off: bridge woken and kept on,
+ * power/control on, d3cold_allowed 0, the config-read gate, and only then the module (and its MSI-X unhide), the
+ * remove and the rescan, after which d3cold_allowed is 0 again. The stub reads all-ones until woken, so the inspection
+ * after the wake proves the order. Refused, with nothing written, when the card reads all-ones while its status says
+ * it is up; refused with everything given back when it does not come back.
+ */
+static void test_laptop_prepare(void)
+{
+	static const char ctl[] = "W bus/pci/devices/0000:03:00.0/power/control";
+	static const char d3w[] = "W bus/pci/devices/0000:03:00.0/d3cold_allowed 0\n";
+	char root[GS_PATH_MAX], p[GS_PATH_MAX], *out, *log, *bridge, *d3;
+	struct gs_config cfg;
+	struct gs_plan plan;
+	struct gs_card card;
+	long bon, pon, d3a, mod, rm, rs;
+	int rc;
+
+	/*
+	 * No d3cold=off in the config: refused before anything is read beyond the device ID, woken or written, for a
+	 * laptop row alone, in a selection with a desktop card, and at boot with a console release granted (before the
+	 * deferral). The refusal names the install command that keeps the whole selection and its grants.
+	 */
+	{
+		static const struct fx_fn desk04[] = { { "0000:04:00.0", "2206", "030000", NULL }, { NULL, NULL, NULL, NULL } };
+
+		laptop_host("lap-noconsent", "suspended\n", 1, root, sizeof(root));
+		cfg_of(&cfg, "bdfs=0000:03:00.0\n");
+		rc = run_prepare(&cfg, 1, NULL, &out);
+		CHECK(rc == GS_EXIT_REFUSED &&
+		      contains(out, "geforce-sriov: refused, nothing changed: no D3cold consent in the config for laptop GPU "
+				    "0000:03:00.0.\nRun geforce-sriov setup, or:\n"
+				    "  geforce-sriov install --device 0000:03:00.0 --disable-d3cold\n"
+				    "Why: docs/laptops.md#d3cold.\n"),
+		      "laptop without consent: refused with the owner's text: %d\n%s", rc, out);
+		check_untouched("laptop without consent");
+		free(out);
+		rc = run_prepare(&cfg, 0, NULL, &out);
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, "no D3cold consent"), "by hand too: refused: %d\n%s", rc, out);
+		check_untouched("laptop without consent, by hand");
+		free(out);
+
+		make_card(root, &topo_display, desk04, 0, NULL);
+		card_resource(root, &topo_display, 0x387fc0000000ULL);
+		cfg_of(&cfg, "bdfs=0000:04:00.0,0000:03:00.0\n");
+		rc = run_prepare(&cfg, 1, NULL, &out);
+		CHECK(rc == GS_EXIT_REFUSED &&
+		      contains(out, "no D3cold consent in the config for laptop GPU 0000:03:00.0.\n") &&
+		      contains(out, "  geforce-sriov install --device 0000:04:00.0 --device 0000:03:00.0 --disable-d3cold\n"),
+		      "mixed selection without consent: refused, naming the laptop GPU and the whole selection: %d\n%s", rc,
+		      out);
+		check_untouched("mixed selection without consent");
+		free(out);
+		cfg_of(&cfg, "bdfs=0000:04:00.0,0000:03:00.0\nboot_display_release=0000:04:00.0\n");
+		rc = run_prepare(&cfg, 1, NULL, &out);
+		CHECK(rc == GS_EXIT_REFUSED && !sim_exists("run/" GS_DEFERRED_NAME) &&
+		      contains(out, "  geforce-sriov install --device 0000:04:00.0 --device 0000:03:00.0 "
+				    "--boot-display-release 0000:04:00.0 --disable-d3cold\n"),
+		      "boot unit, grant, laptop without consent: refused before the deferral: %d\n%s", rc, out);
+		check_untouched("deferral, laptop without consent");
+		free(out);
+	}
+
+	for (int msix = 1; msix >= 0; msix--) {
+		laptop_host(msix ? "lap-order" : "lap-order-nomsix", "suspended\n", 1, root, sizeof(root));
+		cfg_of(&cfg, msix ? "bdfs=0000:03:00.0\nd3cold=off\n" : "bdfs=0000:03:00.0\nmsix=off\nd3cold=off\n");
+		rc = run_prepare(&cfg, 1, NULL, &out);
+		log = sim_text("sim.log");
+		bridge = sim_text(BRIDGE_DEV "power/control");
+		d3 = sim_text(PF_DEV "d3cold_allowed");
+		bon = pos_of(log, BRIDGE_CTL " on\n");
+		pon = pos_of(log, ctl);
+		d3a = pos_of(log, d3w);
+		mod = pos_of(log, msix ? "R modprobe geforce_sriov ari=1 msix=1 " : "R modprobe geforce_sriov ari=1 msix=0 ");
+		rm = pos_of(log, "W bus/pci/devices/0000:03:00.0/remove 1\n");
+		rs = pos_of(log, "/rescan 1\n");
+		CHECK(rc == 0 && bon >= 0 && bon < pon && pon < d3a && d3a < mod && mod < rm && rm < rs &&
+		      pos_of(log + rs, d3w) >= 0 && !contains(log, BRIDGE_CTL " auto") && bridge &&
+		      strcmp(bridge, "on\n") == 0 && d3 && strcmp(d3, "0\n") == 0 &&
+		      contains(out, "0000:03:00.0: laptop GPU: bridge 0000:00:02.0 power/control on (kept on), power/control auto "
+				    "-> on, d3cold_allowed 1 -> 0, config reads 10de:28e0 in D0\n") &&
+		      count_of(out, "0000:03:00.0: D3cold disabled (d3cold_allowed=0); bridge 0000:00:02.0 stays powered\n") == 1 &&
+		      !contains(out, "on the rescanned PF") && !contains(out, "stays at power/control=on"),
+		      "laptop prepare, msix %s: bridge on, power/control on, d3cold_allowed 0, gate, module, remove, rescan, "
+		      "d3cold_allowed 0 again, bridge kept on: %d\n%s\n%s", msix ? "default" : "off", rc, out, log ? log : "");
+		free(out);
+		free(log);
+		free(bridge);
+		free(d3);
+	}
+
+	/*
+	 * A second rescan (prepare on a later boot: no record, no presented SR-IOV yet): the new device gets
+	 * d3cold_allowed 0 again.
+	 */
+	gs_pathf(p, sizeof(p), "%s/run/" GS_PREPARED_NAME "/0000:03:00.0", root);
+	unlink(p);
+	gs_pathf(p, sizeof(p), "%s/sim.log", root);
+	unlink(p);
+	gs_pathf(p, sizeof(p), "%s/" PF_DEV "sriov_totalvfs", root);
+	unlink(p);
+	gs_pathf(p, sizeof(p), "%s/" PF_DEV "sriov_numvfs", root);
+	unlink(p);
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	d3 = sim_text(PF_DEV "d3cold_allowed");
+	rs = pos_of(log, "/rescan 1\n");
+	CHECK(rc == 0 && rs >= 0 && pos_of(log + rs, d3w) >= 0 && d3 && strcmp(d3, "0\n") == 0,
+	      "laptop prepare, second rescan: d3cold_allowed 0 written again: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+	free(d3);
+	/* The record says whether MSI-X was linked at the end (here the stub keeps it hidden). */
+	d3 = sim_text("run/" GS_PREPARED_NAME "/0000:03:00.0");
+	CHECK(contains(d3, "msix_linked=0\n"), "prepared record holds msix_linked: %s", d3 ? d3 : "(none)");
+	free(d3);
+
+	/* Up by its status, all-ones in its config space: refused before any write. */
+	laptop_host("lap-dead", "active\n", 1, root, sizeof(root));
+	sim.cold = 0;
+	cfg_of(&cfg, "bdfs=0000:03:00.0\nd3cold=off\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	CHECK(rc == GS_EXIT_REFUSED &&
+	      contains(out, "geforce-sriov: refused, nothing changed: 0000:03:00.0 does not answer although its runtime_status "
+			    "is active: its config space reads ffff:ffff, not 10de:28e0 (a laptop GPU that did not come back "
+			    "from D3cold). Switch the laptop to its discrete GPU"),
+	      "laptop active but all-ones: refused: %d\n%s", rc, out);
+	check_untouched("laptop active but all-ones");
+	free(out);
+	/* msix_linked() does not walk a dead config space. */
+	plan_for(root, &plan, &card);
+	CHECK(card.msix_linked == -1, "all-ones config: MSI-X linkage unknown, not 'hidden': %d", card.msix_linked);
+
+	/*
+	 * The module refuses the card (a listed ID whose config lacks the hidden block): a failure, exit 1, before any
+	 * remove or rescan; the bridge, power/control and d3cold_allowed written for the wake are given back.
+	 */
+	laptop_host("lap-modfail", "suspended\n", 1, root, sizeof(root));
+	sim.modprobe_fail = 1;
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	bridge = sim_text(BRIDGE_DEV "power/control");
+	d3 = sim_text(PF_DEV "d3cold_allowed");
+	{
+		char *pc = sim_text(PF_DEV "power/control");
+
+		CHECK(rc == GS_EXIT_FAIL && contains(log, "R modprobe") && !contains(log, "/remove") && !contains(log, "rescan") &&
+		      !sim_exists("state/" GS_ATTEMPT_NAME) && pc && strcmp(pc, "auto\n") == 0 && d3 && strcmp(d3, "1\n") == 0 &&
+		      bridge && strcmp(bridge, "auto\n") == 0,
+		      "laptop, module refuses the card: exit 1, nothing removed, power settings given back: %d\n%s\n%s", rc, out,
+		      log ? log : "");
+		free(pc);
+	}
+	free(out);
+	free(log);
+	free(bridge);
+	free(d3);
+
+	/* Suspended, never back: refused before the module; d3cold_allowed, power/control and the bridge given back. */
+	laptop_host("lap-stays", "suspended\n", 1, root, sizeof(root));
+	sim.cold = 0;
+	sim.stays_suspended = "0000:03:00.0/power/control";
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	bridge = sim_text(BRIDGE_DEV "power/control");
+	d3 = sim_text(PF_DEV "d3cold_allowed");
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "did not come back within 5 s of power/control=on") &&
+	      pos_of(log, BRIDGE_CTL " on\n") < pos_of(log, PF_CTL " on\n") && pos_of(log, PF_CTL " on\n") < pos_of(log, d3w) &&
+	      pos_of(log, d3w) < pos_of(log, "d3cold_allowed 1\n") &&
+	      pos_of(log, "d3cold_allowed 1\n") < pos_of(log, PF_CTL " auto\n") &&
+	      pos_of(log, PF_CTL " auto\n") < pos_of(log, BRIDGE_CTL " auto\n") && !contains(log, "R modprobe") &&
+	      !contains(log, "/remove") && bridge && strcmp(bridge, "auto\n") == 0 && d3 && strcmp(d3, "1\n") == 0,
+	      "laptop never back: refused, all given back: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+	free(bridge);
+	free(d3);
+
+	/*
+	 * After the module loaded: card 03 comes back without SR-IOV (CARD_FAILED_BACK) while laptop card 04, woken
+	 * in preflight, was never removed. 04's wake is given back; nothing is written to the rescanned 03.
+	 */
+	{
+		static const struct fx_fn laptop_04[] = {
+			{ "0000:04:00.0", "28e0", "030000", NULL },
+			{ "0000:04:00.1", "22be", "040300", "snd_hda_intel" },
+			{ NULL, NULL, NULL, NULL },
+		};
+
+		laptop_host("lap-two", "suspended\n", 0, root, sizeof(root));
+		make_card(root, &topo_display, laptop_04, 0, NULL);
+		card_resource(root, &topo_display, 0x387fc0000000ULL);
+		laptop_config(root, &topo_display, 0x28e0, 1, 0, 0);
+		sim_writef("devices/pci0000:00/0000:00:03.0/0000:04:00.0/power/control", "auto\n");
+		sim_writef("devices/pci0000:00/0000:00:03.0/0000:04:00.0/power/runtime_status", "suspended\n");
+		sim_writef("devices/pci0000:00/0000:00:03.0/0000:04:00.0/d3cold_allowed", "1\n");
+		sim.no_sriov = "0000:03:00.0";
+		cfg_of(&cfg, "bdfs=0000:03:00.0,0000:04:00.0\nd3cold=off\n");
+		rc = run_prepare(&cfg, 1, NULL, &out);
+		log = sim_text("sim.log");
+		CHECK(rc == GS_EXIT_FAIL && contains(log, "W bus/pci/devices/0000:04:00.0/d3cold_allowed 1\n") &&
+		      !contains(log, BRIDGE_CTL " auto") &&
+		      contains(log, "W bus/pci/devices/0000:04:00.0/power/control auto\n") &&
+		      contains(log, "0000:00:03.0/power/control auto\n") && !contains(log, "0000:04:00.0/remove") &&
+		      !contains(log, "W bus/pci/devices/0000:03:00.0/power/control auto") &&
+		      !contains(log, "W bus/pci/devices/0000:03:00.0/d3cold_allowed 1"),
+		      "card 03 failed back: card 04's wake given back, nothing written to the rescanned 03: %d\n%s\n%s", rc, out,
+		      log ? log : "");
+		free(out);
+		free(log);
+	}
+
+	/* A laptop card refused at the audio unbind (before its removal): its wake is given back. */
+	laptop_host("lap-unbind", "suspended\n", 0, root, sizeof(root));
+	sim.fail = "0000:03:00.1/driver/unbind";
+	cfg_of(&cfg, "bdfs=0000:03:00.0\nd3cold=off\n");
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	bridge = sim_text(BRIDGE_DEV "power/control");
+	d3 = sim_text(PF_DEV "d3cold_allowed");
+	{
+		char *pc = sim_text(PF_DEV "power/control");
+
+		CHECK(rc == GS_EXIT_FAIL && !contains(log, "/remove") && pc && strcmp(pc, "auto\n") == 0 && d3 &&
+		      strcmp(d3, "1\n") == 0 && bridge && strcmp(bridge, "auto\n") == 0,
+		      "laptop refused at the audio unbind: wake given back: %d\n%s\n%s", rc, out, log ? log : "");
+		free(pc);
+	}
+	free(out);
+	free(log);
+	free(bridge);
+	free(d3);
+
+	/*
+	 * Something puts the laptop bridge back to auto between preflight and the card's step (a udev or TLP rule):
+	 * prepare_card reads auto as the bridge's old setting, and restore_pm still leaves a laptop bridge at on.
+	 */
+	laptop_host("lap-bridge-auto", "active\n", 0, root, sizeof(root));
+	sim.bridge_auto_at_load = 1;
+	rc = run_prepare(&cfg, 1, NULL, &out);
+	log = sim_text("sim.log");
+	bridge = sim_text(BRIDGE_DEV "power/control");
+	rs = pos_of(log, "/rescan 1\n");
+	CHECK(rc == 0 && rs >= 0 && !contains(log + rs, BRIDGE_CTL " auto") && bridge && strcmp(bridge, "on\n") == 0 &&
+	      contains(out, "bridge 0000:00:02.0 power/control auto -> on (held awake)"),
+	      "laptop bridge reset to auto before the card's step: still kept on: %d\n%s\n%s", rc, out, log ? log : "");
+	free(out);
+	free(log);
+	free(bridge);
+}
+
+/*
+ * doctor on a laptop row writes nothing: it reads the power state (a sysfs config read resumes a runtime-suspended
+ * device itself), FAILs a GPU whose config space does not answer, warns for nvidia's runtime power management and
+ * unblocked system sleep (OK once set), and for a GPU that lost its SR-IOV state or has MSI-X hidden again. None of
+ * it for a desktop row.
+ */
+static void test_laptop_doctor(void)
+{
+	char root[GS_PATH_MAX], conf[GS_PATH_MAX], mpd[GS_PATH_MAX], units[GS_PATH_MAX], p[GS_PATH_MAX], want[GS_PATH_MAX + 128];
+	char *out, *log;
+	int rc;
+
+	/* Active and suspended (as the config read finds it once it resumed the card): INFO, nothing written. */
+	for (int k = 0; k < 2; k++) {
+		laptop_host(k ? "lap-doctor-suspended" : "lap-doctor", k ? "suspended\n" : "active\n", 0, root, sizeof(root));
+		gs_pathf(conf, sizeof(conf), "%s/config", root);
+		writef(conf, "bdfs=0000:03:00.0\n");
+		gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", root);
+		gs_mkdir_p(mpd, 0755);
+		gs_pathf(units, sizeof(units), "%s/etc/systemd/system", root);
+		gs_mkdir_p(units, 0755);
+		rc = run_doctor_sim(conf, mpd, units, &out);
+		log = sim_text("sim.log");
+		snprintf(want, sizeof(want), "[INFO] 0000:03:00.0: laptop GPU answers (10de:28e0 in D0): runtime_status %s, "
+			 "power/control auto, d3cold_allowed 1, bridge power/control auto; prepare sets power/control and the "
+			 "bridge to on and d3cold_allowed to 0\n", k ? "suspended" : "active");
+		CHECK(contains(out, want) &&
+		      contains(out, "[WARN] 0000:03:00.0: nvidia may power off this GPU: set options nvidia "
+				    "NVreg_DynamicPowerManagement=0 (docs/laptops.md#d3cold)\n") &&
+		      contains(out, "[WARN] 0000:03:00.0: suspend is not blocked; sleep powers off this GPU "
+				    "(docs/laptops.md#d3cold)\n") && !contains(out, "lost its SR-IOV state") &&
+		      !contains(out, "MSI-X was hidden again") && !log && laptop_power_untouched("auto\n", "1\n", "auto\n"),
+		      "doctor, laptop %s: power read, two host warnings, nothing written: %d\n%s", k ? "suspended" : "active", rc,
+		      out);
+		/* No d3cold=off and none planned: FAIL, as prepare refuses, with the owner's reason. */
+		CHECK(rc == GS_EXIT_REFUSED &&
+		      contains(out, "[FAIL] no D3cold consent in the config for laptop GPU 0000:03:00.0.\n"
+				    "       Run geforce-sriov setup, or:\n"
+				    "         geforce-sriov install --device 0000:03:00.0 --disable-d3cold\n"
+				    "       Why: docs/laptops.md#d3cold.\n"),
+		      "doctor, laptop %s without consent: FAIL: %d\n%s", k ? "suspended" : "active", rc, out);
+		free(out);
+		free(log);
+	}
+	/* Consent planned by --disable-d3cold: INFO, no FAIL; in the config: INFO, no FAIL. */
+	{
+		struct gs_diag_opts d;
+
+		memset(&d, 0, sizeof(d));
+		d.sysroot = sim.root;
+		d.config_path = conf;
+		d.modprobe_dir = mpd;
+		d.unit_dir = units;
+		d.run_dir = sim.run;
+		d.disable_d3cold = 1;
+		rc = run_diag(gs_cmd_doctor, &d, &out);
+		CHECK(contains(out, "[INFO] 0000:03:00.0: laptop GPU: D3cold consent planned by --disable-d3cold; install "
+				    "writes d3cold=off, and prepare keeps this GPU powered\n") &&
+		      !contains(out, "no D3cold consent"),
+		      "doctor --disable-d3cold: consent planned, no failure: %d\n%s", rc, out);
+		free(out);
+	}
+	writef(conf, "bdfs=0000:03:00.0\nd3cold=off\n");
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	CHECK(contains(out, "[INFO] 0000:03:00.0: laptop GPU: D3cold consent in the config (d3cold=off); prepare keeps this "
+			    "GPU powered\n") && !contains(out, "no D3cold consent"),
+	      "doctor, consent in the config: INFO, no failure: %d\n%s", rc, out);
+	free(out);
+
+	/* The option set and sleep masked: OK lines instead. */
+	gs_pathf(p, sizeof(p), "%s/nvidia-pm.conf", mpd);
+	writef(p, "# laptop\noptions nvidia NVreg_DynamicPowerManagement=0\n");
+	gs_pathf(p, sizeof(p), "%s/sleep.target", units);
+	link_to("/dev/null", p);
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	snprintf(want, sizeof(want), "[OK  ] laptop GPU: nvidia's runtime power management is off "
+		 "(NVreg_DynamicPowerManagement=0 in %s/nvidia-pm.conf)\n", mpd);
+	CHECK(contains(out, want) && contains(out, "[OK  ] laptop host: system sleep is blocked (sleep.target is masked)\n") &&
+	      !contains(out, "nvidia may power") && !contains(out, "not blocked"),
+	      "doctor, laptop with both set: OK: %d\n%s", rc, out);
+	free(out);
+	/* NVIDIA's documented form, in double quotes, and 0x00: OK as well; a quoted 0x02 (fine-grained) is not. */
+	for (int k = 0; k < 3; k++) {
+		static const char *const lines[] = { "options nvidia \"NVreg_DynamicPowerManagement=0\"\n",
+						     "options nvidia \"NVreg_DynamicPowerManagement=0x00\"\n",
+						     "options nvidia \"NVreg_DynamicPowerManagement=0x02\"\n" };
+
+		gs_pathf(p, sizeof(p), "%s/nvidia-pm.conf", mpd);
+		writef(p, "%s", lines[k]);
+		rc = run_doctor_sim(conf, mpd, units, &out);
+		CHECK(k < 2 ? contains(out, want) && !contains(out, "nvidia may power") : contains(out, "nvidia may power"),
+		      "doctor, %s: %d\n%s", lines[k], rc, out);
+		free(out);
+	}
+
+	/*
+	 * After prepare: VF Enable clear while the kernel counts VFs, and MSI-X hidden again under msix=Y although
+	 * prepare recorded it linked.
+	 */
+	sim_writef(PF_DEV "sriov_totalvfs", "4\n");
+	sim_writef(PF_DEV "sriov_numvfs", "4\n");
+	fake_module(root, "0000:03:00.0");
+	sim_writef("run/" GS_PREPARED_NAME "/0000:03:00.0", "boot_id=x\ntotalvfs=4\nari_enabled=1\nmsix_linked=1\n");
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	CHECK(contains(out, "[WARN] 0000:03:00.0: the GPU lost its SR-IOV state (D3cold reset); power the machine off and "
+			    "on, then run setup again\n") &&
+	      contains(out, "[WARN] 0000:03:00.0: MSI-X was hidden again (the GPU was power cycled); power the machine off "
+			    "and on, then run setup again\n"), "doctor, laptop power cycled: both warnings: %d\n%s", rc, out);
+	free(out);
+	/* MSI-X never linked at prepare (the module left it hidden), or a record from 0.2.0 without the key: no MSI-X warning. */
+	for (int k = 0; k < 2; k++) {
+		sim_writef("run/" GS_PREPARED_NAME "/0000:03:00.0",
+			   k ? "boot_id=x\ntotalvfs=4\nari_enabled=1\n" : "boot_id=x\ntotalvfs=4\nari_enabled=1\nmsix_linked=0\n");
+		rc = run_doctor_sim(conf, mpd, units, &out);
+		CHECK(contains(out, "lost its SR-IOV state") && !contains(out, "MSI-X was hidden again"),
+		      "doctor, laptop, MSI-X %s at prepare: no MSI-X warning: %d\n%s", k ? "not recorded" : "hidden", rc, out);
+		free(out);
+	}
+	sim_writef("run/" GS_PREPARED_NAME "/0000:03:00.0", "boot_id=x\ntotalvfs=4\nari_enabled=1\nmsix_linked=1\n");
+	laptop_config(root, &topo_default, 0x28e0, 1, 1, 1);
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	CHECK(!contains(out, "lost its SR-IOV state") && !contains(out, "MSI-X was hidden again"),
+	      "doctor, laptop with VF Enable set and MSI-X linked: no warning: %d\n%s", rc, out);
+	free(out);
+
+	/* A desktop row in the same state: none of the laptop lines. */
+	two_cards("desk-doctor", 0, -1, root, sizeof(root));
+	laptop_config(root, &topo_default, 0x2206, 1, 0, 0);
+	sim_writef(PF_DEV "sriov_totalvfs", "4\n");
+	sim_writef(PF_DEV "sriov_numvfs", "4\n");
+	fake_module(root, "0000:03:00.0");
+	gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", root);
+	gs_mkdir_p(mpd, 0755);
+	gs_pathf(units, sizeof(units), "%s/etc/systemd/system", root);
+	gs_mkdir_p(units, 0755);
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	log = sim_text("sim.log");
+	CHECK(!contains(out, "laptop") && !contains(out, "lost its SR-IOV") && !contains(out, "hidden again") && !log,
+	      "doctor, desktop: no laptop line, nothing written: %d\n%s", rc, out);
+	free(out);
+	free(log);
+	/* --disable-d3cold with no laptop GPU among those judged: a usage error, as install and setup give. */
+	{
+		struct gs_diag_opts d;
+
+		memset(&d, 0, sizeof(d));
+		d.sysroot = sim.root;
+		d.config_path = conf;
+		d.disable_d3cold = 1;
+		rc = run_diag(gs_cmd_doctor, &d, &out);
+		CHECK(rc == GS_EXIT_USAGE &&
+		      contains(out, "geforce-sriov: --disable-d3cold requires a selected laptop GPU. Nothing changed.\n"
+				    "Try 'geforce-sriov --help'.\n"),
+		      "doctor --disable-d3cold, desktop only: exit 2: %d\n%s", rc, out);
+		free(out);
+	}
+
+	/* A laptop GPU that reads all-ones while up: FAIL, not inspected, nothing written. */
+	laptop_host("lap-doctor-dead", "active\n", 1, root, sizeof(root));
+	sim.cold = 0;
+	rc = run_doctor_sim(conf, mpd, units, &out);
+	log = sim_text("sim.log");
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "[FAIL] 0000:03:00.0 does not answer although its runtime_status is "
+						    "active") && contains(out, "; prepare refuses this card. Switch the laptop") &&
+	      contains(out, "[WARN] 0000:03:00.0: nvidia may power off this GPU") &&
+	      contains(out, "[WARN] 0000:03:00.0: suspend is not blocked;") &&
+	      !contains(out, "  id 10de:") && !log && laptop_power_untouched("auto\n", "1\n", "auto\n"),
+	      "doctor, laptop all-ones: FAIL with the host warnings, nothing written: %d\n%s", rc, out);
+	free(out);
+	free(log);
+}
+
+/*
+ * gs_write_attr writes regular files only: a FIFO with no reader fails at the open (ENXIO, no hang), a device that
+ * opens is refused by the fstat check (EINVAL), and a link is not followed.
+ */
+static void test_write_attr(void)
+{
+	char p[GS_PATH_MAX], q[GS_PATH_MAX], *t;
+	int r;
+
+	gs_pathf(p, sizeof(p), "%s/attr-fifo", tmp);
+	unlink(p);
+	if (mkfifo(p, 0600))
+		die(p);
+	r = gs_write_attr(p, "on");
+	CHECK(r == -ENXIO, "FIFO refused at the open without blocking: %d", r);
+	r = gs_write_attr("/dev/null", "on");
+	CHECK(r == -EINVAL, "a device that opens is refused by the fstat check: %d", r);
+	gs_pathf(p, sizeof(p), "%s/attr-file", tmp);
+	writef(p, "auto\n");
+	CHECK(gs_write_attr(p, "on") == 0, "regular file written");
+	t = slurp(p);
+	CHECK(t && strncmp(t, "on", 2) == 0, "regular file holds the value: %s", t ? t : "(none)");
+	free(t);
+	gs_pathf(q, sizeof(q), "%s/attr-link", tmp);
+	link_to(p, q);
+	CHECK(gs_write_attr(q, "on") == -ELOOP, "link not followed");
 }
 
 static void test_prepare_release(void)
@@ -3142,6 +4146,70 @@ static int check_marker_mid_read(const struct gs_config *cfg, const struct gs_ac
 			close(fd);
 	}
 	return rc;
+}
+
+/*
+ * activate and check on a laptop row (the Ada host with its PF as a 4060 Laptop, 10de:28e0): the re-probe puts the
+ * bridge and the PF's power/control at on and d3cold_allowed at 0 before the unbind; check reads each VF's config
+ * space at 0x08 (its vendor and device IDs read ffff by design) and is NOT READY while it reads all-ones.
+ */
+static void test_laptop_activate_check(void)
+{
+	unsigned char vf[64];
+	char root[GS_PATH_MAX], p[GS_PATH_MAX], *out, *log, *t;
+	struct gs_activate_opts o;
+	struct gs_config cfg;
+	long unbind;
+	int rc;
+
+	cfg_of(&cfg, "bdfs=0000:03:00.0\n");
+	ada_host("lap-activate", root, sizeof(root));
+	sim_writef(ADA_DEV "0000:03:00.0/device", "0x28e0\n");
+	sim_writef(ADA_DEV "0000:03:00.4/device", "0x28e0\n");
+	sim_writef(ADA_DEV "0000:03:00.0/power/control", "auto\n");
+	sim_writef(ADA_DEV "0000:03:00.0/d3cold_allowed", "1\n");
+	sim.bind_auto = 1;
+	/* The VF answers: vendor and device ffff (by design on a VF), revision and class at 0x08. */
+	memset(vf, 0, sizeof(vf));
+	memset(vf, 0xff, 4);
+	vf[0x08] = 0xa1, vf[0x0b] = 0x03;
+	gs_pathf(p, sizeof(p), "%s/" ADA_DEV "0000:03:00.4/config", root);
+	if (gs_write_file_atomic(p, vf, sizeof(vf), 0644))
+		die(p);
+	memset(&o, 0, sizeof(o));
+	rc = run_ada(child_activate, &cfg, &o, &out);
+	log = sim_text("sim.log");
+	unbind = pos_of(log, "W bus/pci/drivers/nvidia/unbind 0000:03:00.0\n");
+	CHECK(rc == GS_EXIT_OK && unbind > 0 && pos_of(log, BRIDGE_CTL " on\n") >= 0 && pos_of(log, BRIDGE_CTL " on\n") < unbind &&
+	      pos_of(log, PF_CTL " on\n") >= 0 && pos_of(log, PF_CTL " on\n") < unbind &&
+	      pos_of(log, "W bus/pci/devices/0000:03:00.0/d3cold_allowed 0\n") >= 0 &&
+	      pos_of(log, "W bus/pci/devices/0000:03:00.0/d3cold_allowed 0\n") < unbind,
+	      "laptop activate: bridge, power/control and d3cold_allowed held before the unbind: %d\n%s\n%s", rc, out,
+	      log ? log : "");
+	/* NVIDIA's bind put the PF back to auto: the hold after the bind writes on again. */
+	CHECK(pos_of(log + (unbind > 0 ? unbind : 0), "W bus/pci/drivers/nvidia/bind 0000:03:00.0\n") >= 0 &&
+	      pos_of(log + pos_of(log, "W bus/pci/drivers/nvidia/bind 0000:03:00.0\n"), PF_CTL " on\n") >= 0,
+	      "laptop activate: power/control on again after the bind: %s", log ? log : "");
+	t = sim_text(ADA_DEV "0000:03:00.0/d3cold_allowed");
+	CHECK(t && strcmp(t, "0\n") == 0, "laptop activate: d3cold_allowed 0 after the re-probe: %s", t ? t : "(none)");
+	free(t);
+	free(out);
+	free(log);
+
+	/* check with the VF answering at 0x08: ready. */
+	o.type = 942;
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_OK && !contains(out, "NOT READY"), "laptop check, VF answers at 0x08: ready: %d\n%s", rc, out);
+	free(out);
+	/* The VF stops answering (all-ones, a powered-off GPU): NOT READY. */
+	memset(vf, 0xff, sizeof(vf));
+	if (gs_write_file_atomic(p, vf, sizeof(vf), 0644))
+		die(p);
+	rc = run_ada(child_check, &cfg, &o, &out);
+	CHECK(rc == GS_EXIT_FAIL && contains(out, "NOT READY 0000:03:00.4 (VF of 0000:03:00.0)") &&
+	      contains(out, "NOT READY 0000:03:00.4: its config space reads ffffffff at 0x08, or cannot be read; the GPU may "
+			    "have been powered off\n"), "laptop check, VF config dead: NOT READY: %d\n%s", rc, out);
+	free(out);
 }
 
 static void test_activate(void)
@@ -4735,6 +5803,26 @@ static void test_doctor_modprobe(void)
 			    "docs/installation.md#boot-display-card\n"),
 	      "doctor, grant planned by --boot-display-release, empty modprobe.d: hold missing: %d\n%s", rc, out);
 	free(out);
+	/* The same with --hold-nvidia (setup's yes, or the flag): install writes the hold, so INFO, not the WARN. */
+	d.hold_nvidia = 1;
+	rc = run_diag(gs_cmd_doctor, &d, &out);
+	CHECK(contains(out, "[INFO] hold planned by --hold-nvidia: install writes /etc/modprobe.d/nvidia-manual-load.conf\n") &&
+	      !contains(out, "nvidia is not held back at boot"),
+	      "doctor --hold-nvidia with a planned grant: INFO, no WARN: %d\n%s", rc, out);
+	free(out);
+	/* A hold already in place: the OK line stays. */
+	gs_pathf(hold, sizeof(hold), "%s/nvidia-manual-load.conf", mpd);
+	writef(hold, GS_NVIDIA_HOLD_TEXT);
+	rc = run_diag(gs_cmd_doctor, &d, &out);
+	CHECK(contains(out, "[OK  ] nvidia is held back at boot") && !contains(out, "hold planned by --hold-nvidia"),
+	      "doctor --hold-nvidia with the hold in place: OK unchanged: %d\n%s", rc, out);
+	free(out);
+	/* Without any console release (none planned, none in the config): a usage error, as install gives. */
+	d.nrelease = 0;
+	rc = run_diag(gs_cmd_doctor, &d, &out);
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "--hold-nvidia needs --boot-display-release BDF"),
+	      "doctor --hold-nvidia without a grant: exit 2: %d\n%s", rc, out);
+	free(out);
 }
 
 /*
@@ -4991,11 +6079,34 @@ static void test_driver_file(void)
 	free(out);
 	rc = run_cli(&out, NULL, (const char *const[]){ "help", NULL });
 	CHECK(rc == 0 && contains(out, "[--nvidia-source DIR] [--driver-file PATH] [--accept-nvidia-license]\n") &&
-	      contains(out, "[--msix=on|off] [--driver=skip]\n"
-			    "          [--nvidia-source DIR] [--driver-file PATH] [--accept-nvidia-license]\n") &&
-	      contains(out, "  --driver-file PATH ") && contains(out, "  --accept-nvidia-license "),
-	      "help names the package options on setup and install:\n%s", out);
+	      contains(out, "[--msix=on|off] [--driver=skip] [--hold-nvidia]\n"
+			    "          [--nvidia-source DIR] [--driver-file PATH] [--accept-nvidia-license]\n"
+			    "          [--disable-d3cold]\n") &&
+	      contains(out, "        [--driver=skip] [--hold-nvidia] [--disable-d3cold]\n"
+			    "        [--interactive | --no-prompt]\n") &&
+	      contains(out, "         [--nvidia-source DIR] [--driver-file PATH] [--disable-d3cold]\n") &&
+	      contains(out, "  --driver-file PATH ") && contains(out, "  --accept-nvidia-license ") &&
+	      contains(out, "\n  --hold-nvidia              prevent nvidia from loading at boot for the boot display GPU\n"
+			    "  --disable-d3cold           keep a laptop GPU powered when idle (D3cold off)\n"),
+	      "help names the package options, --hold-nvidia and --disable-d3cold on setup, install and doctor:\n%s", out);
 	free(out);
+	/* The flag on the command line: doctor takes it (a desktop fixture refuses it, exit 2); status does not. */
+	{
+		static const struct fx_fn desk[] = { { "0000:03:00.0", "2206", "030000", NULL }, { NULL, NULL, NULL, NULL } };
+		char droot[GS_PATH_MAX];
+
+		snprintf(droot, sizeof(droot), "%s/cli-d3cold", tmp);
+		make_card(droot, &topo_default, desk, 0, NULL);
+		rc = run_cli(&out, NULL, (const char *const[]){ "doctor", "--disable-d3cold", "--sysfs-root", droot, "--device",
+								"0000:03:00.0", NULL });
+		CHECK(rc == GS_EXIT_USAGE && contains(out, "--disable-d3cold requires a selected laptop GPU. Nothing changed.\n"),
+		      "doctor --disable-d3cold on a desktop GPU: exit 2: %d\n%s", rc, out);
+		free(out);
+		rc = run_cli(&out, NULL, (const char *const[]){ "status", "--disable-d3cold", NULL });
+		CHECK(rc == GS_EXIT_USAGE && contains(out, "unknown option '--disable-d3cold'"),
+		      "status takes no --disable-d3cold: %d\n%s", rc, out);
+		free(out);
+	}
 
 	/* Without --accept-nvidia-license: extracted only; the userspace is named as still to install. The
 	 * extraction was written, so the refusal exits 1, not 3. */
@@ -5150,14 +6261,17 @@ static int run_setup(const char *root, const char *answers, const struct gs_inst
 		     char **out)
 {
 	struct gs_host h = { root, root, root, root, NULL, setup_run, NULL };
-	struct gs_setup_host s = { &h, -1, driver_present, setup_config, setup_build };
-	char cfg[GS_PATH_MAX];
+	struct gs_setup_host s = { &h, -1, driver_present, setup_config, setup_build, NULL };
+	char cfg[GS_PATH_MAX], mpd[GS_PATH_MAX];
 	int in[2], pipefd[2];
 	pid_t pid;
 
 	gs_pathf(setup_log, sizeof(setup_log), "%s/setup.log", root);
 	unlink(setup_log);
 	gs_pathf(cfg, sizeof(cfg), "%s/no-config", root);
+	/* The fixture's own modprobe.d, so the host's /etc/modprobe.d never decides whether setup asks. */
+	gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", root);
+	s.modprobe_dir = mpd;
 	if (answers) {
 		if (pipe(in))
 			die("pipe");
@@ -5199,6 +6313,10 @@ static void setup_opts(struct gs_install_opts *o)
 #define DRIVER_Q "Path to NVIDIA's vGPU host driver package (.run)?"
 #define GPUS_Q "Which GPUs? all, a number, or numbers separated by commas"
 #define RELEASE_Q "Allow releasing the console of 0000:04:00.0 after the next boot? [y/N]"
+#define HOLD_Q "Create /etc/modprobe.d/nvidia-manual-load.conf now? [y/N]"
+#define HOLD_HINT "  Yes: install writes the file with its other files.\n" \
+	"  No: after install, setup shows how to create it by hand.\n" \
+	"  Default is no."
 
 /*
  * Three eligible cards: 1 = 0000:03:00.0 and 3 = 0000:05:00.0, and 2 = 0000:04:00.0, the boot display.
@@ -5265,7 +6383,8 @@ static void test_setup_questions(void)
 	rc = run_setup(root, "\n", &o, 0, &out);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	log = slurp(setup_log);
-	CHECK(rc == GS_EXIT_REFUSED && count_of(out, DRIVER_Q) == 2 && contains(out, "Give --driver-file PATH instead") && !log,
+	CHECK(rc == GS_EXIT_REFUSED && count_of(out, DRIVER_Q) == 2 &&
+	      contains(out, "setup: end of input. Nothing changed. Use --driver-file PATH instead.\n") && !log,
 	      "empty driver answer asked again, then refused at the end of input: %d\n%s", rc, out);
 	CHECK(t1.tv_sec - t0.tv_sec + (t1.tv_nsec - t0.tv_nsec) / 1e9 < 1.0, "end of input before the driver: ended in under 1 s");
 	free(log);
@@ -5275,7 +6394,7 @@ static void test_setup_questions(void)
 	o.driver_file = real;
 	rc = run_setup(root, "", &o, 0, &out);
 	log = slurp(setup_log);
-	CHECK(rc == GS_EXIT_REFUSED && contains(out, "Give --accept-nvidia-license instead") && !log,
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, "Use --accept-nvidia-license instead") && !log,
 	      "end of input at the licence: %d\n%s", rc, out);
 	free(log);
 	free(out);
@@ -5284,7 +6403,7 @@ static void test_setup_questions(void)
 	rc = run_setup(root, "\n0\n", &o, 0, &out);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	log = slurp(setup_log);
-	CHECK(rc == GS_EXIT_REFUSED && count_of(out, GPUS_Q) == 3 && contains(out, "Give --device BDF instead") && !log,
+	CHECK(rc == GS_EXIT_REFUSED && count_of(out, GPUS_Q) == 3 && contains(out, "Use --device BDF instead") && !log,
 	      "end of input at the selection: %d\n%s", rc, out);
 	CHECK(t1.tv_sec - t0.tv_sec + (t1.tv_nsec - t0.tv_nsec) / 1e9 < 1.0, "end of input at the selection: ended in under 1 s");
 	free(log);
@@ -5293,32 +6412,79 @@ static void test_setup_questions(void)
 	/* The boot display only by its number, with its console release confirmed; a no to the licence extracts only. */
 	setup_opts(&o);
 	o.driver_file = real;
-	rc = run_setup(root, "n\n2, 3\ny\n", &o, 0, &out);
+	rc = run_setup(root, "n\n2, 3\ny\ny\n", &o, 0, &out);
 	log = slurp(setup_log);
 	/* setup explained the grant at its question, so install is told not to repeat its note. */
 	snprintf(want, sizeof(want),
 		 "R install --device 0000:04:00.0 --device 0000:05:00.0 --boot-display-release 0000:04:00.0 --driver-file %s "
-		 "--release-note-shown\n", real);
+		 "--release-note-shown --hold-nvidia\n", real);
 	CHECK(rc == 0 && !contains(out, DRIVER_Q) && contains(out, "extract only") &&
-	      contains(out, RELEASE_Q "\n  Yes records the grant; nothing is released now. After the power cycle, setup asks\n"
-			    "  again before it releases the console of 0000:04:00.0, which stops the local display\n"
-			    "  on that card until the following boot. SSH keeps working. Default is no.\n") &&
+	      contains(out, RELEASE_Q "\n  After every boot, running setup releases the console on this GPU.\n"
+			    "  The monitor may go blank or freeze on the last frame. You will have no\n"
+			    "  local text console until the next boot.\n"
+			    "  Set up and test SSH or a serial console BEFORE you power cycle.\n"
+			    "  Without that access, you cannot see the result or fix a problem.\n"
+			    "  Yes records the grant; nothing is released now.\n"
+			    "  Default is no.\n") &&
 	      !contains(out, "stops until the next boot") &&
 	      pos_of(out, RELEASE_Q) < pos_of(out, "= --device 0000:04:00.0 --device 0000:05:00.0 --boot-display-release 0000:04:00.0\n") &&
 	      !contains(out, "Console release:") && contains(log, want) && !contains(log, "--accept-nvidia-license"),
 	      "boot display by number, release confirmed, licence declined: %d\n%s\n%s", rc, out, log ? log : "");
+	/* After the grant, the notice and the hold question; yes passes --hold-nvidia, and the notice is not repeated. */
+	CHECK(contains(out, "--boot-display-release 0000:04:00.0\n\n" HOLD_NOTICE_ASK "\n" HOLD_Q "\n" HOLD_HINT "\n> ") &&
+	      contains(out, "  = --hold-nvidia\n") && count_of(out, "IMPORTANT:") == 1 && !contains(out, "echo ") &&
+	      contains(out, " --boot-display-release 0000:04:00.0 --hold-nvidia\n") && pos_of(out, HOLD_Q) < pos_of(out, "== doctor") &&
+	      !contains(log, "--hold-note-shown"),
+	      "boot display by number, hold yes: notice, question, --hold-nvidia to install: %d\n%s\n%s", rc, out,
+	      log ? log : "");
 	{
 		char dwant[2 * GS_PATH_MAX + 256];
 
 		/* doctor judges the cards with the grant install gets, so it plans the boot display's console release. */
 		snprintf(dwant, sizeof(dwant),
 			 "R doctor --config %s/no-config --driver-file %s --device 0000:04:00.0 --device 0000:05:00.0 "
-			 "--boot-display-release 0000:04:00.0\nR install ", root, real);
+			 "--boot-display-release 0000:04:00.0 --hold-nvidia\nR install ", root, real);
 		CHECK(contains(log, dwant), "boot display by number, release confirmed: doctor gets the grant:\n%s",
 		      log ? log : "");
 	}
 	free(log);
 	free(out);
+	/* No (or an empty answer) to the hold: install runs without it, and the notice with the commands follows install. */
+	for (int k = 0; k < 2; k++) {
+		rc = run_setup(root, k ? "n\n2, 3\ny\n\n" : "n\n2, 3\ny\nn\n", &o, 0, &out);
+		log = slurp(setup_log);
+		CHECK(rc == 0 && contains(out, "  = no --hold-nvidia\n") && count_of(out, "IMPORTANT:") == 2 &&
+		      pos_of(out, HOLD_NOTICE_ASK) < pos_of(out, HOLD_Q) && count_of(out, HOLD_NOTICE_HAND) == 1 &&
+		      pos_of(out, "\n== install\n") < pos_of(out, "\n\n" HOLD_NOTICE_HAND) &&
+		      pos_of(out, HOLD_NOTICE_HAND) < pos_of(out, "Guest drivers:") &&
+		      contains(log, "--release-note-shown --hold-note-shown\n") && !contains(log, "--hold-nvidia"),
+		      "boot display by number, hold %s: the notice and the commands again after install: %d\n%s\n%s",
+		      k ? "empty" : "no", rc, out, log ? log : "");
+		free(log);
+		free(out);
+	}
+	/* The end of input at the hold question: refused naming --hold-nvidia, nothing run. */
+	rc = run_setup(root, "n\n2, 3\ny\n", &o, 0, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, HOLD_Q) &&
+	      contains(out, "setup: end of input. Nothing changed. Use --hold-nvidia instead.\n") && !log,
+	      "end of input at the hold question: refused: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* A file in modprobe.d already holds nvidia back: no notice and no question. */
+	{
+		char hold[GS_PATH_MAX];
+
+		gs_pathf(hold, sizeof(hold), "%s/etc/modprobe.d/blacklist-nvidia.conf", root);
+		writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n");
+		rc = run_setup(root, "n\n2, 3\ny\n", &o, 0, &out);
+		log = slurp(setup_log);
+		CHECK(rc == 0 && !contains(out, HOLD_Q) && !contains(out, "IMPORTANT:") && !contains(log, "--hold-"),
+		      "hold already in modprobe.d: not asked: %d\n%s\n%s", rc, out, log ? log : "");
+		free(log);
+		free(out);
+		unlink(hold);
+	}
 
 	/* No (or an empty answer) drops the boot display card and continues with the others. */
 	for (int k = 0; k < 2; k++) {
@@ -5341,7 +6507,7 @@ static void test_setup_questions(void)
 	free(out);
 	rc = run_setup(root, "n\n2\n", &o, 0, &out);
 	log = slurp(setup_log);
-	CHECK(rc == GS_EXIT_REFUSED && contains(out, RELEASE_Q) && contains(out, "Give --boot-display-release BDF instead") &&
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, RELEASE_Q) && contains(out, "Use --boot-display-release BDF instead") &&
 	      !log, "end of input at the release question: refused: %d\n%s", rc, out);
 	free(log);
 	free(out);
@@ -5389,6 +6555,39 @@ static void test_setup_questions(void)
 	free(out);
 	rc = run_cli(&out, NULL, (const char *const[]){ "setup", "--ari=off", NULL });
 	CHECK(rc == GS_EXIT_USAGE && contains(out, "unknown option '--ari=off'"), "setup takes no switches: %d\n%s", rc, out);
+	free(out);
+	/* --hold-nvidia without a boot display grant: a usage error, before any step. */
+	rc = run_cli(&out, NULL, (const char *const[]){ "setup", "--hold-nvidia", "--device", "0000:03:00.0", NULL });
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "geforce-sriov: --hold-nvidia requires --boot-display-release BDF for a boot "
+						   "display GPU\nwith a console-release grant.\nTry 'geforce-sriov --help'.\n"),
+	      "setup --hold-nvidia --device without the grant: usage: %d\n%s", rc, out);
+	free(out);
+	setup_opts(&o);
+	o.hold_nvidia = 1;
+	rc = run_setup(root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "geforce-sriov: --hold-nvidia requires a selected boot display GPU.\n"
+						   "Select it with --boot-display-release BDF. Nothing changed.\n"
+						   "Try 'geforce-sriov --help'.\n") &&
+	      !log, "setup --hold-nvidia without input or grant: usage, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* Asked, and the boot display left out: no grant, so the same usage error, before any step. */
+	o.driver_file = real;
+	o.accept_nvidia_license = 1;
+	rc = run_setup(root, "2, 3\nn\n", &o, 0, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "--hold-nvidia requires a selected boot display GPU") && !contains(out, HOLD_Q) &&
+	      !log, "setup --hold-nvidia, boot display declined: usage, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* Asked, the boot display granted: --hold-nvidia answers the hold question, so it is not asked. */
+	rc = run_setup(root, "2, 3\ny\n", &o, 0, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && !contains(out, HOLD_Q) && !contains(out, "IMPORTANT:") && contains(log, " --hold-nvidia\n") &&
+	      !contains(log, "--hold-note-shown"),
+	      "setup --hold-nvidia, boot display granted: not asked, passed to install: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
 	free(out);
 }
 
@@ -5466,17 +6665,43 @@ static void test_setup_selection(void)
 	/* With input, setup asks the console-release question for that card; yes selects it with the grant. */
 	setup_opts(&o);
 	setup_doctor_rc = setup_check_rc = 0;
-	rc = run_setup(boot_root, "y\n", &o, 1, &out);
+	rc = run_setup(boot_root, "y\ny\n", &o, 1, &out);
 	log = slurp(setup_log);
 	CHECK(rc == 0 && contains(out, "\nThe only NVIDIA GPU here, 0000:03:00.0, is the boot display.\n") &&
 	      contains(out, "Allow releasing the console of 0000:03:00.0 after the next boot? [y/N]\n"
-			    "  Yes records the grant; nothing is released now. After the power cycle, setup asks\n") &&
+			    "  After every boot, running setup releases the console on this GPU.\n") &&
 	      contains(out, "  = --device 0000:03:00.0 --boot-display-release 0000:03:00.0\n") &&
-	      contains(log, "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --release-note-shown\n") &&
-	      contains(log, " --device 0000:03:00.0 --boot-display-release 0000:03:00.0\nR install ") &&
+	      contains(log, "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --release-note-shown "
+			    "--hold-nvidia\n") &&
+	      contains(log, " --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --hold-nvidia\nR install ") &&
 	      pos_of(log, "R doctor ") == 0 &&
 	      !contains(out, "does not select by itself"),
 	      "boot display only, yes: selected with its release: %d\n%s\n%s", rc, out, log ? log : "");
+	CHECK(contains(out, "  = --device 0000:03:00.0 --boot-display-release 0000:03:00.0\n\n" HOLD_NOTICE_ASK "\n" HOLD_Q
+			    "\n" HOLD_HINT "\n> y\n  = --hold-nvidia\n") && count_of(out, "IMPORTANT:") == 1,
+	      "boot display only, hold yes: notice and question after the grant: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* No, or an empty answer, to the hold: install runs without it, and the notice with the commands follows it. */
+	for (int k = 0; k < 2; k++) {
+		rc = run_setup(boot_root, k ? "y\n\n" : "y\nn\n", &o, 1, &out);
+		log = slurp(setup_log);
+		CHECK(rc == 0 && contains(log, "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 "
+					       "--release-note-shown --hold-note-shown\n") &&
+		      contains(log, " --device 0000:03:00.0 --boot-display-release 0000:03:00.0\nR install ") &&
+		      !contains(log, "--hold-nvidia") &&
+		      count_of(out, "IMPORTANT:") == 2 && count_of(out, HOLD_NOTICE_HAND) == 1 &&
+		      pos_of(out, "\n== install\n") < pos_of(out, "\n\n" HOLD_NOTICE_HAND) &&
+		      pos_of(out, HOLD_NOTICE_HAND) < pos_of(out, "Guest drivers:"),
+		      "boot display only, hold %s: the notice and the commands after install: %d\n%s\n%s", k ? "empty" : "no",
+		      rc, out, log ? log : "");
+		free(log);
+		free(out);
+	}
+	rc = run_setup(boot_root, "y\n", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, HOLD_Q) && contains(out, "Use --hold-nvidia instead") && !log,
+	      "boot display only, end of input at the hold question: refused, nothing run: %d\n%s", rc, out);
 	free(log);
 	free(out);
 
@@ -5490,8 +6715,30 @@ static void test_setup_selection(void)
 	log = slurp(setup_log);
 	CHECK(rc == 0 && pos_of(log, "R doctor ") == 0 &&
 	      contains(log, " --device 0000:03:00.0 --boot-display-release 0000:03:00.0\n"
-			    "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0\n"),
+			    "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --hold-note-shown\n"),
 	      "boot display only, --device and --boot-display-release: doctor gets the grant: %d\n%s\n%s", rc, out,
+	      log ? log : "");
+	/* Without questions and without --hold-nvidia: nothing is created; the notice with the commands follows install, once. */
+	CHECK(!contains(out, HOLD_Q) && count_of(out, "IMPORTANT:") == 1 && count_of(out, "\n\n" HOLD_NOTICE_HAND) == 1 &&
+	      pos_of(out, "\n== install\n") < pos_of(out, HOLD_NOTICE_HAND) && pos_of(out, HOLD_NOTICE_HAND) < pos_of(out, "Guest drivers:"),
+	      "boot display only, no prompt, no --hold-nvidia: the notice once, after install: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	o.hold_nvidia = 1;
+	rc = run_setup(boot_root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && contains(log, "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --hold-nvidia\n") &&
+	      !contains(out, "IMPORTANT:"),
+	      "boot display only, no prompt, --hold-nvidia: passed to install, no notice: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+	o.hold_nvidia = 0;
+	/* The grant as flags, with input: the hold question is asked all the same. */
+	rc = run_setup(boot_root, "y\n", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && contains(out, "\n" HOLD_NOTICE_ASK "\n" HOLD_Q "\n") && !contains(out, "Allow releasing the console") &&
+	      contains(log, "R install --device 0000:03:00.0 --boot-display-release 0000:03:00.0 --hold-nvidia\n"),
+	      "boot display only, grant as flags, with input: asked, yes passes --hold-nvidia: %d\n%s\n%s", rc, out,
 	      log ? log : "");
 	free(log);
 	free(out);
@@ -5508,7 +6755,7 @@ static void test_setup_selection(void)
 			struct gs_install_opts q;
 
 			setup_opts(&q);
-			rc = run_setup(boot_root, "y\n", &q, 1, &out);
+			rc = run_setup(boot_root, "y\ny\n", &q, 1, &out);
 		}
 		log = slurp(setup_log);
 		CHECK(rc == 0 && contains(out, "[INFO] config: console release of 0000:03:00.0 planned by --boot-display-release\n") &&
@@ -5544,7 +6791,7 @@ static void test_setup_selection(void)
 	rc = run_setup(boot_root, "", &o, 1, &out);
 	log = slurp(setup_log);
 	CHECK(rc == GS_EXIT_REFUSED && contains(out, "Allow releasing the console of 0000:03:00.0") &&
-	      contains(out, "Give --boot-display-release BDF instead") && !log,
+	      contains(out, "Use --boot-display-release BDF instead") && !log,
 	      "boot display only, end of input: refused naming the flag: %d\n%s", rc, out);
 	free(log);
 	free(out);
@@ -5634,11 +6881,14 @@ static void test_setup_selection(void)
 	o.nvidia_source = "/usr/src/nvidia-580.159.01";
 	gs_addr_parse("0000:03:00.0", &o.release[0]);
 	o.nrelease = 1;
+	o.hold_nvidia = 1;
 	rc = run_setup(root, NULL, &o, 1, &out);
 	CHECK(rc == 0 && contains(out, "install already ran, so --driver=skip is ignored: it applies only to a first install\n") &&
 	      contains(out, "install already ran, so --nvidia-source is ignored: it applies only to a first install\n") &&
-	      contains(out, "install already ran, so --boot-display-release is ignored: it applies only to a first install\n"),
-	      "installed, --driver=skip, --nvidia-source, --boot-display-release: notes, exit 0: %d\n%s", rc, out);
+	      contains(out, "install already ran, so --boot-display-release is ignored: it applies only to a first install\n") &&
+	      contains(out, "install already ran, so --hold-nvidia is ignored: it applies only to a first install\n") &&
+	      !contains(out, "IMPORTANT:") && !contains(out, HOLD_Q),
+	      "installed, --driver=skip, --nvidia-source, --boot-display-release, --hold-nvidia: notes, exit 0: %d\n%s", rc, out);
 	free(out);
 	setup_config = NULL;
 	setup_check_rc = 0;
@@ -5673,8 +6923,10 @@ static void test_setup_release(void)
 
 	rc = run_setup(root, "y\n", &o, 1, &out);
 	log = slurp(setup_log);
-	CHECK(rc == GS_EXIT_FAIL && contains(out, RELEASE_NOW_Q "\n  the local console on 0000:03:00.0 stops until the "
-						  "next boot; SSH keeps working; default is no\n") &&
+	CHECK(rc == GS_EXIT_FAIL && contains(out, RELEASE_NOW_Q "\n  If you continue, the monitor on 0000:03:00.0 may go blank "
+						  "or freeze on\n  the last frame. You will have no local text console until "
+						  "the next boot.\n  Run this over SSH or a serial console so you can see the "
+						  "result.\n  Default is no.\n") &&
 	      contains(log, "R check\nR prepare --release-console=0000:03:00.0\nR modprobe --ignore-install nvidia\n"
 			    "R activate\nR check\n") && contains(out, "\n== modprobe --ignore-install nvidia\n") &&
 	      contains(out, "Guest drivers:"),
@@ -5731,9 +6983,12 @@ static void test_setup_release(void)
 	rc = run_setup(root, NULL, &o, 1, &out);
 	log = slurp(setup_log);
 	CHECK(rc == GS_EXIT_REFUSED && !contains(out, "console needs a yes") &&
-	      contains(out, "setup: NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. Create the "
-			    "hold (docs/installation.md#boot-display-card), power the machine off and on, then run "
-			    "setup again.\n") &&
+	      contains(out, "setup: NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. Create "
+			    "/etc/modprobe.d/nvidia-manual-load.conf with these two lines:\n"
+			    "  blacklist nvidia\n"
+			    "  install nvidia /bin/false\n"
+			    "Power the machine off and on, then run setup again.\n"
+			    "See docs/installation.md#boot-display-card.\n") &&
 	      contains(log, "R check\n") && !contains(log, "R prepare") && !contains(log, "R activate"),
 	      "nvidia loaded: stopped before prepare, exit 3: %d\n%s\n%s", rc, out, log ? log : "");
 	free(log);
@@ -6664,6 +7919,25 @@ static void test_uninstall_restore_failed(void)
 	free(out);
 	unlink(guard);
 
+	/* The driver script changed since install: not run as root; it stays, with the way back, exit 1. */
+	{
+		char mark[GS_PATH_MAX];
+
+		gs_pathf(mark, sizeof(mark), "%s/ran", dir);
+		unlink(mark);
+		uninstall_fixture(dir, "#!/bin/sh\nexit 0\n", manifest, sizeof(manifest));
+		writef(driver, "#!/bin/sh\ntouch %s\nexit 0\n", mark);
+		rc = run_uninstall_files(manifest, mpd, &out);
+		snprintf(want, sizeof(want), "NVIDIA's module was not restored: %s changed since install, not run. Check that "
+			 "file, or put the installed copy back with `geforce-sriov install`, then run uninstall again; or as "
+			 "root: cp /var/lib/geforce-sriov/stock/", driver);
+		CHECK(rc == GS_EXIT_FAIL && contains(out, want) && !contains(out, " --restore,") && !gs_exists(mark) &&
+		      gs_exists(driver), "changed driver script: not run, kept, a way back that does not run it, exit 1: %d\n%s",
+		      rc, out);
+		free(out);
+		unlink(driver);
+	}
+
 	/* Two other kernels' backups: the directory stays, each is named with the command that puts it back. */
 	{
 		static const char *const kernels[] = { "6.0.0-gs-a", "6.0.0-gs-b" };
@@ -6879,7 +8153,7 @@ static char *install_next_text(const struct gs_config *cfg, const char *modprobe
 	if (pid == 0) {
 		dup2(pipefd[1], 1);
 		close(pipefd[0]);
-		gs_install_next("/usr/local/bin", cfg, modprobe_dir);
+		gs_install_next("/usr/local/bin", cfg, modprobe_dir, 0);
 		fflush(stdout);
 		_exit(0);
 	}
@@ -6922,22 +8196,665 @@ static void test_install_next(void)
 			    "After the boot, run the commands above, or `sudo geforce-sriov setup`, which asks first, then\n"
 			    "runs them.\n") &&
 	      !contains(out, "setup` again") && !contains(out, "reboot") && !contains(out, "geforce-sriov status") &&
-	      !contains(out, "geforce_sriov.skip") && contains(out, "create\n" RELEASE_HOLD_04) && !contains(out, "already held"),
+	      !contains(out, "geforce_sriov.skip") && contains(out, "\n\n" RELEASE_HOLD_04) && !contains(out, "is held back") &&
+	      count_of(out, "IMPORTANT:") == 1,
 	      "install's closing, console release granted: the listed commands or setup, no skip line\n%s", out ? out : "");
 	free(out);
 
 	/* The hold already in place: its file named instead of the one to create, the commands after each boot unchanged. */
 	writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n");
 	out = install_next_text(&cfg, mpd);
-	snprintf(want, sizeof(want), "\nnvidia is already held back at boot by %s.\n" GS_RELEASE_STEPS_LEAD "\n"
+	snprintf(want, sizeof(want), "\nnvidia is held back at boot by %s.\n" GS_RELEASE_STEPS_LEAD "\n"
 		 RELEASE_STEPS_04("  "), hold);
-	CHECK(contains(out, want) && !contains(out, "create\n") && !contains(out, "nvidia-persistenced") && contains(out, cycle),
+	CHECK(contains(out, want) && !contains(out, "IMPORTANT:") && !contains(out, "nvidia-persistenced") && contains(out, cycle),
 	      "install's closing, hold in place: the file named, the commands kept\n%s", out ? out : "");
 	free(out);
 }
 
+/*
+ * install --hold-nvidia: a usage error without a console-release grant; staged, the hold file below the stage
+ * with exactly its two lines, mode 0644, in the manifest, written with the config; one this tool did not write
+ * refuses before any write; a hold already in modprobe.d is named instead. doctor finds it; uninstall removes it
+ * while unchanged, keeps it once changed, and names only a hold it did not write.
+ */
+static void test_install_hold(void)
+{
+	char stage[GS_PATH_MAX], hold[GS_PATH_MAX], p[GS_PATH_MAX], mpd[GS_PATH_MAX], cfg[GS_PATH_MAX], root[GS_PATH_MAX];
+	char want[3 * GS_PATH_MAX], sha[65], *out, *text;
+	struct gs_diag_opts d;
+	struct stat st;
+	int rc;
+
+	/* No grant: on the command line, or (with no --device) none in the config either. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-usage", tmp);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--hold-nvidia",
+							 "--device", "0000:03:00.0", NULL });
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "--hold-nvidia requires --boot-display-release BDF for a boot display GPU\n"),
+	      "install --hold-nvidia --device without the grant: usage: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--hold-nvidia",
+							 NULL });
+	gs_pathf(p, sizeof(p), "%s%s", stage, GS_MANIFEST);
+	gs_pathf(cfg, sizeof(cfg), "%s%s", stage, GS_CONFIG_PATH);
+	CHECK(rc == GS_EXIT_USAGE && contains(out, "geforce-sriov: --hold-nvidia requires a console-release grant.\n"
+						   "Only a boot display GPU can use it. Supply --boot-display-release BDF,\n"
+						   "or a boot_display_release= grant in ") && !gs_exists(p) && !gs_exists(cfg),
+	      "install --hold-nvidia without any grant: usage, nothing staged: %d\n%s", rc, out);
+	free(out);
+
+	/* Staged with the grant: the file below the stage, after the config, exactly its two lines, 0644, recorded. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-stage", tmp);
+	gs_pathf(hold, sizeof(hold), "%s" GS_NVIDIA_HOLD, stage);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", "--device", "0000:04:00.0", "--boot-display-release",
+							 "0000:04:00.0", "--hold-nvidia", NULL });
+	snprintf(want, sizeof(want), "installed %s\n", hold);
+	CHECK(rc == 0 && contains(out, want) && pos_of(out, "/etc/geforce-sriov/config\n") < pos_of(out, want) &&
+	      pos_of(out, want) < pos_of(out, "staged below ") && !contains(out, "installed " GS_NVIDIA_HOLD) &&
+	      contains(out, "nvidia is held back at boot by " GS_NVIDIA_HOLD ".\n" GS_RELEASE_STEPS_LEAD "\n") &&
+	      !contains(out, "IMPORTANT:"),
+	      "staged --hold-nvidia: written below the stage after the config, named in the closing: %d\n%s", rc, out);
+	free(out);
+	text = slurp(hold);
+	CHECK(text && strcmp(text, "blacklist nvidia\ninstall nvidia /bin/false\n") == 0 && lstat(hold, &st) == 0 &&
+	      (st.st_mode & 07777) == 0644, "staged hold: exactly the two lines, mode 0644: %s", text ? text : "(missing)");
+	free(text);
+	gs_sha256_buf(GS_NVIDIA_HOLD_TEXT, strlen(GS_NVIDIA_HOLD_TEXT), sha);
+	snprintf(want, sizeof(want), "f %s " GS_NVIDIA_HOLD "\n", sha);
+	gs_pathf(p, sizeof(p), "%s%s", stage, GS_MANIFEST);
+	text = slurp(p);
+	CHECK(contains(text, want), "staged hold: in the manifest with its hash:\n%s", text ? text : "(missing)");
+	free(text);
+	/* Again, and with the grant only in the config: the recorded file is left as it is. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--hold-nvidia",
+							 NULL });
+	snprintf(want, sizeof(want), "unchanged %s\n", hold);
+	CHECK(rc == 0 && contains(out, want) && !contains(out, "already holds"),
+	      "staged --hold-nvidia again, grant from the config: unchanged: %d\n%s", rc, out);
+	free(out);
+	/* The recorded file edited by the user, both lines still in it: named as the hold, not written again. */
+	writef(hold, "# mine\nblacklist nvidia\ninstall nvidia /bin/false\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--hold-nvidia",
+							 NULL });
+	snprintf(want, sizeof(want), "%s already holds nvidia back at boot\n", hold);
+	text = slurp(hold);
+	CHECK(rc == 0 && contains(out, want) && text &&
+	      strcmp(text, "# mine\nblacklist nvidia\ninstall nvidia /bin/false\n") == 0,
+	      "staged --hold-nvidia over an edited recorded hold: kept and named: %d\n%s", rc, out);
+	free(text);
+	free(out);
+	/* Edited so that it no longer holds nvidia back: refused, the user's file left as it is. */
+	writef(hold, "blacklist nvidia\n# install nvidia /bin/false\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--hold-nvidia",
+							 NULL });
+	snprintf(want, sizeof(want), "geforce-sriov: %s was changed since install and no longer holds nvidia back", hold);
+	text = slurp(hold);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, want) && text &&
+	      strcmp(text, "blacklist nvidia\n# install nvidia /bin/false\n") == 0,
+	      "staged --hold-nvidia over a recorded hold edited without its lines: refused, kept: %d\n%s", rc, out);
+	free(text);
+	free(out);
+	writef(hold, GS_NVIDIA_HOLD_TEXT);
+
+	/* doctor with the config and modprobe.d install left: the hold is OK. */
+	two_cards("hold-doctor", 1, FW_BOUND, root, sizeof(root));
+	gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", stage);
+	gs_pathf(cfg, sizeof(cfg), "%s%s", stage, GS_CONFIG_PATH);
+	memset(&d, 0, sizeof(d));
+	d.sysroot = root;
+	d.config_path = cfg;
+	d.modprobe_dir = mpd;
+	rc = run_diag(gs_cmd_doctor, &d, &out);
+	snprintf(want, sizeof(want), "[OK  ] nvidia is held back at boot (`blacklist nvidia` and `install nvidia /bin/false` in %s)\n",
+		 mpd);
+	CHECK(contains(out, want) && !contains(out, "not held back"), "doctor after install --hold-nvidia: hold OK: %d\n%s", rc, out);
+	free(out);
+
+	/* That path with other content, not written by this tool: refused before any write. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-foreign", tmp);
+	gs_pathf(hold, sizeof(hold), "%s" GS_NVIDIA_HOLD, stage);
+	writef(hold, "options nvidia NVreg_X=1\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:04:00.0", "--boot-display-release", "0000:04:00.0", "--hold-nvidia",
+							 NULL });
+	gs_pathf(p, sizeof(p), "%s/usr/bin/geforce-sriov", stage);
+	gs_pathf(cfg, sizeof(cfg), "%s%s", stage, GS_CONFIG_PATH);
+	snprintf(want, sizeof(want), "%s exists and was not installed by geforce-sriov; move it away first\n", hold);
+	text = slurp(hold);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, want) && !gs_exists(p) && !gs_exists(cfg) &&
+	      contains(text, "options nvidia NVreg_X=1\n") && !contains(text, "blacklist"),
+	      "a foreign file at the hold path: refused, nothing written: %d\n%s", rc, out);
+	free(text);
+	free(out);
+	/* The same two lines, not written by this tool: it already holds nvidia back, so nothing is written or recorded. */
+	writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:04:00.0", "--boot-display-release", "0000:04:00.0", "--hold-nvidia",
+							 NULL });
+	snprintf(want, sizeof(want), "%s already holds nvidia back at boot\n", hold);
+	gs_pathf(p, sizeof(p), "%s%s", stage, GS_MANIFEST);
+	text = slurp(p);
+	CHECK(rc == 0 && contains(out, want) && !contains(text, GS_NVIDIA_HOLD) && !contains(out, "IMPORTANT:"),
+	      "the hold file with the same lines, not this tool's: named, not recorded: %d\n%s", rc, out);
+	free(text);
+	free(out);
+
+	/* Another file holds both lines: the hold file is not created, that file is named. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-other", tmp);
+	gs_pathf(hold, sizeof(hold), "%s/etc/modprobe.d/blacklist.conf", stage);
+	writef(hold, "blacklist nouveau\nblacklist nvidia\ninstall nvidia /bin/false\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:04:00.0", "--boot-display-release", "0000:04:00.0", "--hold-nvidia",
+							 NULL });
+	snprintf(want, sizeof(want), "%s already holds nvidia back at boot\n", hold);
+	gs_pathf(p, sizeof(p), "%s" GS_NVIDIA_HOLD, stage);
+	CHECK(rc == 0 && contains(out, want) && !gs_exists(p) &&
+	      contains(out, "nvidia is held back at boot by /etc/modprobe.d/blacklist.conf.\n"),
+	      "another file holds nvidia back: no hold file, that file named: %d\n%s", rc, out);
+	free(out);
+
+	/* uninstall: the hold file it wrote goes while unchanged, with no word about a hold left. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-uninstall", tmp);
+	gs_pathf(mpd, sizeof(mpd), "%s/hold-uninstall-modprobe.d", tmp);
+	gs_pathf(hold, sizeof(hold), "%s/nvidia-manual-load.conf", mpd);
+	for (int k = 0; k < 2; k++) {
+		char manifest[GS_PATH_MAX], line[GS_PATH_MAX + 80];
+
+		uninstall_fixture(stage, "#!/bin/sh\nexit 0\n", manifest, sizeof(manifest));
+		writef(hold, "%s", GS_NVIDIA_HOLD_TEXT);
+		snprintf(line, sizeof(line), "f %s %s\n", sha, hold);
+		text = slurp(manifest);
+		writef(manifest, "%s%s", text ? text : "", line);
+		free(text);
+		/* The second time it was changed since install: kept with the others' rule, still listed, not named again. */
+		if (k)
+			writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n# mine\n");
+		rc = run_uninstall_files(manifest, mpd, &out);
+		text = slurp(manifest);
+		if (!k) {
+			snprintf(want, sizeof(want), "removed %s\n", hold);
+			CHECK(rc == 0 && contains(out, want) && !gs_exists(hold) && !contains(out, "holds nvidia back"),
+			      "uninstall: the unchanged hold file removed, no hold line: %d\n%s", rc, out);
+		} else {
+			snprintf(want, sizeof(want), "kept %s (changed since install)\n", hold);
+			CHECK(rc == 0 && contains(out, want) && gs_exists(hold) && !contains(out, "holds nvidia back") &&
+			      contains(text, hold),
+			      "uninstall: the changed hold file kept, listed, not named as left: %d\n%s\n%s", rc, out,
+			      text ? text : "(missing)");
+		}
+		free(text);
+		free(out);
+	}
+	/* A hold made by hand stays and is named, as before. */
+	cleanup(stage);
+	writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n");
+	{
+		char manifest[GS_PATH_MAX];
+
+		uninstall_fixture(stage, "#!/bin/sh\nexit 0\n", manifest, sizeof(manifest));
+		rc = run_uninstall_files(manifest, mpd, &out);
+		snprintf(want, sizeof(want), "%s still holds nvidia back at boot; remove it if nothing else needs it\n", hold);
+		CHECK(rc == 0 && contains(out, want) && gs_exists(hold), "uninstall: a hold made by hand named and kept: %d\n%s",
+		      rc, out);
+		free(out);
+	}
+}
+
+/*
+ * install --device without --boot-display-release on a config that granted a console release: the hold file
+ * install wrote goes while unchanged (and leaves the manifest); a changed one or the user's own stays and is
+ * named. Keeping the grant, or --hold-nvidia with it, removes nothing; without an earlier grant nothing is said.
+ */
+static void test_install_hold_dropped(void)
+{
+	static const char *const grant[] = { "install", "--prefix", "/usr", "--source", NULL, "--device", "0000:03:00.0",
+					     "--device", "0000:04:00.0", "--boot-display-release", "0000:04:00.0",
+					     "--hold-nvidia", NULL };
+	char stage[GS_PATH_MAX], hold[GS_PATH_MAX], manifest[GS_PATH_MAX], cfg[GS_PATH_MAX], mpd[GS_PATH_MAX];
+	char root[GS_PATH_MAX], want[3 * GS_PATH_MAX], *out, *text;
+	const char *args[16];
+	struct gs_diag_opts d;
+	int rc;
+
+	memcpy(args, grant, sizeof(grant));
+	args[4] = srcdir;
+
+	/* Grant and hold, then the same grant again, and --hold-nvidia with it: nothing is removed. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-drop", tmp);
+	gs_pathf(hold, sizeof(hold), "%s" GS_NVIDIA_HOLD, stage);
+	gs_pathf(manifest, sizeof(manifest), "%s%s", stage, GS_MANIFEST);
+	gs_pathf(cfg, sizeof(cfg), "%s%s", stage, GS_CONFIG_PATH);
+	rc = run_cli(&out, stage, args);
+	CHECK(rc == 0 && gs_exists(hold), "grant and --hold-nvidia: hold written: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, NULL });
+	CHECK(rc == 0 && gs_exists(hold) && !contains(out, "removed ") && !contains(out, "still holds"),
+	      "reinstall keeping the grant: hold kept, nothing said: %d\n%s", rc, out);
+	free(out);
+	rc = run_cli(&out, stage, args);
+	CHECK(rc == 0 && gs_exists(hold) && !contains(out, "removed ") && !contains(out, "still holds"),
+	      "--hold-nvidia with the grant again: hold kept: %d\n%s", rc, out);
+	free(out);
+
+	/* --device without the grant: the unchanged hold file goes, after the config, and leaves the manifest. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	snprintf(want, sizeof(want), "removed %s: the console release is no longer granted, so nvidia loads at boot again\n",
+		 hold);
+	text = slurp(manifest);
+	CHECK(rc == 0 && contains(out, want) && pos_of(out, "/etc/geforce-sriov/config\n") < pos_of(out, want) &&
+	      pos_of(out, want) < pos_of(out, "staged below ") && !gs_exists(hold) && !contains(out, "still holds") &&
+	      !contains(text, GS_NVIDIA_HOLD), "grant dropped: hold removed, out of the manifest: %d\n%s\n%s", rc, out,
+	      text ? text : "(missing)");
+	free(text);
+	free(out);
+	text = slurp(cfg);
+	CHECK(text && !contains(text, "boot_display_release"), "grant dropped: config has no grant: %s", text ? text : "");
+	free(text);
+	two_cards("hold-drop-doctor", 1, FW_BOUND, root, sizeof(root));
+	gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", stage);
+	memset(&d, 0, sizeof(d));
+	d.sysroot = root;
+	d.config_path = cfg;
+	d.modprobe_dir = mpd;
+	rc = run_diag(gs_cmd_doctor, &d, &out);
+	CHECK(!contains(out, "held back at boot"), "grant dropped: doctor names no hold: %d\n%s", rc, out);
+	free(out);
+
+	/* A hold file install wrote and the user changed: kept and named. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-drop-changed", tmp);
+	gs_pathf(hold, sizeof(hold), "%s" GS_NVIDIA_HOLD, stage);
+	gs_pathf(manifest, sizeof(manifest), "%s%s", stage, GS_MANIFEST);
+	rc = run_cli(&out, stage, args);
+	free(out);
+	writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n# mine\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	snprintf(want, sizeof(want), "%s still holds nvidia back at boot; remove it if nothing else needs it\n", hold);
+	text = slurp(manifest);
+	CHECK(rc == 0 && contains(out, want) && !contains(out, "removed ") && gs_exists(hold) && contains(text, GS_NVIDIA_HOLD),
+	      "grant dropped, hold changed: kept, named, still listed: %d\n%s", rc, out);
+	free(text);
+	free(out);
+
+	/* The user's own hold: kept and named. */
+	gs_pathf(stage, sizeof(stage), "%s/hold-drop-own", tmp);
+	gs_pathf(hold, sizeof(hold), "%s" GS_NVIDIA_HOLD, stage);
+	args[11] = NULL;
+	rc = run_cli(&out, stage, args);
+	args[11] = "--hold-nvidia";
+	CHECK(rc == 0 && !gs_exists(hold), "grant without --hold-nvidia: no hold written: %d\n%s", rc, out);
+	free(out);
+	writef(hold, "blacklist nvidia\ninstall nvidia /bin/false\n");
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	snprintf(want, sizeof(want), "%s still holds nvidia back at boot; remove it if nothing else needs it\n", hold);
+	CHECK(rc == 0 && contains(out, want) && !contains(out, "removed ") && gs_exists(hold),
+	      "grant dropped, the user's own hold: kept and named: %d\n%s", rc, out);
+	free(out);
+	/* No grant before: nothing is said about it. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	CHECK(rc == 0 && !contains(out, "still holds") && !contains(out, "removed ") && gs_exists(hold),
+	      "no grant before: the hold not named: %d\n%s", rc, out);
+	free(out);
+}
+
+/* d3cold=off: the one accepted value, absent means no consent, rendered back only when set. */
+static void test_d3cold_config(void)
+{
+	static const char *const bad[] = { "d3cold=on\n", "d3cold=0\n", "d3cold=OFF\n", "d3cold=off\nd3cold=off\n", NULL };
+	struct gs_config c, back;
+	char err[512], text[4096];
+	int n;
+
+	CHECK(gs_config_parse("bdfs=0000:03:00.0\n", 18, &c, err, sizeof(err)) == 0 && c.d3cold_off == 0,
+	      "no d3cold key: no consent: %s", err);
+	CHECK(gs_config_parse("bdfs=0000:03:00.0\nd3cold=off\n", 29, &c, err, sizeof(err)) == 0 && c.d3cold_off == 1,
+	      "d3cold=off: consent: %s", err);
+	for (int i = 0; bad[i]; i++)
+		CHECK(gs_config_parse(bad[i], strlen(bad[i]), &back, err, sizeof(err)) != 0, "rejects %s", bad[i]);
+	CHECK(gs_config_parse("d3cold=on\n", 10, &back, err, sizeof(err)) != 0 &&
+	      strcmp(err, "line 1: d3cold must be off (leave the key out for no consent)") == 0, "d3cold=on: why: %s", err);
+	n = gs_config_render(&c, text, sizeof(text));
+	CHECK(n > 0 && strstr(text, "\nd3cold=off\n") && gs_config_parse(text, (size_t)n, &back, err, sizeof(err)) == 0 &&
+	      back.d3cold_off == 1, "render keeps d3cold=off: %s\n%s", err, text);
+	c.d3cold_off = 0;
+	n = gs_config_render(&c, text, sizeof(text));
+	CHECK(n > 0 && !strstr(text, "d3cold=off"), "no consent: no d3cold line:\n%s", text);
+}
+
+/* The laptop rows of a selection, by the device attribute alone (a powered-off card still has it). */
+static void test_laptop_gpus(void)
+{
+	static const struct fx_topo t4 = { "pci0000:00/0000:00:03.0", "0000:04:00.0" };
+	static const struct fx_fn desk[] = { { "0000:04:00.0", "2206", "030000", NULL }, { NULL, NULL, NULL, NULL } };
+	struct gs_addr sel[3], out[3];
+	char root[GS_PATH_MAX];
+	unsigned int n;
+
+	snprintf(root, sizeof(root), "%s/laptop-gpus", tmp);
+	make_card(root, &topo_default, laptop_gpu, 0, NULL);
+	make_card(root, &t4, desk, 0, NULL);
+	gs_addr_parse("0000:04:00.0", &sel[0]);
+	gs_addr_parse("0000:03:00.0", &sel[1]);
+	gs_addr_parse("0000:05:00.0", &sel[2]);
+	n = gs_laptop_gpus(root, sel, 3, out);
+	CHECK(n == 1 && strcmp(out[0].str, "0000:03:00.0") == 0, "only the laptop row: %u", n);
+	CHECK(gs_laptop_gpus(root, sel, 1, out) == 0, "a desktop row alone: none");
+}
+
+/*
+ * install writes d3cold=off only with --disable-d3cold; a later install without --device keeps it; --device
+ * without the flag drops it, with one line; uninstall removes the config that holds it (it is the file install
+ * wrote, so its hash matches the manifest).
+ */
+static void test_install_d3cold(void)
+{
+	char stage[GS_PATH_MAX], cfg[GS_PATH_MAX], manifest[GS_PATH_MAX], own[GS_PATH_MAX], mpd[GS_PATH_MAX];
+	char line[GS_PATH_MAX + 128], *out, *text, *at;
+	int rc;
+
+	gs_pathf(stage, sizeof(stage), "%s/d3cold-stage", tmp);
+	gs_pathf(cfg, sizeof(cfg), "%s%s", stage, GS_CONFIG_PATH);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	text = slurp(cfg);
+	CHECK(rc == 0 && text && !contains(text, "d3cold"), "install without the flag: no consent written: %d\n%s", rc,
+	      text ? text : "(missing)");
+	free(text);
+	free(out);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", "--disable-d3cold", NULL });
+	text = slurp(cfg);
+	CHECK(rc == 0 && contains(text, "\nd3cold=off\n") && contains(text, "bdfs=0000:03:00.0\n") &&
+	      !contains(out, "is removed from the config"),
+	      "install --disable-d3cold: d3cold=off written: %d\n%s\n%s", rc, out, text ? text : "(missing)");
+	free(text);
+	free(out);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, NULL });
+	text = slurp(cfg);
+	CHECK(rc == 0 && contains(text, "\nd3cold=off\n") && !contains(out, "is removed from the config"),
+	      "install without --device keeps the consent: %d\n%s", rc, text ? text : "(missing)");
+	free(text);
+	free(out);
+
+	/* uninstall removes the config that carries the consent: the manifest's entry, pointed at the staged file. */
+	gs_pathf(manifest, sizeof(manifest), "%s%s", stage, GS_MANIFEST);
+	text = slurp(manifest);
+	at = text ? strstr(text, " " GS_CONFIG_PATH "\n") : NULL;
+	CHECK(at && at - text >= 66 && at[-65] == ' ', "the config is in the manifest:\n%s", text ? text : "(missing)");
+	if (at && at - text >= 66) {
+		gs_pathf(own, sizeof(own), "%s/d3cold-uninstall.manifest", tmp);
+		snprintf(line, sizeof(line), "f %.64s %s\n", at - 64, cfg);
+		writef(own, "%s", line);
+		gs_pathf(mpd, sizeof(mpd), "%s/etc/modprobe.d", stage);
+		rc = run_uninstall_files(own, mpd, &out);
+		CHECK(rc == 0 && !gs_exists(cfg), "uninstall removes the config with d3cold=off: %d\n%s", rc, out);
+		free(out);
+		out = NULL;
+	}
+	free(text);
+
+	/* --device without the flag drops the consent and says so in one line; nothing else of the config changes. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", "--disable-d3cold", "--vfs", "2", NULL });
+	free(out);
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	text = slurp(cfg);
+	CHECK(rc == 0 && text && !contains(text, "d3cold") && contains(text, "\nvfs=2\n") &&
+	      count_of(out, "--device without --disable-d3cold: the D3cold consent (d3cold=off) is removed from the "
+			    "config\n") == 1,
+	      "--device without the flag: consent dropped, one line, vfs kept: %d\n%s\n%s", rc, out,
+	      text ? text : "(missing)");
+	free(text);
+	free(out);
+	/* No consent before: nothing is said about it. */
+	rc = run_cli(&out, stage, (const char *const[]){ "install", "--prefix", "/usr", "--source", srcdir, "--device",
+							 "0000:03:00.0", NULL });
+	CHECK(rc == 0 && !contains(out, "D3cold consent"), "no consent before: no line: %d\n%s", rc, out);
+	free(out);
+}
+
+/* gs_d3cold_notice, the owner's D1 text. */
+#define D3COLD_NOTICE \
+	HOLD_RULE \
+	"IMPORTANT: This laptop GPU can power off when idle.\n" \
+	"\n" \
+	"This power state is called D3cold. When power returns, the GPU restarts,\n" \
+	"losing its SR-IOV setup and stopping every running vGPU. Its firmware\n" \
+	"resets too.\n" \
+	"\n" \
+	"setup can save your consent as d3cold=off in the config.\n" \
+	"prepare reapplies the power settings whenever it prepares the GPU.\n" \
+	"These runtime settings do not survive a reboot.\n" \
+	"\n" \
+	"This keeps the GPU and its parent bridge powered, even when idle.\n" \
+	"It means shorter battery life and a warmer laptop.\n" \
+	"\n" \
+	"You must also configure these yourself; setup does neither:\n" \
+	"  - Block suspend, including on lid close and when idle. Sleep powers\n" \
+	"    the GPU off.\n" \
+	"  - Disable NVIDIA's runtime power management. Run as root:\n" \
+	"      echo 'options nvidia NVreg_DynamicPowerManagement=0' > /etc/modprobe.d/nvidia-power.conf\n" \
+	"\n" \
+	"Without these safeguards, an idle GPU can power off and stop its vGPUs.\n" \
+	"To revert, run `geforce-sriov uninstall`.\n" \
+	"Restore any sleep or modprobe settings you changed yourself.\n" \
+	HOLD_RULE
+#define D3COLD_Q_03 "Turn off D3cold for 0000:03:00.0 while geforce-sriov manages it? [y/N]"
+#define D3COLD_HINT "  Yes: save d3cold=off in the config. prepare keeps this GPU powered each time it runs.\n" \
+	"  No: prepare refuses this GPU. Default is no."
+#define D3COLD_REFUSED_03 \
+	"geforce-sriov: refused, nothing changed: no D3cold consent in the config for laptop GPU 0000:03:00.0.\n" \
+	"Run geforce-sriov setup, or:\n" \
+	"  geforce-sriov install --device 0000:03:00.0 --disable-d3cold\n" \
+	"Why: docs/laptops.md#d3cold.\n"
+
+/* The D3cold notice follows the hold notice's colour rules: red on a terminal only, the text unchanged. */
+static void test_d3cold_notice_color(void)
+{
+	static const char red[] = "\033[31m", reset[] = "\033[0m";
+	const char *have_term = getenv("TERM"), *have_no_color = getenv("NO_COLOR");
+	char *term = have_term ? strdup(have_term) : NULL, *no_color = have_no_color ? strdup(have_no_color) : NULL;
+	char head[sizeof(red)] = "", *s;
+	size_t n;
+	FILE *f, *tty = NULL;
+	int m, fd = -1;
+
+	if ((have_term && !term) || (have_no_color && !no_color))
+		die("strdup");
+	set_env("TERM", "xterm");
+	set_env("NO_COLOR", NULL);
+	if (!(f = tmpfile()))
+		die("tmpfile");
+	gs_d3cold_notice(f);
+	s = stream_text(f);
+	CHECK(strcmp(s, D3COLD_NOTICE) == 0, "D3cold notice, not a terminal: plain, the owner's text:\n%s", s);
+	free(s);
+	if (!(f = tmpfile()))
+		die("tmpfile");
+	gs_d3cold_notice_color(f, 1);
+	s = stream_text(f);
+	n = strlen(s);
+	CHECK(n == strlen(red) + strlen(D3COLD_NOTICE) + strlen(reset) && strncmp(s, red, strlen(red)) == 0 &&
+	      strncmp(s + strlen(red), D3COLD_NOTICE, strlen(D3COLD_NOTICE)) == 0 && strcmp(s + n - strlen(reset), reset) == 0,
+	      "D3cold notice, colour forced: red, the unchanged text, the reset:\n%s", s);
+	free(s);
+	m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0 || grantpt(m) || unlockpt(m) || !ptsname(m) || (fd = open(ptsname(m), O_RDWR | O_NOCTTY)) < 0 ||
+	    !(tty = fdopen(fd, "w")))
+		die("pseudo-terminal");
+	gs_d3cold_notice(tty);
+	fflush(tty);
+	n = 0;
+	while (n < sizeof(red) - 1) {
+		ssize_t got = read(m, head + n, sizeof(red) - 1 - n);
+
+		if (got <= 0)
+			die("pseudo-terminal read");
+		n += (size_t)got;
+	}
+	CHECK(strcmp(head, red) == 0, "the D3cold notice on a terminal starts red");
+	fclose(tty);
+	close(m);
+	set_env("TERM", term);
+	set_env("NO_COLOR", no_color);
+	free(term);
+	free(no_color);
+}
+
+/*
+ * setup with a laptop GPU selected and no D3cold consent: the notice, then the question after every other one.
+ * Yes passes --disable-d3cold to doctor and install; no, an empty answer, no question or the end of input stop
+ * before any step. The flag answers it; without a laptop GPU it is a usage error. On an installed host whose
+ * config lacks the consent, a yes runs `install --driver=skip --disable-d3cold` and nothing else.
+ */
+static void test_setup_d3cold(void)
+{
+	static const struct fx_topo t4 = { "pci0000:00/0000:00:03.0", "0000:04:00.0" };
+	static const struct fx_fn lap04[] = { { "0000:04:00.0", "28e0", "030000", NULL }, { NULL, NULL, NULL, NULL } };
+	static const struct fx_fn desk[] = { { "0000:03:00.0", "2206", "030000", NULL }, { NULL, NULL, NULL, NULL } };
+	char root[GS_PATH_MAX], two[GS_PATH_MAX], desk_root[GS_PATH_MAX], cfg[GS_PATH_MAX], want[GS_PATH_MAX + 256];
+	char *out, *log;
+	struct gs_install_opts o;
+	int rc;
+
+	snprintf(root, sizeof(root), "%s/setup-d3cold", tmp);
+	make_card(root, &topo_default, laptop_gpu, 0, NULL);
+	setup_doctor_rc = setup_check_rc = 0;
+	setup_opts(&o);
+
+	/* Yes: the notice, the question with its hint, the flag in the summary and to doctor and install. */
+	rc = run_setup(root, "y\n", &o, 1, &out);
+	log = slurp(setup_log);
+	snprintf(want, sizeof(want), "R doctor --config %s/no-config --device 0000:03:00.0 --disable-d3cold\n"
+		 "R install --device 0000:03:00.0 --disable-d3cold\n", root);
+	CHECK(rc == 0 && contains(out, "\n" D3COLD_NOTICE "\n" D3COLD_Q_03 "\n" D3COLD_HINT "\n> ") &&
+	      count_of(out, "IMPORTANT:") == 1 && contains(out, "  = --disable-d3cold\n") &&
+	      contains(out, "geforce-sriov setup --no-prompt --device 0000:03:00.0 --disable-d3cold\n") &&
+	      pos_of(out, "The one eligible GPU, 0000:03:00.0, is selected") < pos_of(out, D3COLD_Q_03) &&
+	      pos_of(out, D3COLD_Q_03) < pos_of(out, "Setup runs with:") && log && strcmp(log, want) == 0,
+	      "laptop, yes: notice, question, --disable-d3cold to doctor and install: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+
+	/* No, or an empty answer: stopped before any step, the notice again, then why, exit 3. */
+	for (int k = 0; k < 2; k++) {
+		rc = run_setup(root, k ? "\n" : "n\n", &o, 1, &out);
+		log = slurp(setup_log);
+		CHECK(rc == GS_EXIT_REFUSED && contains(out, "  = no --disable-d3cold\n") && count_of(out, D3COLD_NOTICE) == 2 &&
+		      pos_of(out, "  = no --disable-d3cold\n") < pos_of(out, D3COLD_REFUSED_03) &&
+		      contains(out, D3COLD_REFUSED_03) && !log,
+		      "laptop, %s: stopped before any step with the refusal: %d\n%s", k ? "empty answer" : "no", rc, out);
+		free(log);
+		free(out);
+	}
+	/* The end of input at the question: the owner's line, exit 3, nothing run. */
+	rc = run_setup(root, "", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, D3COLD_Q_03) &&
+	      contains(out, "setup: end of input. Nothing changed. Use --disable-d3cold for a non-interactive run.\n") &&
+	      !contains(out, "refused, nothing changed") && !log,
+	      "laptop, end of input: refused, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* No question (--no-prompt) and no flag: the notice and the refusal, nothing run. */
+	rc = run_setup(root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_REFUSED && count_of(out, D3COLD_NOTICE) == 1 && !contains(out, "\n> ") &&
+	      contains(out, D3COLD_REFUSED_03) && !log, "laptop, no question: notice and refusal, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* --disable-d3cold answers it: no notice, no question, the flag to doctor and install. */
+	o.disable_d3cold = 1;
+	rc = run_setup(root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && !contains(out, "IMPORTANT:") && contains(log, " --device 0000:03:00.0 --disable-d3cold\nR install ") &&
+	      contains(log, "R install --device 0000:03:00.0 --disable-d3cold\n"),
+	      "laptop, --disable-d3cold: not asked, passed on: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+
+	/* The flag without a laptop GPU: usage error, nothing run. */
+	snprintf(desk_root, sizeof(desk_root), "%s/setup-d3cold-desk", tmp);
+	make_card(desk_root, &topo_default, desk, 0, NULL);
+	rc = run_setup(desk_root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_USAGE &&
+	      contains(out, "geforce-sriov: --disable-d3cold requires a selected laptop GPU. Nothing changed.\n"
+			    "Try 'geforce-sriov --help'.\n") && !log,
+	      "desktop, --disable-d3cold: usage, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	/* A desktop GPU alone: nothing about D3cold. */
+	setup_opts(&o);
+	rc = run_setup(desk_root, NULL, &o, 1, &out);
+	CHECK(rc == 0 && !contains(out, "D3cold"), "desktop: no D3cold question: %d\n%s", rc, out);
+	free(out);
+
+	/* Two laptop GPUs selected: the question names both. */
+	snprintf(two, sizeof(two), "%s/setup-d3cold-two", tmp);
+	make_card(two, &topo_default, laptop_gpu, 0, NULL);
+	make_card(two, &t4, lap04, 0, NULL);
+	rc = run_setup(two, "all\ny\n", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && contains(out, "Turn off D3cold for 0000:03:00.0, 0000:04:00.0 while geforce-sriov manages it? [y/N]\n") &&
+	      contains(log, "R install --device 0000:03:00.0 --device 0000:04:00.0 --disable-d3cold\n"),
+	      "two laptop GPUs: both named, one answer: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+
+	/*
+	 * An installed host whose config lacks the consent: asked first; yes runs only install, which records the
+	 * consent and leaves NVIDIA's files as the first install (or the user) left them.
+	 */
+	gs_pathf(cfg, sizeof(cfg), "%s/installed-config", root);
+	writef(cfg, "bdfs=0000:03:00.0\n");
+	setup_config = cfg;
+	rc = run_setup(root, "y\n", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && contains(out, D3COLD_Q_03) && contains(out, "  = --disable-d3cold\n") && log &&
+	      strcmp(log, "R install --driver=skip --disable-d3cold\n") == 0,
+	      "installed host without consent, yes: install --driver=skip --disable-d3cold, nothing else: %d\n%s\n%s",
+	      rc, out, log ? log : "");
+	free(log);
+	free(out);
+	rc = run_setup(root, "n\n", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == GS_EXIT_REFUSED && contains(out, D3COLD_REFUSED_03) && !log,
+	      "installed host without consent, no: refused, nothing run: %d\n%s", rc, out);
+	free(log);
+	free(out);
+	o.disable_d3cold = 1;
+	rc = run_setup(root, NULL, &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(rc == 0 && !contains(out, "IMPORTANT:") && !contains(out, "is ignored") && log &&
+	      strcmp(log, "R install --driver=skip --disable-d3cold\n") == 0,
+	      "installed host, --disable-d3cold: install records it: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+	/* The consent in the config: no question; the run goes on to doctor. */
+	writef(cfg, "bdfs=0000:03:00.0\nd3cold=off\n");
+	setup_opts(&o);
+	rc = run_setup(root, "", &o, 1, &out);
+	log = slurp(setup_log);
+	CHECK(!contains(out, "D3cold") && contains(log, "R doctor") && !contains(log, "R install"),
+	      "installed host with consent: not asked: %d\n%s\n%s", rc, out, log ? log : "");
+	free(log);
+	free(out);
+	setup_config = NULL;
+}
+
 int main(void)
 {
+	/* Several tests run the CLI against the live system and rely on it refusing an unprivileged caller. */
+	if (geteuid() == 0 && !getenv("GS_TEST_ALLOW_ROOT")) {
+		fprintf(stderr, "test_lifecycle: refusing to run as root, where some tests could change this host; "
+			"set GS_TEST_ALLOW_ROOT=1 to run anyway\n");
+		return 2;
+	}
 	cli = getenv("GS_CLI");
 	srcdir = getenv("GS_SRC");
 	if (!cli || !srcdir) {
@@ -6959,6 +8876,7 @@ int main(void)
 	test_install_guards();
 	test_install_link_kept();
 	test_dkms_step();
+	test_dkms_old_tree();
 	test_doctor_scope();
 	test_status_guidance();
 	test_topologies();
@@ -6966,13 +8884,19 @@ int main(void)
 	test_procfs_read();
 	test_release_config();
 	test_release_cli();
+	test_hold_notice_color();
 	test_display_inspect();
 	test_release_diag();
 	test_prepare_default_and_deferral();
 	test_prepare_msix_message();
+	test_prepare_power_state();
+	test_laptop_prepare();
+	test_laptop_doctor();
+	test_write_attr();
 	test_prepare_release();
 	test_vf_count();
 	test_activate();
+	test_laptop_activate_check();
 	test_activate_mixed();
 	test_activate_types();
 	test_run_capture();
@@ -6999,6 +8923,13 @@ int main(void)
 	test_foreign_driver();
 	test_setup_existing_driver();
 	test_install_next();
+	test_install_hold();
+	test_d3cold_config();
+	test_laptop_gpus();
+	test_install_d3cold();
+	test_d3cold_notice_color();
+	test_setup_d3cold();
+	test_install_hold_dropped();
 
 	cleanup(tmp);
 	printf("test_lifecycle: %d checks, %d failures\n", checks, failures);

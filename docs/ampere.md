@@ -5,6 +5,7 @@
 | Item | Value |
 |---|---|
 | Device IDs | Every Ampere row in [devices.md](devices.md#rows). Tested card: `10de:2206` (RTX 3080 20GB) |
+| Laptop GPUs | Supported through the same path as the desktop cards ([Laptop support](laptops.md)). No laptop GPU has been tested |
 | Presented as | RTX A6000, `10de:2230` |
 | VFs per card | 4 |
 | Host driver | NVIDIA vGPU software 19.5, host driver 580.159.01, vGPU-KVM proprietary build, CPU-side mode with `NVreg_EnableGpuFirmware=0`, GSP not used |
@@ -182,5 +183,5 @@ Method:
 
 ## Known limits
 
-- Four VFs per card is the package maximum.
+- `vfs` accepts values from 1 to the card's ceiling (16 on Ampere and `28b0`, 4 on other Ada cards); NVIDIA's patched driver uses at most 4 VFs per card.
 - The open driver flavour and the GSP route are not supported.

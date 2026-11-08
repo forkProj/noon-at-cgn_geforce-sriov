@@ -89,7 +89,8 @@ static int bridge_ari_forwarding(const char *bridge_dir)
 /*
  * Is MSI-X (capability 0x11) in the PF's capability list, walked as the kernel's
  * pci_find_capability() does? -1 when <dir>/config cannot tell: unreadable, shorter than 0x40
- * bytes, or ending before the walk does (unprivileged reads stop at 64 bytes).
+ * bytes, ending before the walk does (unprivileged reads stop at 64 bytes), or reading all-ones
+ * at its start, as a powered-off (D3cold) or lost device does: there is no list to walk then.
  */
 static int msix_linked(const char *dir)
 {
@@ -106,7 +107,7 @@ static int msix_linked(const char *dir)
 		return -1;
 	n = pread(fd, cfg, sizeof(cfg), 0);
 	close(fd);
-	if (n < 0x40)
+	if (n < 0x40 || (cfg[0] & cfg[1] & cfg[2] & cfg[3]) == 0xff)
 		return -1;
 	if (!(cfg[0x06] & 0x10))
 		return 0;
@@ -686,6 +687,7 @@ int gs_prepared_read(const char *run_dir, const struct gs_addr *pf, struct gs_pr
 	size_t len;
 
 	memset(rec, 0, sizeof(*rec));
+	rec->msix_linked = -1;
 	if (gs_pathf(p, sizeof(p), "%s/" GS_PREPARED_NAME "/%s", run_dir, pf->str) ||
 	    gs_read_whole(p, &data, &len, 4096))
 		return 0;
@@ -695,6 +697,8 @@ int gs_prepared_read(const char *run_dir, const struct gs_addr *pf, struct gs_pr
 			gs_copy(rec->boot_id, sizeof(rec->boot_id), line + 8);
 		else if (strncmp(line, "console_release=", 16) == 0)
 			gs_copy(rec->console_release, sizeof(rec->console_release), line + 16);
+		else if (strcmp(line, "msix_linked=1") == 0 || strcmp(line, "msix_linked=0") == 0)
+			rec->msix_linked = line[12] - '0';
 	}
 	free(data);
 	return 0;

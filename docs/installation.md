@@ -28,6 +28,7 @@ The individual commands below are for manual operation and troubleshooting.
   Either install it with DKMS, which rebuilds kernel modules for each new kernel, or have its `.run` file ready for `--driver-file` ([One command from a clean host](#one-command-from-a-clean-host)).
 - A card from the [device table](devices.md#generations) that is not the
   [boot display](#boot-display-card), or a console release for it if it is.
+- On a laptop, read [Laptop support](laptops.md) first: system sleep must be blocked and NVIDIA's runtime power management turned off.
 - The IOMMU turned on in firmware (VT-d or AMD-Vi, plus *Above 4G decoding*) and in the kernel.
 - A vGPU licence setup of your own for the guests. Licensing is outside this project.
 - A way to cold power-cycle the machine (IPMI, a smart plug or the power button), and SSH or a console
@@ -90,6 +91,12 @@ For the boot display, read [Boot display card](#boot-display-card) before instal
 - If the host's only NVIDIA card is the boot display, `setup` asks the console-release question for it. Without a terminal, or with `--no-prompt`, it refuses before installing and names `--device` and `--boot-display-release`.
 - Selecting a boot-display card at the prompt requires a console-release grant, default no.
   The grant releases nothing now; after the power cycle, `setup` asks again before releasing it.
+- After granting console release, `setup` displays an IMPORTANT notice and asks whether to create the hold file.
+  Accepting passes `--hold-nvidia` to `install`.
+  If declined, or with `--no-prompt` or without a terminal, `setup` shows the notice after installation, with the file's path and its two lines.
+- If any selected GPU is a laptop GPU, `setup` then shows a D3cold notice and asks for consent to keep it powered; the default is no ([Consent](laptops.md#consent)).
+  Answering yes passes `--disable-d3cold` to `doctor` and `install`.
+  `setup` exits 3 before installing anything if you decline, or if it cannot prompt (`--no-prompt` or no terminal) and `--disable-d3cold` was not given.
 - Missing prerequisites cause refusal; install the listed packages and rerun.
 
 If NVIDIA's driver already owns a card, preparation waits until the next boot.
@@ -98,8 +105,10 @@ The normal boot path prepares the cards and activates their VFs.
 Run `sudo ./geforce-sriov setup` again after boot to check every VF and see the required guest drivers.
 On the boot-display path, the boot units defer and `setup` asks before releasing the console.
 
-Repeating the first command is safe: once installed, `setup` ignores `--driver-file`, `--vfs`, `--boot-display-release`, `--nvidia-source` and `--driver=skip`.
+Repeating the first command is safe: once installed, `setup` ignores `--driver-file`, `--vfs`, `--boot-display-release`, `--hold-nvidia`, `--nvidia-source` and `--driver=skip`.
 A `--device` selection that differs from the config is refused.
+On an installed host, `setup` asks for D3cold consent before `doctor` if the config lacks it and a laptop GPU is selected.
+Accepting or passing `--disable-d3cold` runs `install --driver=skip --disable-d3cold` to record consent, then ends the `setup` run.
 If VFs are not ready and the loaded `nvidia` module differs from the installed build, `setup` stops after `check` with exit 3 and changes nothing.
 Cold power-cycle, then run `setup` again.
 In this state, `status` also requests a power cycle and exits 1.
@@ -112,6 +121,16 @@ The flags below work on `install` directly as well.
 | `--accept-nvidia-license` | Accepts NVIDIA's licence and runs `sh PATH --silent --dkms --skip-module-load` when the package's userspace is not already installed. The licence is `LICENSE` in the extraction. Without this flag, installation extracts the package, then refuses before other writes if userspace is missing and gives the manual installer command (`sh PATH --dkms --skip-module-load`). |
 | `--nvidia-source DIR` | Uses a kernel source tree outside `/usr/src/nvidia-<version>`, such as an extracted `kernel/` directory. Cannot combine with `--driver-file`. |
 | `--driver=skip` | Leaves NVIDIA's module, plugin and modprobe option untouched. Use only after completing [the manual driver path](driver-patch.md#the-manual-path). |
+| `--hold-nvidia` | Creates `/etc/modprobe.d/nvidia-manual-load.conf` with the two required lines and mode 0644, after the driver step and alongside the config. Records the file so `uninstall` can remove it if unchanged. Requires `--boot-display-release`, or a console-release grant in the config with no `--device` option (exit 2 otherwise). |
+| `--disable-d3cold` | Records D3cold consent as `d3cold=off` in the config so `prepare` keeps the selected laptop GPUs powered ([Consent](laptops.md#consent)).<br><br>Requires at least one selected laptop GPU (exit 2 otherwise); a staged install (`--destdir`) records consent without this check. Passing `--device` without this flag removes consent from the config. |
+
+Passing `--device` without `--boot-display-release` drops the console-release grant, so combining it with `--hold-nvidia` exits 2 even if the config already has a grant.
+
+If any file in `/etc/modprobe.d/` already holds `nvidia` back with both required lines, `install` names it and creates no hold file.
+If `/etc/modprobe.d/nvidia-manual-load.conf` exists but `install` did not write it, installation refuses before writing anything (exit 3).
+
+If you edited a hold file that `install` wrote, it leaves the file unchanged and names it as long as both required lines remain.
+If your edit removed either line, installation refuses (exit 3) and names the file.
 
 The package is extracted with `sh PATH --extract-only` into `/var/lib/geforce-sriov/nvidia/<version>/`.
 If its filename has no version, the directory uses the first 16 hex digits of its SHA-256 instead.
@@ -162,6 +181,10 @@ The first column, for example `0000:01:00.0`, is the address every command here 
 
 Before installation, warnings about the unbuilt module or a card already owned by NVIDIA are expected.
 An absent config is informational; a boot-display failure needs the explicit opt-in below, and `doctor --device BDF --boot-display-release BDF` checks the card with that opt-in.
+Add `--hold-nvidia` if you plan to have `install` create the hold file.
+`setup` adds the option when you choose the hold.
+For a laptop GPU, pass `--disable-d3cold` to `doctor` when you plan to record D3cold consent with `install`.
+`setup` adds this option when you answer yes to its D3cold question.
 
 `make check` runs the offline tests and touches no hardware.
 
@@ -316,10 +339,12 @@ geforce-sriov check [--device BDF]... [--type N]
 
 Run `check` before every VM start.
 It changes nothing, needs no root and prints one line for each VF of the selected cards.
+On a laptop GPU, a read of its config space resumes the GPU or VF if it is suspended.
 It exits 0 only when every VF:
 
 - is bound to `nvidia`,
-- has `power/control=on` and `runtime_status=active`, and
+- has `power/control=on` and `runtime_status=active`,
+- on a laptop GPU, answers a config read at offset `0x08`, and
 - carries the expected type (`N` with `--type`, else the type `activate` takes from the config, else
   the generation's default).
 
@@ -499,7 +524,7 @@ flowchart TD
 1. Grant the release at install time, together with any other cards:
 
    ```sh
-   sudo ./geforce-sriov install --device 0000:01:00.0 --boot-display-release 0000:01:00.0
+   sudo ./geforce-sriov install --device 0000:01:00.0 --boot-display-release 0000:01:00.0 --hold-nvidia
    # with a second card: --device 0000:02:00.0 --device 0000:01:00.0 --boot-display-release 0000:01:00.0
    ```
 
@@ -509,8 +534,11 @@ flowchart TD
    With a grant, the prepare unit defers all selected cards and holds `nvidia-vgpud` back; the activate unit does not run.
    Nothing may bind any selected card before `prepare`.
    Leave `nvidia-persistenced`, `nvidia-vgpu-mgr` and similar services disabled.
-   The package changes no blacklists or services for you.
-   Unless an existing file holds both lines, create `/etc/modprobe.d/nvidia-manual-load.conf`:
+   The package changes no services for you.
+   `setup` asks whether to create `/etc/modprobe.d/nvidia-manual-load.conf`.
+   You can also create it directly with `install --hold-nvidia`.
+
+   If neither creates the file and no existing file contains both required lines, create it manually:
 
    ```text
    blacklist nvidia
@@ -534,7 +562,7 @@ flowchart TD
    Yes runs the four commands in order and stops on the first failure.
    No prints them and exits 0.
    With `--no-prompt`, no terminal or end of input, it refuses without changes (exit 3).
-   If `nvidia` is already loaded, release is impossible this boot: create the hold, cold power-cycle and retry.
+   If `nvidia` is already loaded, release is impossible this boot: create the hold file at `/etc/modprobe.d/nvidia-manual-load.conf`, cold power-cycle and retry.
 
    `--release-console` must name exactly the cards granted in the config.
    `prepare` checks every card first and refuses, changing nothing, if the console is not the card's own simple framebuffer or anything else still uses the card.
@@ -550,9 +578,10 @@ Its journal records deferral and the manual commands.
 
 ### Returning to automatic preparation
 
-1. Run `install --device …` again with only the non-display cards.
-2. Remove `/etc/modprobe.d/nvidia-manual-load.conf`, the hold from [Setting it up](#setting-it-up).
-   Otherwise `nvidia` stays unloaded and activation refuses; `doctor` warns about the obsolete hold.
+1. Run `install --device …` again, selecting only the non-display GPUs and omitting `--boot-display-release`.
+2. If `setup` or `install --hold-nvidia` created `/etc/modprobe.d/nvidia-manual-load.conf` and it is unchanged, `install` removes it and prints a removal message.
+   If you created or modified the file yourself, it is left in place and reported so you can remove it manually.
+   If the hold remains, `nvidia` does not load at boot, `activate` refuses, and `doctor` warns that the hold is there with no console release granted.
 
 The next boot prepares the cards automatically and leaves the boot display and its console alone.
 
@@ -594,12 +623,17 @@ The target is the path from `modinfo -k <kernel release> -n nvidia`, or `/lib/mo
 A later install takes a fresh backup.
 The driver log and empty build, stock and state directories are removed.
 
-Your boot-display hold `/etc/modprobe.d/nvidia-manual-load.conf` is not removed.
-Remove it if nothing else needs it, or NVIDIA's driver stays unloaded after each boot.
+Uninstall removes `/etc/modprobe.d/nvidia-manual-load.conf` if it was created by `setup` or `install --hold-nvidia` and has not been modified.
+Changed files and files you created yourself are left alone.
+Uninstall reports any remaining hold so you can remove it if nothing else needs it.
 
 If restoration fails, uninstall exits 1 but removes its other files.
 It keeps `geforce-sriov-driver` and all stock backups.
 Fix the reported cause, then run the printed `geforce-sriov-driver --restore` command or the backup-copy command above as root.
+
+If `geforce-sriov-driver` changed since install, uninstall refuses to run it and exits 1.
+The message tells you to check the file, or restore the installed copy with `geforce-sriov install` and run uninstall again.
+It also lists the backup-copy commands.
 See [Reverting](driver-patch.md#reverting) for the plugin link and modprobe file.
 
 If you installed with `--driver=skip`, restore your own backup of NVIDIA's files ([Reverting](driver-patch.md#reverting)).
@@ -619,13 +653,19 @@ For implementation details, see [doctor and status](technical-reference.md#docto
 | NVIDIA's host package | Proprietary flavour, installed with DKMS: vGPU software 19.5, host driver 580.159.01. While `nvidia` is loaded, another host driver version is reported as not supported and does not fail the check | `modinfo -F version nvidia` (works without loading the module; `/proc/driver/nvidia/version` exists only while `nvidia` is loaded) |
 | NVIDIA's units | `nvidia-vgpud.service` and `nvidia-vgpu-mgr.service` exist | `systemctl list-unit-files 'nvidia-vgpu*'` lists both. If not, see [below](#nvidias-vgpu-daemon-units) |
 | The card | In the device table, function `.0`, a PCI bridge directly above it, and no other device on its PCI bus | `./geforce-sriov devices`; `./geforce-sriov doctor --device BDF` checks the rest |
+| Laptop power | On a laptop GPU:<br>D3cold consent is recorded as `d3cold=off` or planned with `--disable-d3cold`.<br>The GPU answers a config read.<br>A file in `/etc/modprobe.d/` sets `options nvidia NVreg_DynamicPowerManagement=0`.<br>`sleep.target` is masked ([D3cold](laptops.md#d3cold)). | `grep d3cold /etc/geforce-sriov/config`; `grep -h NVreg_DynamicPowerManagement /etc/modprobe.d/*.conf`; `systemctl is-enabled sleep.target` prints `masked` |
 | Boot display | The card is not the boot display, or its console release is granted | `cat /sys/bus/pci/devices/<BDF>/boot_vga` |
 | Early loading | Nothing loads `nvidia` before the boot unit: not `/etc/modules`, `/etc/modules-load.d/` or the initramfs | `doctor` warns when it finds it |
-| Console card hold | With `boot_display_release` set, `/etc/modprobe.d/` holds `blacklist nvidia` and `install nvidia /bin/false` ([Setting it up](#setting-it-up)) | `grep -h nvidia /etc/modprobe.d/*.conf` |
+| Console card hold | With `boot_display_release` set, `/etc/modprobe.d/` holds `blacklist nvidia` and `install nvidia /bin/false` ([Setting it up](#setting-it-up)). With `doctor --hold-nvidia`, a missing hold is reported as information rather than a warning, because `install` writes it | `grep -h nvidia /etc/modprobe.d/*.conf` |
 | GSP option | No file in `/etc/modprobe.d/` sets `NVreg_EnableGpuFirmware` to a value other than `0`; a file that sets `0` is noted, and the driver step keeps it | `grep -h NVreg_EnableGpuFirmware /etc/modprobe.d/*.conf` |
 | Hook support | The loaded driver build is one the identity hook acts on | `doctor` reports it once the driver is loaded |
 | Daemon drop-ins | No drop-in of `nvidia-vgpud` or `nvidia-vgpu-mgr` other than the package's own `geforce-sriov.conf` sets `LD_PRELOAD`; in `nvidia-vgpud.service.d` only a file read after `geforce-sriov.conf` counts. Each one found is a warning naming the file, the unit and the hook to point it at | `grep -l LD_PRELOAD /etc/systemd/system/nvidia-vgpu*.service.d/*.conf` |
 | vGPU plugin | `libnvidia-vgpu.so` resolves to the patched plugin copy, SHA-256 `aa4fdeb5…`. Any other file is a warning with the reason, and an earlier copy with only the placement change names `install`. Before the driver step has run, the stock plugin is expected there and is only noted | `sha256sum "$(readlink -f /usr/lib/x86_64-linux-gnu/libnvidia-vgpu.so)"` |
+
+For laptop power, `doctor` warns about missing power-management or sleep settings, but fails a laptop GPU that lacks consent or does not answer.
+It reports recorded or planned consent as information.
+`doctor` also reports the GPU's `runtime_status`, `power/control` and `d3cold_allowed`, and the bridge's `power/control`, as information.
+It does not write any of these settings.
 
 `install` separately checks the object and plugin SHA-256 digests against [Supported inputs](driver-patch.md#supported-inputs).
 

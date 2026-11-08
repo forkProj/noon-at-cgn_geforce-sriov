@@ -29,6 +29,8 @@
 #include "gs_lifecycle.h"
 
 #define LIVEPATCH_WAIT_MS 15000
+/* How long prepare waits for a runtime-suspended PF to wake after power/control=on. */
+#define PF_WAKE_MS 5000u
 #define BRIDGE_WAKE_MS 2000
 #define REMOVE_WAIT_MS 5000
 #define RETURN_WAIT_MS 10000
@@ -69,12 +71,36 @@ static const char *const recovery_msg =
 
 static int cmdline_noari(const char *procroot);
 static const char *plugin_link(void);
+static int wait_attr_eq(const char *path, const char *want, unsigned int ms);
 static const struct gs_display *granted_display(const struct gs_config *cfg, const char *sys, const char *proc,
 						const struct gs_card *c, struct gs_display *buf);
 
 static const char *sw(int v)
 {
 	return v == GS_SW_OFF ? "off" : "on";
+}
+
+/*
+ * Is a power/runtime_status value a runtime-suspended device? A hybrid laptop's GPU then may sit in
+ * D3cold, where its config space reads all-ones.
+ */
+static int runtime_suspended(const char *status)
+{
+	return strcmp(status, "suspended") == 0 || strcmp(status, "suspending") == 0;
+}
+
+/* <pf>/power/runtime_status into buf: 0, or -1 when it is absent or unreadable (buf ""). */
+static int pf_runtime_status(const char *sysroot, const struct gs_addr *pf, char *buf, size_t len)
+{
+	char p[GS_PATH_MAX];
+
+	buf[0] = '\0';
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/power/runtime_status", sysroot, pf->str) ||
+	    gs_read_attr(p, buf, len)) {
+		buf[0] = '\0';
+		return -1;
+	}
+	return 0;
 }
 
 int gs_cmd_devices(void)
@@ -264,6 +290,352 @@ static int module_selects(const struct module_state *m, const struct gs_addr *pf
 
 	return m->loaded && gs_parse_addr_list("bdfs", m->bdfs, list, &n, err, sizeof(err)) == 0 &&
 	       addr_listed(list, n, pf->str);
+}
+
+/* ---- laptop power guards ------------------------------------------------------------------------ */
+
+/* What a refusal of a GPU that does not come back from a power-off suggests. */
+#define WAKE_REMEDY \
+	"Switch the laptop to its discrete GPU (dGPU or discrete mode in the firmware setup), or stop whatever powers " \
+	"the GPU off (for example bbswitch), then run prepare again"
+
+/* The table entry of pf by its device attribute (the kernel's copy of the ID, readable while the card is off). */
+static const struct gs_device *pf_entry(const char *sysroot, const struct gs_addr *pf, unsigned int *device)
+{
+	char p[GS_PATH_MAX];
+	unsigned int d = 0;
+
+	*device = 0;
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/device", sysroot, pf->str) || gs_read_hex(p, &d))
+		return NULL;
+	*device = d;
+	return gs_device_lookup(d);
+}
+
+unsigned int gs_laptop_gpus(const char *sys, const struct gs_addr *list, unsigned int n, struct gs_addr *out)
+{
+	unsigned int k = 0, device;
+
+	for (unsigned int i = 0; i < n; i++) {
+		const struct gs_device *e = pf_entry(sys, &list[i], &device);
+
+		if (e && e->laptop)
+			out[k++] = list[i];
+	}
+	return k;
+}
+
+int gs_d3cold_usage(void)
+{
+	fprintf(stderr, "geforce-sriov: --disable-d3cold requires a selected laptop GPU. Nothing changed.\n"
+		"Try 'geforce-sriov --help'.\n");
+	return GS_EXIT_USAGE;
+}
+
+/* s at the end of the string in buf (len bytes), cut short when it does not fit. */
+static void str_add(char *buf, size_t len, const char *s)
+{
+	size_t n = strlen(buf);
+
+	snprintf(buf + n, len - n, "%s", s);
+}
+
+void gs_d3cold_why(char *buf, size_t len, const struct gs_addr *laptops, unsigned int n, const struct gs_addr *sel,
+		   unsigned int nsel, const struct gs_addr *rel, unsigned int nrel, const char *indent)
+{
+	unsigned int i;
+
+	buf[0] = '\0';
+	str_add(buf, len, n > 1 ? "no D3cold consent in the config for laptop GPUs " :
+				  "no D3cold consent in the config for laptop GPU ");
+	for (i = 0; i < n; i++) {
+		if (i)
+			str_add(buf, len, ", ");
+		str_add(buf, len, laptops[i].str);
+	}
+	str_add(buf, len, ".\n");
+	str_add(buf, len, indent);
+	str_add(buf, len, "Run geforce-sriov setup, or:\n");
+	str_add(buf, len, indent);
+	/* --device replaces the selection and its grants: name them all, so the install keeps them. */
+	str_add(buf, len, "  geforce-sriov install");
+	for (i = 0; i < nsel; i++) {
+		str_add(buf, len, " --device ");
+		str_add(buf, len, sel[i].str);
+	}
+	for (i = 0; i < nrel; i++) {
+		str_add(buf, len, " --boot-display-release ");
+		str_add(buf, len, rel[i].str);
+	}
+	str_add(buf, len, " --disable-d3cold\n");
+	str_add(buf, len, indent);
+	str_add(buf, len, "Why: docs/laptops.md#d3cold.");
+}
+
+/* n bytes of <dir>/config from off into buf: 0, or -1 when fewer can be read (unprivileged reads stop at 64). */
+static int config_read(const char *dir, unsigned int off, void *buf, size_t n)
+{
+	char p[GS_PATH_MAX];
+	ssize_t got;
+	int fd;
+
+	if (gs_pathf(p, sizeof(p), "%s/config", dir) || (fd = open(p, O_RDONLY | O_CLOEXEC)) < 0)
+		return -1;
+	got = pread(fd, buf, n, (off_t)off);
+	close(fd);
+	return got == (ssize_t)n ? 0 : -1;
+}
+
+static int config_dword(const char *dir, unsigned int off, unsigned int *out)
+{
+	unsigned char b[4];
+
+	if (config_read(dir, off, b, sizeof(b)))
+		return -1;
+	*out = (unsigned int)b[0] | (unsigned int)b[1] << 8 | (unsigned int)b[2] << 16 | (unsigned int)b[3] << 24;
+	return 0;
+}
+
+/*
+ * The config-read gate. A sysfs config read powers a D3cold device up first, so what it returns is the card's own
+ * answer, which runtime_status is not: the first 256 bytes must read vendor 10de with device, and the control
+ * register of the PCI power management capability must say D0. 0, or -1 with what was read in why.
+ */
+static int config_gate(const char *dir, unsigned int device, char *why, size_t len)
+{
+	unsigned char cfg[256];
+	unsigned int pos, guard = 0;
+
+	if (config_read(dir, 0, cfg, sizeof(cfg))) {
+		snprintf(why, len, "its config space cannot be read");
+		return -1;
+	}
+	if (((unsigned int)cfg[0] | (unsigned int)cfg[1] << 8) != GS_VENDOR_NVIDIA ||
+	    ((unsigned int)cfg[2] | (unsigned int)cfg[3] << 8) != device) {
+		snprintf(why, len, "its config space reads %02x%02x:%02x%02x, not 10de:%04x", cfg[1], cfg[0], cfg[3], cfg[2],
+			 device);
+		return -1;
+	}
+	pos = cfg[0x06] & 0x10 ? cfg[0x34] & 0xfcu : 0;
+	while (pos >= 0x40 && pos < 0xf8 && cfg[pos] != 0x01 && guard++ < 48)
+		pos = cfg[pos + 1] & 0xfcu;
+	if (pos < 0x40 || pos >= 0xf8 || cfg[pos] != 0x01) {
+		snprintf(why, len, "its config space shows no power management capability");
+		return -1;
+	}
+	if (cfg[pos + 4] & 3) {
+		snprintf(why, len, "its power management control register says D%u, not D0", cfg[pos + 4] & 3u);
+		return -1;
+	}
+	return 0;
+}
+
+/* The sysfs directory of the PCI bridge above pf into out: 0, or -1 when its parent is not a PCI function. */
+static int pf_bridge_dir(const char *sysroot, const struct gs_addr *pf, char *out, size_t len)
+{
+	char p[GS_PATH_MAX], real[PATH_MAX], *slash;
+	struct gs_addr a;
+
+	if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s", sysroot, pf->str) || !realpath(p, real) ||
+	    !(slash = strrchr(real, '/')))
+		return -1;
+	*slash = '\0';
+	slash = strrchr(real, '/');
+	if (!slash || gs_addr_parse(slash + 1, &a))
+		return -1;
+	gs_copy(out, len, real);
+	return 0;
+}
+
+/*
+ * on to the power/control of the bridge at dir, then up to BRIDGE_WAKE_MS for its runtime_status to say active
+ * ("unsupported" means runtime PM is disabled for it, so it is not runtime-suspended). 0, the write's -errno, or
+ * 1 when it did not say so.
+ */
+static int bridge_awake(int (*write_attr)(const char *, const char *), const char *dir)
+{
+	char p[GS_PATH_MAX];
+	int r;
+
+	if (gs_pathf(p, sizeof(p), "%s/power/control", dir))
+		return -ENAMETOOLONG;
+	if ((r = write_attr(p, "on")))
+		return r;
+	if (gs_pathf(p, sizeof(p), "%s/power/runtime_status", dir))
+		return -ENAMETOOLONG;
+	return wait_attr_eq(p, "unsupported", 0) && wait_attr_eq(p, "active", BRIDGE_WAKE_MS) ? 1 : 0;
+}
+
+/* What wake_card() changed on one PF, so that it can be given back. */
+struct woken {
+	struct gs_addr pf;
+	int laptop;
+	int wrote_control, wrote_d3cold, wrote_bridge;
+	char dir[GS_PATH_MAX];    /* the PF's sysfs directory */
+	char control[16];         /* its power/control before */
+	char d3cold[8];           /* its d3cold_allowed before */
+	char bridge[GS_PATH_MAX]; /* the bridge's sysfs directory; "" without one */
+	char bridge_control[16];  /* the bridge's power/control before */
+	char done[320];           /* one line on what was done */
+};
+
+/* Write the old value back to path, the attribute what of who; nothing when the old value is unknown. */
+static void give_back(int (*write_attr)(const char *, const char *), const char *path, const char *old,
+		      const char *who, const char *what)
+{
+	if (!old[0])
+		return;
+	if (write_attr(path, old))
+		fprintf(stderr, "geforce-sriov: %s: restoring %s=%s failed\n", who, what, old);
+	else
+		printf("%s: %s restored to %s\n", who, what, old);
+}
+
+/* Give back what wake_card() wrote on each of the n PFs (none of them was prepared). */
+static void unwake(int (*write_attr)(const char *, const char *), const struct woken *w, unsigned int n)
+{
+	char p[GS_PATH_MAX];
+
+	for (unsigned int i = 0; i < n; i++) {
+		const char *slash = strrchr(w[i].bridge, '/');
+
+		if (w[i].wrote_d3cold && !gs_pathf(p, sizeof(p), "%s/d3cold_allowed", w[i].dir))
+			give_back(write_attr, p, w[i].d3cold, w[i].pf.str, "d3cold_allowed");
+		if (w[i].wrote_control && !gs_pathf(p, sizeof(p), "%s/power/control", w[i].dir))
+			give_back(write_attr, p, w[i].control, w[i].pf.str, "power/control");
+		if (w[i].wrote_bridge && strcmp(w[i].bridge_control, "on") != 0 && slash &&
+		    !gs_pathf(p, sizeof(p), "%s/power/control", w[i].bridge))
+			give_back(write_attr, p, w[i].bridge_control, slash + 1, "bridge power/control");
+	}
+}
+
+/*
+ * Before the first config-space read of pf: a runtime-suspended PF (power/runtime_status suspended or suspending)
+ * and every laptop row are brought up and checked by the config-read gate (config_gate()). In this order: a laptop
+ * PF whose status says it is up must already pass the gate (nothing is written otherwise); the bridge above is
+ * woken (bridge_awake()); the PF's power/control goes to on; a laptop PF's d3cold_allowed goes to 0, so it cannot
+ * drop to D3cold (a cold reset that loses its SR-IOV state and every vGPU); then up to PF_WAKE_MS for the status to
+ * leave suspend and the gate to pass. A laptop's bridge stays on for the session; a desktop card's bridge gets its
+ * old setting back. A desktop PF that is not suspended is left alone: nothing is read, written or printed.
+ * 1 done (*w says what, w->done in one line); 0 nothing to do; -1 a write failed, -2 the card did not come back.
+ * On -1 and -2 everything written is given back and why says what happened.
+ */
+static int wake_card(const char *sysroot, int (*write_attr)(const char *, const char *), const struct gs_addr *pf,
+		     struct woken *w, char *why, size_t len)
+{
+	char st[GS_PATH_MAX], p[GS_PATH_MAX], was[32], now[32] = "", gate[96] = "";
+	unsigned int device = 0;
+	const struct gs_device *e = pf_entry(sysroot, pf, &device);
+	const char *bname;
+	int r, suspended;
+
+	memset(w, 0, sizeof(*w));
+	w->pf = *pf;
+	w->laptop = e && e->laptop;
+	pf_runtime_status(sysroot, pf, was, sizeof(was));
+	suspended = runtime_suspended(was);
+	if ((!suspended && !w->laptop) || gs_pathf(w->dir, sizeof(w->dir), "%s/bus/pci/devices/%s", sysroot, pf->str) ||
+	    gs_pathf(st, sizeof(st), "%s/power/runtime_status", w->dir))
+		return 0;
+	if (!suspended && config_gate(w->dir, device, gate, sizeof(gate))) {
+		snprintf(why, len, "%s does not answer although its runtime_status is %s: %s (a laptop GPU that did not come "
+			 "back from D3cold)", pf->str, was[0] ? was : "absent", gate);
+		return -2;
+	}
+	if (!pf_bridge_dir(sysroot, pf, w->bridge, sizeof(w->bridge))) {
+		bname = strrchr(w->bridge, '/') + 1;
+		if (gs_pathf(p, sizeof(p), "%s/power/control", w->bridge) ||
+		    gs_read_attr(p, w->bridge_control, sizeof(w->bridge_control)))
+			w->bridge_control[0] = '\0';
+		r = bridge_awake(write_attr, w->bridge);
+		if (r < 0) {
+			snprintf(why, len, "%s: writing on to the power/control of its bridge %s failed: %s", pf->str, bname,
+				 strerror(-r));
+			return -1;
+		}
+		w->wrote_bridge = 1;
+		if (r > 0) {
+			unwake(write_attr, w, 1);
+			snprintf(why, len, "%s: its bridge %s did not report runtime_status=active", pf->str, bname);
+			return -2;
+		}
+	}
+	if (gs_pathf(p, sizeof(p), "%s/power/control", w->dir) || gs_read_attr(p, w->control, sizeof(w->control)))
+		w->control[0] = '\0';
+	if (strcmp(w->control, "on") != 0) {
+		if ((r = write_attr(p, "on"))) {
+			unwake(write_attr, w, 1);
+			snprintf(why, len, "%s: writing on to its power/control failed: %s", pf->str, strerror(-r));
+			return -1;
+		}
+		w->wrote_control = 1;
+	}
+	if (w->laptop) {
+		if (gs_pathf(p, sizeof(p), "%s/d3cold_allowed", w->dir) || gs_read_attr(p, w->d3cold, sizeof(w->d3cold)))
+			w->d3cold[0] = '\0';
+		if (strcmp(w->d3cold, "0") != 0) {
+			if ((r = write_attr(p, "0"))) {
+				unwake(write_attr, w, 1);
+				snprintf(why, len, "%s: writing 0 to its d3cold_allowed failed: %s", pf->str, strerror(-r));
+				return -1;
+			}
+			w->wrote_d3cold = 1;
+		}
+	}
+	for (unsigned int t = 0;; t += POLL_MS) {
+		if (gs_read_attr(st, now, sizeof(now)))
+			now[0] = '\0';
+		if (!config_gate(w->dir, device, gate, sizeof(gate)) && !runtime_suspended(now))
+			break;
+		if (t >= PF_WAKE_MS) {
+			unwake(write_attr, w, 1);
+			snprintf(why, len, "%s is powered down (runtime_status was %s) and did not come back within %u s of "
+				 "power/control=on: %s (runtime_status %s)", pf->str, was[0] ? was : "absent", PF_WAKE_MS / 1000,
+				 gate, now[0] ? now : "unreadable");
+			return -2;
+		}
+		gs_sleep_ms(POLL_MS);
+	}
+	bname = w->bridge[0] ? strrchr(w->bridge, '/') + 1 : "";
+	if (w->laptop) {
+		snprintf(w->done, sizeof(w->done), "laptop GPU: %s%.32s%spower/control %s%s, d3cold_allowed %s%s, config "
+			 "reads 10de:%04x in D0", bname[0] ? "bridge " : "", bname, bname[0] ? " power/control on (kept on), " : "",
+			 w->wrote_control ? w->control : "", w->wrote_control ? " -> on" : "on",
+			 w->wrote_d3cold ? w->d3cold : "", w->wrote_d3cold ? " -> 0" : "0", device);
+		return 1;
+	}
+	if (w->wrote_bridge && strcmp(w->bridge_control, "on") != 0 && !gs_pathf(p, sizeof(p), "%s/power/control", w->bridge))
+		give_back(write_attr, p, w->bridge_control, bname, "bridge power/control");
+	w->wrote_bridge = 0;
+	snprintf(w->done, sizeof(w->done), "was runtime_status=%s: power/control %s -> on, config reads 10de:%04x in D0", was,
+		 w->control[0] ? w->control : "?", device);
+	return 1;
+}
+
+/*
+ * Signs in the config space of a prepared laptop GPU that it was powered off (D3cold, a cold reset) since: VF Enable
+ * clear while the kernel still counts VFs, and MSI-X hidden again although prepare recorded it linked (run_dir's
+ * record: a record without msix_linked, as 0.2.0 wrote, or no run_dir, says nothing). Reads need root (offsets
+ * above 64); what cannot be read says nothing. Each finding goes to out[n]; returns how many.
+ */
+static unsigned int laptop_lost(const char *sysroot, const char *run_dir, const struct gs_card *c,
+				const struct module_state *m, char out[2][256])
+{
+	struct gs_prepared rec;
+	char dir[GS_PATH_MAX];
+	unsigned int v, n = 0;
+
+	if (!c->entry || !c->entry->laptop || gs_pathf(dir, sizeof(dir), "%s/bus/pci/devices/%s", sysroot, c->pf.str))
+		return 0;
+	if (c->has_sriov && c->numvfs > 0 && !config_dword(dir, c->entry->sriov_pos + 8u, &v) && !(v & 1))
+		snprintf(out[n++], 256, "%s: the GPU lost its SR-IOV state (D3cold reset); power the machine off and on, then "
+			 "run setup again", c->pf.str);
+	if (run_dir && !gs_prepared_read(run_dir, &c->pf, &rec) && rec.msix_linked == 1 && c->has_sriov &&
+	    strcmp(m->msix, "Y") == 0 && module_selects(m, &c->pf) && !config_dword(dir, c->entry->msix_hide_pos, &v) &&
+	    v != 0xffffffffu && (v >> GS_MSIX_HIDE_BIT & 1))
+		snprintf(out[n++], 256, "%s: MSI-X was hidden again (the GPU was power cycled); power the machine off and on, "
+			 "then run setup again", c->pf.str);
+	return n;
 }
 
 /*
@@ -1063,10 +1435,11 @@ int gs_nvidia_hold(const char *dir, char *files, size_t len)
 }
 
 /*
- * The option the driver step checks; with a console release granted, the hold that keeps nvidia unbound;
- * with an installed config that grants none, a hold left over, which keeps nvidia from loading at all.
+ * The option the driver step checks; with a console release granted, the hold that keeps nvidia unbound
+ * (or, with hold_planned, that install writes it); with an installed config that grants none, a hold left
+ * over, which keeps nvidia from loading at all.
  */
-static void modprobe_checks(struct tally *t, const char *dir, const struct gs_config *cfg)
+static void modprobe_checks(struct tally *t, const char *dir, const struct gs_config *cfg, int hold_planned)
 {
 	struct modprobe_view v;
 	char own[GS_PATH_MAX], files[2 * GS_PATH_MAX + 8];
@@ -1093,6 +1466,8 @@ static void modprobe_checks(struct tally *t, const char *dir, const struct gs_co
 	}
 	if (!hold_files(&v, files, sizeof(files))) {
 		check(t, "OK", "nvidia is held back at boot (`blacklist nvidia` and `install nvidia /bin/false` in %s)", dir);
+	} else if (hold_planned) {
+		check(t, "INFO", "hold planned by --hold-nvidia: install writes %s", GS_NVIDIA_HOLD);
 	} else {
 		char rel[GS_BDF_LIST_STR_SIZE];
 
@@ -1236,18 +1611,100 @@ static int activating_left(const struct gs_diag_opts *o, int live, char *p, size
 	return run && !gs_pathf(p, len, "%s/" GS_ACTIVATING_NAME, run) && gs_exists(p);
 }
 
+/* 1 when a *.conf file in the modprobe.d directory dir has `options nvidia ... NVreg_DynamicPowerManagement=0` (file names it). */
+static int nvidia_rtd3_off(const char *dir, char *file, size_t len)
+{
+	struct dirent *de;
+	DIR *d = opendir(dir);
+	int found = 0;
+
+	if (!d)
+		return 0;
+	while (!found && (de = readdir(d))) {
+		char p[GS_PATH_MAX], *data, *line, *save = NULL;
+		size_t n = strlen(de->d_name);
+
+		if (n < 6 || strcmp(de->d_name + n - 5, ".conf") != 0 || gs_pathf(p, sizeof(p), "%s/%s", dir, de->d_name) ||
+		    gs_read_whole(p, &data, &n, 1 << 16))
+			continue;
+		for (line = strtok_r(data, "\n", &save); line && !found; line = strtok_r(NULL, "\n", &save)) {
+			char *tok, *save2 = NULL;
+			unsigned int k = 0;
+
+			for (tok = strtok_r(line, " \t", &save2); tok && !found; tok = strtok_r(NULL, " \t", &save2), k++) {
+				size_t tl = strlen(tok);
+
+				if ((k == 0 && strcmp(tok, "options") != 0) || (k == 1 && strcmp(tok, "nvidia") != 0))
+					break;
+				/* NVIDIA's documentation writes the option in double quotes. */
+				if (tl >= 2 && tok[0] == '"' && tok[tl - 1] == '"') {
+					tok[tl - 1] = '\0';
+					tok++;
+				}
+				found = k > 1 && (strcmp(tok, "NVreg_DynamicPowerManagement=0") == 0 ||
+						  strcmp(tok, "NVreg_DynamicPowerManagement=0x00") == 0);
+			}
+		}
+		free(data);
+		if (found)
+			gs_copy(file, len, p);
+	}
+	closedir(d);
+	return found;
+}
+
+/* 1 when sleep.target in the unit directory dir is masked (a link to /dev/null). */
+static int sleep_masked(const char *dir)
+{
+	char p[GS_PATH_MAX], target[64];
+	ssize_t n;
+
+	if (gs_pathf(p, sizeof(p), "%s/sleep.target", dir) || (n = readlink(p, target, sizeof(target) - 1)) < 0)
+		return 0;
+	target[n] = '\0';
+	return strcmp(target, "/dev/null") == 0;
+}
+
+/*
+ * A host with the laptop rows laptops (n) selected: nvidia's runtime power management and system sleep each power
+ * the GPU off (D3cold), which resets its SR-IOV state and every vGPU. doctor only names the change, once per GPU
+ * while it is missing; the package makes neither.
+ */
+static void laptop_host_checks(struct tally *t, const struct gs_diag_opts *o, int live, const struct gs_addr *laptops,
+			       unsigned int n)
+{
+	const char *mpd = o->modprobe_dir ? o->modprobe_dir : live ? "/etc/modprobe.d" : NULL;
+	const char *units = o->unit_dir ? o->unit_dir : live ? GS_UNIT_DIR : NULL;
+	char file[GS_PATH_MAX];
+	unsigned int i;
+
+	if (mpd && nvidia_rtd3_off(mpd, file, sizeof(file)))
+		check(t, "OK", "laptop GPU: nvidia's runtime power management is off (NVreg_DynamicPowerManagement=0 in %s)",
+		      file);
+	else if (mpd)
+		for (i = 0; i < n; i++)
+			check(t, "WARN", "%s: nvidia may power off this GPU: set options nvidia "
+			      "NVreg_DynamicPowerManagement=0 (docs/laptops.md#d3cold)", laptops[i].str);
+	if (units && sleep_masked(units))
+		check(t, "OK", "laptop host: system sleep is blocked (sleep.target is masked)");
+	else if (units)
+		for (i = 0; i < n; i++)
+			check(t, "WARN", "%s: suspend is not blocked; sleep powers off this GPU (docs/laptops.md#d3cold)",
+			      laptops[i].str);
+}
+
 int gs_cmd_doctor(const struct gs_diag_opts *o)
 {
 	const char *sysroot = o->sysroot ? o->sysroot : GS_LIVE_SYSFS;
 	int live = is_live_root(sysroot);
-	struct gs_addr devs[GS_CFG_MAX_BDFS];
+	struct gs_addr devs[GS_CFG_MAX_BDFS], laptops[GS_CFG_MAX_BDFS];
 	struct module_state m;
 	struct gs_config cfg;
 	struct tally t = { 0, 0 };
 	const char *cfg_path, *source, *isrc;
 	const struct gs_addr *isel;
 	char err[512], p[GS_PATH_MAX], act[GS_PATH_MAX];
-	unsigned int n, i, nisel;
+	unsigned int n, i, nisel, nlaptops;
 	int id_on, id_force, activating = activating_left(o, live, act, sizeof(act));
 
 	printf("geforce-sriov %s doctor (sysfs root %s%s)\n", GS_VERSION, sysroot,
@@ -1289,6 +1746,17 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 		gs_addr_list_str(cfg.boot_display_release, cfg.nrelease, rel, sizeof(rel));
 		check(&t, "INFO", "config: console release of %s planned by --boot-display-release", rel);
 	}
+	/* Like install, --hold-nvidia needs a console release: one in the config or one planned above. */
+	if (o->hold_nvidia && !cfg.nrelease) {
+		fprintf(stderr, "geforce-sriov: --hold-nvidia needs --boot-display-release BDF (or boot_display_release in the "
+			"config): only a boot display GPU granted a console\nrelease needs nvidia held back at boot\n");
+		return GS_EXIT_USAGE;
+	}
+	n = selected_devices(o, &cfg, sysroot, devs, &source);
+	nlaptops = gs_laptop_gpus(sysroot, devs, n, laptops);
+	/* Like install, --disable-d3cold needs a laptop GPU among the GPUs judged. */
+	if (o->disable_d3cold && !nlaptops)
+		return gs_d3cold_usage();
 	/*
 	 * Identity as the hook will see it: the config's settings or, for a --device selection the
 	 * config does not hold yet, what `install --device` writes (identity=on, identity_force_host=on).
@@ -1504,7 +1972,7 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 	if (o->unit_dir || live)
 		dropin_checks(&t, o->unit_dir);
 	if (o->modprobe_dir || live)
-		modprobe_checks(&t, o->modprobe_dir ? o->modprobe_dir : "/etc/modprobe.d", &cfg);
+		modprobe_checks(&t, o->modprobe_dir ? o->modprobe_dir : "/etc/modprobe.d", &cfg, o->hold_nvidia);
 	if (o->plugin || live)
 		plugin_checks(&t, o->plugin ? o->plugin : plugin_link(),
 			      o->build && o->build->record ? o->build->record : GS_DRIVER_BUILD);
@@ -1531,9 +1999,9 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 		}
 	}
 
-	n = selected_devices(o, &cfg, sysroot, devs, &source);
 	if (n == 0)
 		check(&t, "WARN", "no NVIDIA display function found (%s)", source);
+
 	for (i = 0; i < n; i++) {
 		struct gs_card c;
 		struct gs_plan plan;
@@ -1541,18 +2009,75 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 		const struct gs_display *d;
 		int ours, prepared = 0;
 
+		printf("\n%s (%s)\n", devs[i].str, source);
+		/*
+		 * A laptop row's power state, read only: doctor writes nothing. A sysfs config read resumes a
+		 * runtime-suspended device by itself, so prepare's config-read gate is a plain read here.
+		 */
+		{
+			unsigned int dev;
+			const struct gs_device *pe = pf_entry(sysroot, &devs[i], &dev);
+			char dir[GS_PATH_MAX], bdir[GS_PATH_MAX], q[GS_PATH_MAX], gate[96], rt[32];
+			char pc[16] = "?", d3[8] = "?", bpc[16] = "?";
+
+			/*
+			 * prepare refuses a laptop row without D3cold consent: in the config, or planned by --disable-d3cold
+			 * (install writes it).
+			 */
+			if (pe && pe->laptop && o->disable_d3cold) {
+				check(&t, "INFO", "%s: laptop GPU: D3cold consent planned by --disable-d3cold; install writes "
+				      "d3cold=off, and prepare keeps this GPU powered", devs[i].str);
+			} else if (pe && pe->laptop && cfg.d3cold_off) {
+				check(&t, "INFO", "%s: laptop GPU: D3cold consent in the config (d3cold=off); prepare keeps this "
+				      "GPU powered", devs[i].str);
+			} else if (pe && pe->laptop) {
+				char why[GS_D3COLD_WHY_SIZE];
+
+				gs_d3cold_why(why, sizeof(why), &devs[i], 1, devs, n, cfg.boot_display_release, cfg.nrelease,
+					      "       ");
+				check(&t, "FAIL", "%s", why);
+			}
+			if (pe && pe->laptop && live && getuid() != 0) {
+				check(&t, "INFO", "%s: laptop GPU: run doctor as root to check that it answers", devs[i].str);
+			} else if (pe && pe->laptop && !gs_pathf(dir, sizeof(dir), "%s/bus/pci/devices/%s", sysroot, devs[i].str)) {
+				pf_runtime_status(sysroot, &devs[i], rt, sizeof(rt));
+				if (config_gate(dir, dev, gate, sizeof(gate))) {
+					check(&t, "FAIL", "%s does not answer although its runtime_status is %s: %s (a laptop GPU that did "
+					      "not come back from D3cold); prepare refuses this card. " WAKE_REMEDY, devs[i].str,
+					      rt[0] ? rt : "absent", gate);
+					continue;
+				}
+				if (!gs_pathf(q, sizeof(q), "%s/power/control", dir) && gs_read_attr(q, pc, sizeof(pc)))
+					gs_copy(pc, sizeof(pc), "?");
+				if (!gs_pathf(q, sizeof(q), "%s/d3cold_allowed", dir) && gs_read_attr(q, d3, sizeof(d3)))
+					gs_copy(d3, sizeof(d3), "?");
+				if (!pf_bridge_dir(sysroot, &devs[i], bdir, sizeof(bdir)) &&
+				    !gs_pathf(q, sizeof(q), "%s/power/control", bdir) && gs_read_attr(q, bpc, sizeof(bpc)))
+					gs_copy(bpc, sizeof(bpc), "?");
+				check(&t, "INFO", "%s: laptop GPU answers (10de:%04x in D0): runtime_status %s, power/control %s, "
+				      "d3cold_allowed %s, bridge power/control %s; prepare sets power/control and the bridge to on "
+				      "and d3cold_allowed to 0", devs[i].str, dev, rt[0] ? rt : "absent", pc, d3, bpc);
+			}
+		}
 		gs_card_inspect(sysroot, &devs[i], &c);
 		ours = module_selects(&m, &c.pf);
 		if (live && !gs_pathf(p, sizeof(p), "%s/%s", GS_PREPARED_DIR, c.pf.str))
 			prepared = gs_exists(p);
 		d = c.present ? granted_display(&cfg, sysroot, live ? GS_LIVE_PROC : NULL, &c, &disp) : NULL;
-		printf("\n%s (%s)\n", devs[i].str, source);
 		if (c.present) {
 			printf("  id 10de:%04x subsystem %04x:%04x class 0x%06x driver %s boot_vga %d iommu_group %s\n",
 			       c.device, c.subvendor, c.subdevice, c.class_code, c.driver[0] ? c.driver : "none",
 			       c.boot_vga, c.iommu_group[0] ? c.iommu_group : "none");
 			if (c.entry)
 				entry_checks(&t, &c, &cfg);
+			if (c.entry && c.entry->laptop) {
+				char lost[2][256];
+				unsigned int nlost = laptop_lost(sysroot, o->run_dir ? o->run_dir : live ? GS_RUN_DIR : NULL, &c, &m,
+								 lost);
+
+				for (unsigned int k = 0; k < nlost; k++)
+					check(&t, "WARN", "%s", lost[k]);
+			}
 			if (c.bridge_is_pci)
 				printf("  bridge %s power/control=%s runtime_status=%s ARI forwarding supported=%s\n",
 				       c.bridge.str, c.bridge_pm[0] ? c.bridge_pm : "?", c.bridge_rt[0] ? c.bridge_rt : "?",
@@ -1644,6 +2169,8 @@ int gs_cmd_doctor(const struct gs_diag_opts *o)
 			check(&t, "FAIL", "%s", plan.reason);
 		}
 	}
+	if (nlaptops)
+		laptop_host_checks(&t, o, live, laptops, nlaptops);
 	{
 		char ada[GS_BDF_STR_SIZE], other[GS_BDF_STR_SIZE];
 		unsigned int gen = 0;
@@ -2148,6 +2675,10 @@ static void restore_pm(const struct gs_host *h, const struct gs_card *c, const c
 {
 	char p[GS_PATH_MAX];
 
+	/* A laptop GPU's bridge stays on for the whole session (wake_card()). */
+	if (c->entry && c->entry->laptop)
+		return;
+
 	if (strcmp(old, "on") == 0 || gs_pathf(p, sizeof(p), "%s/power/control", c->bridge_dir))
 		return;
 	if (h->write_attr(p, old))
@@ -2347,15 +2878,12 @@ static enum card_result prepare_card(const struct gs_host *h, const struct gs_ad
 
 	/* Hold the upstream bridge awake for the whole remove/rescan/return sequence. */
 	snprintf(pm_old, sizeof(pm_old), "%s", c.bridge_pm);
-	gs_pathf(p, sizeof(p), "%s/power/control", c.bridge_dir);
-	if ((r = h->write_attr(p, "on"))) {
+	if ((r = bridge_awake(h->write_attr, c.bridge_dir)) < 0) {
 		fprintf(stderr, "geforce-sriov: refused: %s: bridge %s power/control=on failed: %s\n", pf->str,
 			c.bridge.str, strerror(-r));
 		return CARD_REFUSED;
 	}
-	/* "unsupported" means runtime PM is disabled for the bridge: it is not runtime-suspended. */
-	gs_pathf(p, sizeof(p), "%s/power/runtime_status", c.bridge_dir);
-	if (wait_attr_eq(p, "unsupported", 0) && wait_attr_eq(p, "active", BRIDGE_WAKE_MS)) {
+	if (r) {
 		fprintf(stderr, "geforce-sriov: refused: %s: bridge %s did not report runtime_status=active\n", pf->str,
 			c.bridge.str);
 		restore_pm(h, &c, pm_old);
@@ -2456,6 +2984,16 @@ static enum card_result prepare_card(const struct gs_host *h, const struct gs_ad
 			after.device, vendor, device, recovery_msg);
 		return CARD_LOST;
 	}
+	/* The rescan made a new device, with D3cold allowed again: block it before anything binds the PF. */
+	if (c.entry && c.entry->laptop) {
+		gs_pathf(p, sizeof(p), "%s/d3cold_allowed", pfdir);
+		if ((r = h->write_attr(p, "0"))) {
+			fprintf(stderr, "geforce-sriov: %s: writing 0 to the d3cold_allowed of the rescanned PF failed: %s; a laptop "
+				"GPU that can power off must not get VFs\n", pf->str, strerror(-r));
+			return CARD_FAILED_BACK;
+		}
+		printf("%s: D3cold disabled (d3cold_allowed=0); bridge %s stays powered\n", pf->str, c.bridge.str);
+	}
 	restore_pm(h, &c, pm_old);
 	/* Read-only resource check: a rescan can only resize the card's own bridge window. */
 	if (c.bar0_assigned == 1 && after.bar0_assigned == 0) {
@@ -2497,6 +3035,9 @@ static enum card_result prepare_card(const struct gs_host *h, const struct gs_ad
 		     after.ari_enabled);
 	if (k)
 		r += snprintf(rec + r, sizeof(rec) - (size_t)r, "console_release=%s\n", k->fw[0] ? k->fw : "none");
+	/* Whether MSI-X was linked when the card was prepared: doctor and check warn when it is hidden again. */
+	if (after.msix_linked >= 0)
+		r += snprintf(rec + r, sizeof(rec) - (size_t)r, "msix_linked=%d\n", after.msix_linked);
 	gs_pathf(p, sizeof(p), "%s/" GS_PREPARED_NAME, h->run_dir);
 	if (gs_mkdir_p(p, 0755) || gs_pathf(p, sizeof(p), "%s/" GS_PREPARED_NAME "/%s", h->run_dir, pf->str) ||
 	    gs_write_file_atomic(p, rec, (size_t)r, 0644))
@@ -2602,13 +3143,28 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 	char bdfs[GS_BDF_LIST_STR_SIZE], consent[GS_CFG_MAX_BDFS * 40], p[GS_PATH_MAX];
 	struct gs_addr todo[GS_CFG_MAX_BDFS];
 	struct console *cons;
-	unsigned int ntodo = 0, ncons = 0, i;
+	struct woken woke[GS_CFG_MAX_BDFS];
+	unsigned int ntodo = 0, ncons = 0, nwoke = 0, i;
 	int r, rc = GS_EXIT_OK;
 
 	if (gs_pathf(p, sizeof(p), "%s/" GS_ATTEMPT_NAME, h->state_dir) || gs_exists(p)) {
 		fprintf(stderr, "geforce-sriov: guard %s is set: an earlier preparation did not finish. Nothing done.\n%s\n",
 			p, recovery_msg);
 		return GS_EXIT_COLD_CYCLE;
+	}
+	/* A laptop GPU without D3cold consent: refused before the deferral and before any wake or write. */
+	if (!cfg->d3cold_off) {
+		struct gs_addr laptops[GS_CFG_MAX_BDFS];
+		unsigned int nl = gs_laptop_gpus(h->sys, cfg->bdfs, cfg->nbdfs, laptops);
+
+		if (nl) {
+			char why[GS_D3COLD_WHY_SIZE];
+
+			gs_d3cold_why(why, sizeof(why), laptops, nl, cfg->bdfs, cfg->nbdfs, cfg->boot_display_release,
+				      cfg->nrelease, "");
+			fprintf(stderr, "geforce-sriov: refused, nothing changed: %s\n", why);
+			return GS_EXIT_REFUSED;
+		}
 	}
 	gs_addr_list_str(cfg->bdfs, cfg->nbdfs, bdfs, sizeof(bdfs));
 	consent_args(cfg, consent, sizeof(consent));
@@ -2649,11 +3205,26 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 			printf("%s: already prepared this boot\n", cfg->bdfs[i].str);
 			continue;
 		}
+		/* Power first: a laptop GPU off in D3cold reads all-ones until it is woken and passes the config-read gate. */
+		{
+			char why[1024];
+
+			r = wake_card(h->sys, h->write_attr, &cfg->bdfs[i], &woke[nwoke], why, sizeof(why));
+			if (r < 0) {
+				fprintf(stderr, "geforce-sriov: refused, nothing changed: %s. " WAKE_REMEDY "\n", why);
+				unwake(h->write_attr, woke, nwoke);
+				free(cons);
+				return GS_EXIT_REFUSED;
+			}
+			if (r > 0)
+				printf("%s: %s\n", cfg->bdfs[i].str, woke[nwoke++].done);
+		}
 		gs_card_inspect(h->sys, &cfg->bdfs[i], &c);
 		d = granted_display(cfg, h->sys, h->proc, &c, &disp);
 		gs_plan_prepare(&c, d, &plan);
 		if (plan.verdict != GS_PLAN_READY) {
 			fprintf(stderr, "geforce-sriov: refused, nothing changed: %s\n", plan.reason);
+			unwake(h->write_attr, woke, nwoke);
 			free(cons);
 			return GS_EXIT_REFUSED;
 		}
@@ -2663,6 +3234,7 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 
 			if (v < 0) {
 				fprintf(stderr, "geforce-sriov: refused, nothing changed: %s: %s\n", c.pf.str, why);
+				unwake(h->write_attr, woke, nwoke);
 				free(cons);
 				return GS_EXIT_REFUSED;
 			}
@@ -2698,6 +3270,7 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 		if (release_console(h, bdfs, &cons[i])) {
 			rebind_consoles(h, cons, ncons);
 			clear_marker(h);
+			unwake(h->write_attr, woke, nwoke);
 			free(cons);
 			return GS_EXIT_REFUSED;
 		}
@@ -2706,6 +3279,7 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 		fprintf(stderr, "geforce-sriov: cannot write the guard: %s; nothing done\n", strerror(-r));
 		rebind_consoles(h, cons, ncons);
 		clear_marker(h);
+		unwake(h->write_attr, woke, nwoke);
 		free(cons);
 		return GS_EXIT_FAIL;
 	}
@@ -2713,6 +3287,7 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 	if (r) {
 		rebind_consoles(h, cons, ncons);
 		clear_marker(h);
+		unwake(h->write_attr, woke, nwoke);
 		free(cons);
 		return r;
 	}
@@ -2733,6 +3308,15 @@ int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_p
 		 * failure, not exit 3 ("refused, nothing changed").
 		 */
 		if (res == CARD_REFUSED || res == CARD_FAILED_BACK) {
+			/*
+			 * Give back the wake of each card that was never removed: this one when it was refused
+			 * before its removal (CARD_REFUSED), and every card after it. A card that was removed
+			 * and rescanned is a new device and is never written to here.
+			 */
+			for (unsigned int j = 0; j < nwoke; j++)
+				for (unsigned int l = res == CARD_REFUSED ? i : i + 1; l < ntodo; l++)
+					if (strcmp(woke[j].pf.str, todo[l].str) == 0)
+						unwake(h->write_attr, &woke[j], 1);
 			rc = GS_EXIT_FAIL;
 			break;
 		}
@@ -3207,6 +3791,45 @@ static int type_creatable(const char *sys, const char *vf, unsigned int type)
 }
 
 /*
+ * The re-probe of a laptop PF: its bridge at power/control=on, its own power/control at on and its d3cold_allowed at
+ * 0, before the unbind and again after the bind, so that it cannot power off (D3cold) in between. Only the values
+ * that differ are written, each named. 0, or GS_EXIT_FAIL with the failed write named.
+ */
+static int laptop_hold(const struct gs_host *h, const struct gs_addr *pf)
+{
+	static const char *const attrs[][2] = { { "power/control", "on" }, { "d3cold_allowed", "0" } };
+	char dir[GS_PATH_MAX], p[GS_PATH_MAX], v[16];
+	unsigned int device;
+	const struct gs_device *e = pf_entry(h->sys, pf, &device);
+	int r;
+
+	if (!e || !e->laptop)
+		return 0;
+	if (!pf_bridge_dir(h->sys, pf, dir, sizeof(dir)) && !gs_pathf(p, sizeof(p), "%s/power/control", dir) &&
+	    (gs_read_attr(p, v, sizeof(v)) || strcmp(v, "on") != 0)) {
+		if ((r = h->write_attr(p, "on"))) {
+			fprintf(stderr, "geforce-sriov: %s: writing on to its bridge's power/control failed: %s\n", pf->str,
+				strerror(-r));
+			return GS_EXIT_FAIL;
+		}
+		printf("%s: bridge power/control -> on (laptop GPU)\n", pf->str);
+	}
+	for (size_t k = 0; k < sizeof(attrs) / sizeof(attrs[0]); k++) {
+		if (gs_pathf(p, sizeof(p), "%s/bus/pci/devices/%s/%s", h->sys, pf->str, attrs[k][0]))
+			return GS_EXIT_FAIL;
+		if (!gs_read_attr(p, v, sizeof(v)) && strcmp(v, attrs[k][1]) == 0)
+			continue;
+		if ((r = h->write_attr(p, attrs[k][1]))) {
+			fprintf(stderr, "geforce-sriov: %s: writing %s to %s failed: %s\n", pf->str, attrs[k][1], attrs[k][0],
+				strerror(-r));
+			return GS_EXIT_FAIL;
+		}
+		printf("%s: %s -> %s (laptop GPU)\n", pf->str, attrs[k][0], attrs[k][1]);
+	}
+	return 0;
+}
+
+/*
  * The PF re-probe (driver unbind, then bind; never remove or rescan), behind the guard
  * and NVIDIA's unbindLock, which the driver grants only while no client holds the GPU (the count
  * an unbind would otherwise wait on). 0; GS_EXIT_REFUSED: lock not granted, nothing unbound;
@@ -3222,6 +3845,8 @@ static int reprobe_pf_unmasked(const struct gs_host *h, const struct gs_addr *pf
 	    gs_pathf(bind_path, sizeof(bind_path), "%s/bus/pci/drivers/nvidia/bind", h->sys) ||
 	    gs_pathf(drv, sizeof(drv), "%s/bus/pci/devices/%s/driver", h->sys, pf->str))
 		return GS_EXIT_FAIL;
+	if ((r = laptop_hold(h, pf)))
+		return r;
 	if ((r = write_marker(h, pf->str, "reprobe"))) {
 		fprintf(stderr, "geforce-sriov: cannot write the guard: %s; %s was not re-probed\n", strerror(-r), pf->str);
 		return GS_EXIT_FAIL;
@@ -3280,6 +3905,8 @@ static int reprobe_pf_unmasked(const struct gs_host *h, const struct gs_addr *pf
 				recovery_msg);
 		return GS_EXIT_FAIL;
 	}
+	if ((r = laptop_hold(h, pf)))
+		return r;
 	printf("%s: re-probed, bound to nvidia again\n", pf->str);
 	return 0;
 }
@@ -3913,6 +4540,9 @@ int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const str
 	struct vgpu_card *cards;
 	unsigned int n = 0, i, j;
 	int r, ready = 1;
+	struct module_state m;
+
+	read_module_state(sys, &m);
 
 	cards = calloc(GS_CFG_MAX_BDFS, sizeof(*cards));
 	if (!cards)
@@ -3983,9 +4613,18 @@ int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const str
 			ready = 0;
 			continue;
 		}
+		/* A laptop GPU powered off since prepare (warnings only; the VF lines decide). */
+		{
+			char lost[2][256];
+			unsigned int nlost = laptop_lost(sys, h->run_dir, &c, &m, lost);
+
+			for (j = 0; j < nlost; j++)
+				printf("WARNING %s\n", lost[j]);
+		}
 		for (j = 0; j < c.numvfs; j++) {
-			char drv[64], ctl[32], st[32], type[32];
-			int ok;
+			char drv[64], ctl[32], st[32], type[32], dir[GS_PATH_MAX];
+			unsigned int id08 = 0xffffffffu;
+			int ok, dead = 0;
 
 			dev_driver(sys, k->vf[j].str, drv, sizeof(drv));
 			read_dev_attr(sys, k->vf[j].str, "power/control", ctl, sizeof(ctl));
@@ -3993,9 +4632,20 @@ int gs_check_vfs(const struct gs_host *h, const struct gs_config *cfg, const str
 			ok = read_dev_attr(sys, k->vf[j].str, "nvidia/current_vgpu_type", type, sizeof(type)) == 0 &&
 			     strcmp(drv, "nvidia") == 0 && strcmp(ctl, "on") == 0 && strcmp(st, "active") == 0 &&
 			     strcmp(type, want) == 0;
+			/*
+			 * A laptop VF's liveness: its revision/class dword (offset 0x08). A VF's vendor and device IDs read
+			 * ffff by design, so they are no test; a VF that does not answer reads ffffffff here too.
+			 */
+			if (c.entry && c.entry->laptop &&
+			    (gs_pathf(dir, sizeof(dir), "%s/bus/pci/devices/%s", sys, k->vf[j].str) ||
+			     config_dword(dir, 0x08, &id08) || id08 == 0xffffffffu))
+				ok = 0, dead = 1;
 			printf("%s %s (VF of %s): driver=%s type=%s expected=%s power/control=%s runtime_status=%s\n",
 			       ok ? "OK" : "NOT READY", k->vf[j].str, k->pf.str, drv[0] ? drv : "none", type[0] ? type : "unreadable",
 			       want, ctl[0] ? ctl : "unreadable", st[0] ? st : "unreadable");
+			if (dead)
+				printf("NOT READY %s: its config space reads ffffffff at 0x08, or cannot be read; the GPU may have "
+				       "been powered off\n", k->vf[j].str);
 			if (!ok)
 				ready = 0;
 		}

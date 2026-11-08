@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.2.1] - 2026-11-08
+
+### Added
+
+- `setup` now displays an IMPORTANT notice and asks for permission before creating the NVIDIA module hold file.
+  The notice explains that releasing the boot display GPU disconnects its local console, recommends testing SSH or serial console access before the power cycle, and explains that this path requires manual setup after every boot.
+
+- `install` and `setup` now accept `--hold-nvidia`, which creates and tracks the hold file.
+  Uninstall removes the file if it is unchanged.
+
+- `doctor` also accepts `--hold-nvidia`.
+  With `--hold-nvidia` and a console-release grant, it reports a missing hold file as information rather than a warning, because `install` writes it.
+
+- 60 Ampere and Ada laptop and embedded GPUs are in the device table and go through the same path as the desktop cards ([Laptop support](docs/laptops.md)).
+  25 have public config-space dumps.
+  The other 35 are listed because every laptop GPU with a config-space dump for their generation has the desktop layout.
+
+- D3cold consent for laptop GPUs ([Laptop support](docs/laptops.md#consent)).
+  `setup` shows a notice and asks for consent; `setup --disable-d3cold` and `install --disable-d3cold` record it without asking the D3cold question.
+  `install` records `d3cold=off` in the config; `doctor --disable-d3cold` assesses the host as if that consent were recorded.
+  Without consent, `prepare` refuses the entire run if a laptop GPU is selected (exit 3), before changing anything.
+  `install --device` without `--disable-d3cold` removes consent; `uninstall` removes it with the config if the config is unchanged since install.
+
+- Laptop power guards (require D3cold consent for laptop GPUs):
+  - `prepare` powers on the GPU and the bridge above it and blocks D3cold (`d3cold_allowed=0`).
+    If the GPU reports active, a config read must succeed first.
+    If the GPU does not answer within 5 seconds, `prepare` refuses the entire run (exit 3) and restores the power settings it changed on every GPU.
+    It blocks D3cold again after the rescan and leaves the bridge on.
+  - `activate` keeps D3cold blocked around the re-probe.
+  - `check` requires each VF of a laptop GPU to answer a config read.
+  - `doctor` writes nothing and fails a laptop GPU that has no consent or does not answer.
+    It warns if `options nvidia NVreg_DynamicPowerManagement=0` is missing, if `sleep.target` is not masked, or if MSI-X or the SR-IOV state was lost to a power cut.
+
+  geforce-sriov does not write the modprobe option or the sleep setting.
+
+### Changed
+
+- The final install message no longer says an existing hold was "already" present, since it may have been created during the same installation.
+
+- When `nvidia` is already loaded, the refusal message now includes the hold-file path and its two required lines.
+
+- Running `install --device …` without `--boot-display-release` after a console-release grant removes the hold file if it was created by `setup` or `install --hold-nvidia` and remains unchanged.
+  Modified and manually created hold files are preserved and reported.
+
+- `prepare` also wakes a desktop GPU whose `runtime_status` is `suspended`; if it does not answer within 5 seconds, `prepare` refuses the entire run (exit 3).
+  A desktop GPU that is not suspended sees no change.
+
+- `install` removes other `geforce-sriov` versions from DKMS after a successful trial build.
+  It then removes their source trees under `/usr/src`, leaving one version registered.
+
+- The hints for `setup`'s console-release questions and the note printed by `install --boot-display-release` warn that the monitor may go blank or freeze until the next boot.
+  The grant hint and the install note recommend setting up and testing SSH or a serial console before the power cycle.
+
+- `install --hold-nvidia` preserves edits to a hold file it wrote if the file blocks `nvidia` at boot.
+  If the edited file no longer holds `nvidia` back, installation refuses (exit 3).
+
+- `uninstall` runs `geforce-sriov-driver --restore` only if the script is unchanged since install.
+  If the script changed, `uninstall` does not run it, exits 1, and gives instructions for restoring NVIDIA's module by hand.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

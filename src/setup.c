@@ -9,7 +9,8 @@
  * gs_release_steps. Attaching a VF to a VM stays the user's step.
  *
  * Before a first install it asks for what no flag supplied (NVIDIA's package, the licence, the
- * GPUs) when standard input is a terminal or --interactive is given, and prints the flags that
+ * GPUs, and, for a boot display GPU granted a console release, whether install creates the hold of
+ * nvidia) when standard input is a terminal or --interactive is given, and prints the flags that
  * repeat the run without questions. Without a terminal it asks nothing.
  */
 #include <dirent.h>
@@ -101,6 +102,11 @@ static int step_doctor(const struct gs_host *h, const char *self, const struct g
 		n = push_opt(argv, n, "--driver-file", o->driver_file);
 	if (o)
 		n = push_selection(o, argv, n);
+	/* The hold and the D3cold consent the user chose (flag or yes) are judged as install will write them. */
+	if (o && o->hold_nvidia)
+		argv[n++] = "--hold-nvidia";
+	if (o && o->disable_d3cold)
+		argv[n++] = "--disable-d3cold";
 	argv[n] = NULL;
 	return step(h, self, "doctor", argv);
 }
@@ -297,7 +303,7 @@ static int ask(const struct gs_setup_host *s, const char *question, const char *
 	}
 	printf("\n");
 	if (flag)
-		fprintf(stderr, "setup: no answer (end of input). Nothing changed. Give %s instead.\n", flag);
+		fprintf(stderr, "setup: end of input. Nothing changed. Use %s instead.\n", flag);
 	return -1;
 }
 
@@ -422,15 +428,18 @@ static int ask_release(const struct gs_setup_host *s, const char *question, cons
 /* The console-release question for one boot display card: 1 yes, 0 no, -1 at the end of input. */
 static int ask_console_grant(const struct gs_setup_host *s, const struct gs_addr *pf)
 {
-	char question[128], hint[512];
+	char question[128];
 
 	snprintf(question, sizeof(question), "Allow releasing the console of %s after the next boot? [y/N]", pf->str);
-	snprintf(hint, sizeof(hint),
-		 "Yes records the grant; nothing is released now. After the power cycle, setup asks\n"
-		 "  again before it releases the console of %s, which stops the local display\n"
-		 "  on that card until the following boot. SSH keeps working. Default is no.",
-		 pf->str);
-	return ask_release(s, question, hint, "--boot-display-release BDF");
+	return ask_release(s, question,
+			   "After every boot, running setup releases the console on this GPU.\n"
+			   "  The monitor may go blank or freeze on the last frame. You will have no\n"
+			   "  local text console until the next boot.\n"
+			   "  Set up and test SSH or a serial console BEFORE you power cycle.\n"
+			   "  Without that access, you cannot see the result or fix a problem.\n"
+			   "  Yes records the grant; nothing is released now.\n"
+			   "  Default is no.",
+			   "--boot-display-release BDF");
 }
 
 static int ask_devices(const struct gs_setup_host *s, struct gs_install_opts *a, const struct pick *list, unsigned int n,
@@ -510,6 +519,84 @@ static int ask_boot_only(const struct gs_setup_host *s, struct gs_install_opts *
 	return 0;
 }
 
+/* A file in the modprobe.d directory setup reads already holds nvidia back at boot. */
+static int hold_present(const struct gs_setup_host *s)
+{
+	char files[2 * GS_PATH_MAX + 8];
+
+	return !gs_nvidia_hold(s->modprobe_dir ? s->modprobe_dir : "/etc/modprobe.d", files, sizeof(files));
+}
+
+/*
+ * After a console-release grant, with no hold in place: the notice, then whether install creates the hold.
+ * Yes sets --hold-nvidia. 0, or -1 at the end of input.
+ */
+static int ask_hold(const struct gs_setup_host *s, struct gs_install_opts *a)
+{
+	int r;
+
+	printf("\n");
+	gs_hold_notice(stdout, 0);
+	r = ask_release(s, "Create " GS_NVIDIA_HOLD " now? [y/N]",
+			"Yes: install writes the file with its other files.\n"
+			"  No: after install, setup shows how to create it by hand.\n"
+			"  Default is no.", "--hold-nvidia");
+	if (r < 0)
+		return -1;
+	a->hold_nvidia = r;
+	printf("  = %s\n", r ? "--hold-nvidia" : "no --hold-nvidia");
+	return 0;
+}
+
+/*
+ * The D3cold consent for the laptop GPUs among the selection sel (nsel GPUs, with the console-release grants rel),
+ * unless the config already has it (have): *flag is --disable-d3cold, given, or set by a yes to the question that
+ * follows the notice (asked when s has input). 0 to go on; GS_EXIT_USAGE for the flag without a laptop GPU;
+ * GS_EXIT_REFUSED, nothing changed, on a no, without a question, or at the end of input. Each says why.
+ */
+static int ask_d3cold(const struct gs_setup_host *s, const struct gs_addr *sel, unsigned int nsel,
+		      const struct gs_addr *rel, unsigned int nrel, int have, int *flag)
+{
+	struct gs_addr laptops[GS_CFG_MAX_BDFS];
+	unsigned int n = gs_laptop_gpus(s->h->sys, sel, nsel, laptops);
+	char list[GS_CFG_MAX_BDFS * (GS_BDF_STR_SIZE + 2)] = "", question[sizeof(list) + 80], why[GS_D3COLD_WHY_SIZE];
+	int r;
+
+	if (*flag && !n)
+		return gs_d3cold_usage();
+	if (!n || *flag || have)
+		return 0;
+	printf("\n");
+	gs_d3cold_notice(stdout);
+	if (s->in >= 0) {
+		for (unsigned int i = 0; i < n; i++) {
+			if (i)
+				strcat(list, ", ");
+			strcat(list, laptops[i].str);
+		}
+		snprintf(question, sizeof(question), "Turn off D3cold for %s while geforce-sriov manages it? [y/N]", list);
+		r = ask_release(s, question,
+				"Yes: save d3cold=off in the config. prepare keeps this GPU powered each time it runs.\n"
+				"  No: prepare refuses this GPU. Default is no.", NULL);
+		if (r < 0) {
+			fprintf(stderr, "setup: end of input. Nothing changed. Use --disable-d3cold for a non-interactive run.\n");
+			return GS_EXIT_REFUSED;
+		}
+		printf("  = %s\n", r ? "--disable-d3cold" : "no --disable-d3cold");
+		if (r) {
+			*flag = 1;
+			return 0;
+		}
+		/* The notice follows a no too, then why setup stops. */
+		printf("\n");
+		gs_d3cold_notice(stdout);
+	}
+	fflush(stdout);
+	gs_d3cold_why(why, sizeof(why), laptops, n, sel, nsel, rel, nrel, "");
+	fprintf(stderr, "geforce-sriov: refused, nothing changed: %s\n", why);
+	return GS_EXIT_REFUSED;
+}
+
 /* Appends one argument to buf, quoted for a POSIX shell when it needs it. */
 static void flag_add(char *buf, size_t len, const char *arg)
 {
@@ -553,6 +640,10 @@ static void flag_set(const struct gs_install_opts *a, char *buf, size_t len)
 		flag_add(buf, len, "--boot-display-release");
 		flag_add(buf, len, a->release[i].str);
 	}
+	if (a->hold_nvidia)
+		flag_add(buf, len, "--hold-nvidia");
+	if (a->disable_d3cold)
+		flag_add(buf, len, "--disable-d3cold");
 	if (a->vfs) {
 		snprintf(opt, sizeof(opt), "--vfs=%u", a->vfs);
 		flag_add(buf, len, opt);
@@ -614,10 +705,27 @@ static void select_single(struct gs_install_opts *a, const struct pick *cards, u
 	}
 }
 
-/* Each question no flag answered; GS_EXIT_REFUSED when the input ends first. */
+/* --hold-nvidia on a first install that grants no console release: GS_EXIT_USAGE, with why printed; else 0. */
+static int hold_without_grant(const struct gs_install_opts *a)
+{
+	if (!a->hold_nvidia || a->nrelease)
+		return 0;
+	fprintf(stderr, "geforce-sriov: --hold-nvidia requires a selected boot display GPU.\n"
+		"Select it with --boot-display-release BDF. Nothing changed.\n"
+		"Try 'geforce-sriov --help'.\n");
+	return GS_EXIT_USAGE;
+}
+
+/*
+ * Each question no flag answered, in this order: NVIDIA's package and licence, the GPUs with their console
+ * release, the hold, then the D3cold consent of a laptop GPU, which needs the final selection. GS_EXIT_REFUSED
+ * when the input ends first or the consent is refused, GS_EXIT_USAGE as hold_without_grant or ask_d3cold.
+ */
 static int ask_missing(const struct gs_setup_host *s, struct gs_install_opts *a, const struct pick *cards,
 		       unsigned int ncards, unsigned int more)
 {
+	int r;
+
 	if (needs_driver(s, a) && ask_driver(s, a))
 		return GS_EXIT_REFUSED;
 	if (a->driver_file && !a->accept_nvidia_license && ask_license(s, a))
@@ -626,7 +734,13 @@ static int ask_missing(const struct gs_setup_host *s, struct gs_install_opts *a,
 		return GS_EXIT_REFUSED;
 	if (!a->ndevices && ncards == 1 && cards[0].boot && ask_boot_only(s, a, &cards[0]))
 		return GS_EXIT_REFUSED;
+	if ((r = hold_without_grant(a)))
+		return r;
+	if (a->nrelease && !a->hold_nvidia && !hold_present(s) && ask_hold(s, a))
+		return GS_EXIT_REFUSED;
 	select_single(a, cards, ncards);
+	if ((r = ask_d3cold(s, a->devices, a->ndevices, a->release, a->nrelease, 0, &a->disable_d3cold)))
+		return r;
 	summary(s, a, ncards);
 	return GS_EXIT_OK;
 }
@@ -714,6 +828,7 @@ static void ignore_first_install_opts(const struct gs_install_opts *o)
 		{ o->nvidia_source != NULL, "--nvidia-source" },
 		{ o->skip_driver, "--driver=skip" },
 		{ o->driver_file != NULL, "--driver-file" },
+		{ o->hold_nvidia, "--hold-nvidia" },
 	};
 
 	for (size_t k = 0; k < sizeof(opts) / sizeof(opts[0]); k++)
@@ -769,7 +884,7 @@ static int bring_up(const struct gs_host *h, const char *self, const struct gs_c
 static int release_now(const struct gs_setup_host *s, const char *self, const struct gs_config *cfg)
 {
 	const struct gs_host *h = s->h;
-	char bdfs[GS_BDF_LIST_STR_SIZE], question[GS_BDF_LIST_STR_SIZE + 64], hint[GS_BDF_LIST_STR_SIZE + 96];
+	char bdfs[GS_BDF_LIST_STR_SIZE], question[GS_BDF_LIST_STR_SIZE + 64], hint[GS_BDF_LIST_STR_SIZE + 320];
 	char consent[GS_CFG_MAX_BDFS][GS_BDF_STR_SIZE + 20];
 	const char *prep[GS_CFG_MAX_BDFS + 1];
 	unsigned int i;
@@ -777,8 +892,11 @@ static int release_now(const struct gs_setup_host *s, const char *self, const st
 
 	gs_addr_list_str(cfg->boot_display_release, cfg->nrelease, bdfs, sizeof(bdfs));
 	snprintf(question, sizeof(question), "Release the console of %s and bring the GPUs up now? [y/N]", bdfs);
-	snprintf(hint, sizeof(hint), "the local console on %s stops until the next boot; SSH keeps working; default is no",
-		 bdfs);
+	snprintf(hint, sizeof(hint),
+		 "If you continue, the monitor on %s may go blank or freeze on\n"
+		 "  the last frame. You will have no local text console until the next boot.\n"
+		 "  Run this over SSH or a serial console so you can see the result.\n"
+		 "  Default is no.", bdfs);
 	if (s->in >= 0)
 		r = ask_release(s, question, hint, NULL);
 	if (r < 0) {
@@ -822,6 +940,9 @@ int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o)
 		unsigned int ncards = 0, more = 0;
 
 		printf("This host is not set up.\n");
+		/* Without questions, only the options can grant the console release --hold-nvidia needs. */
+		if ((staged || s->in < 0) && (r = hold_without_grant(&a)))
+			return r;
 		/* A staged install describes another host: nothing here to ask about. */
 		if (!staged) {
 			const struct gs_addr *one = NULL;
@@ -840,9 +961,21 @@ int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o)
 				return r;
 			if (s->in < 0)
 				select_single(&a, cards, ncards);
+			if (s->in < 0 && (r = ask_d3cold(s, a.devices, a.ndevices, a.release, a.nrelease, 0, &a.disable_d3cold)))
+				return r;
+			/* No yes and no --hold-nvidia: the notice for a hold created by hand follows install. */
+			if (a.nrelease && !a.hold_nvidia && !hold_present(s))
+				a.hold_note_shown = 1;
 			bound_note(h->sys, &a);
 		}
-		r = step_doctor(h, self, &a);
+		{
+			/* A staged install's GPUs are on another host: doctor does not judge its D3cold consent here. */
+			struct gs_install_opts d = a;
+
+			if (staged)
+				d.disable_d3cold = 0;
+			r = step_doctor(h, self, &d);
+		}
 		if (r != GS_EXIT_OK && !staged) {
 			printf("\nStopped: fix what doctor names above, then run setup again. Nothing changed.\n");
 			if (s->in < 0)
@@ -879,11 +1012,21 @@ int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o)
 				argv[n++] = "--accept-nvidia-license";
 			if (a.release_note_shown)
 				argv[n++] = "--release-note-shown";
+			if (a.hold_nvidia)
+				argv[n++] = "--hold-nvidia";
+			if (a.hold_note_shown)
+				argv[n++] = "--hold-note-shown";
+			if (a.disable_d3cold)
+				argv[n++] = "--disable-d3cold";
 			argv[n] = NULL;
 			r = step(h, self, "install", argv);
 		}
 		if (r != GS_EXIT_OK)
 			return r;
+		if (a.hold_note_shown) {
+			printf("\n");
+			gs_hold_notice(stdout, 1);
+		}
 		/* install's closing text names the power cycle and the step after it. */
 		if (staged)
 			printf("\nThis host is unchanged and needs no power cycle. After the target host's first boot, run\n"
@@ -913,6 +1056,23 @@ int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o)
 	if ((r = same_devices(o, &cfg, path)))
 		return r;
 	ignore_first_install_opts(o);
+	/*
+	 * A selected laptop GPU without D3cold consent: prepare would refuse it, so the consent comes first. Given
+	 * (flag or yes), install records it in the config and keeps the rest; its closing text names the next step.
+	 */
+	{
+		int consent = o->disable_d3cold;
+
+		if ((r = ask_d3cold(s, cfg.bdfs, cfg.nbdfs, cfg.boot_display_release, cfg.nrelease, cfg.d3cold_off,
+				    &consent)))
+			return r;
+		if (consent && !cfg.d3cold_off) {
+			/* NVIDIA's files were handled by the first install (or by hand): only the config changes. */
+			static const char *const consent_argv[] = { "--driver=skip", "--disable-d3cold", NULL };
+
+			return step(h, self, "install", consent_argv);
+		}
+	}
 
 	r = step_doctor(h, self, NULL);
 	if (r != GS_EXIT_OK) {
@@ -939,8 +1099,12 @@ int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o)
 	if (cfg.nrelease && needs_prepare(h->run_dir, &cfg)) {
 		if (!nvidia_loaded(h))
 			return release_now(s, self, &cfg);
-		fprintf(stderr, "setup: NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. Create the "
-			"hold (docs/installation.md#boot-display-card), power the machine off and on, then run setup again.\n");
+		fprintf(stderr, "setup: NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. Create "
+			GS_NVIDIA_HOLD " with these two lines:\n"
+			"  blacklist nvidia\n"
+			"  install nvidia /bin/false\n"
+			"Power the machine off and on, then run setup again.\n"
+			"See docs/installation.md#boot-display-card.\n");
 		return GS_EXIT_REFUSED;
 	}
 	/* Released this boot, but NVIDIA's driver is not loaded (an earlier run stopped at modprobe): carry on from there. */
@@ -996,7 +1160,7 @@ static int driver_present(const struct gs_install_opts *o)
 
 int gs_cmd_setup(const struct gs_install_opts *o, enum gs_prompt prompt)
 {
-	struct gs_setup_host s = { &gs_host_live, -1, driver_present(o), NULL, NULL };
+	struct gs_setup_host s = { &gs_host_live, -1, driver_present(o), NULL, NULL, NULL };
 
 	if (prompt == GS_PROMPT_ON || (prompt == GS_PROMPT_AUTO && isatty(STDIN_FILENO)))
 		s.in = STDIN_FILENO;

@@ -49,6 +49,9 @@
 #define GS_NVIDIA_VERSION "580.159.01"
 #define GS_NVIDIA_SRC "/usr/src/nvidia-" GS_NVIDIA_VERSION
 #define GS_NVIDIA_MODPROBE "/etc/modprobe.d/geforce-sriov-nvidia.conf"
+/* The hold that keeps nvidia from loading at boot on a host with a console-release grant; install --hold-nvidia writes it. */
+#define GS_NVIDIA_HOLD "/etc/modprobe.d/nvidia-manual-load.conf"
+#define GS_NVIDIA_HOLD_TEXT "blacklist nvidia\ninstall nvidia /bin/false\n"
 #define GS_RUN_DIR "/run/geforce-sriov"
 #define GS_PREPARED_NAME "prepared"
 #define GS_PREPARED_DIR GS_RUN_DIR "/" GS_PREPARED_NAME
@@ -104,6 +107,8 @@ struct gs_config {
 	unsigned int type_ada;    /* vGPU type activate sets on each VF of an Ada card; 0: GS_VGPU_TYPE_ADA */
 	unsigned int type_ampere; /* the same for an Ampere card; 0: GS_VGPU_TYPE_AMPERE */
 	char sriov_manage[GS_PATH_MAX];
+	/* d3cold=off: consent to keep a laptop GPU powered (prepare's D3cold guards); 0 without the key */
+	int d3cold_off;
 	int present;             /* the file existed */
 };
 
@@ -247,6 +252,7 @@ struct gs_prepared {
 	int present;
 	char boot_id[64];
 	char console_release[64]; /* firmware framebuffer released for this card, "none", or "" */
+	int msix_linked;          /* MSI-X linked when prepare finished: 1, 0, or -1 unknown (no key, as 0.2.0 wrote) */
 };
 int gs_prepared_read(const char *run_dir, const struct gs_addr *pf, struct gs_prepared *rec);
 /*
@@ -302,6 +308,8 @@ struct gs_diag_opts {
 	/* doctor --boot-display-release, each also a --device: judged as granted, as install writes it */
 	struct gs_addr release[GS_CFG_MAX_BDFS];
 	unsigned int nrelease;
+	int hold_nvidia;          /* doctor --hold-nvidia: install writes the hold (needs a console release, planned or in the config) */
+	int disable_d3cold;       /* doctor --disable-d3cold: install writes d3cold=off (needs a laptop GPU among those judged) */
 	const char *nvidia_source; /* doctor: NVIDIA's kernel tree to check; NULL: GS_NVIDIA_SRC */
 	const char *driver_file;   /* doctor --driver-file: install extracts NVIDIA's tree from this package */
 	const struct gs_build_src *build; /* doctor, status: NULL: the live host's, skipped on a fixture root */
@@ -343,6 +351,23 @@ struct gs_prepare_opts {
 int gs_cmd_prepare(const struct gs_overrides *ov, const struct gs_prepare_opts *po, int clear_guard);
 /* prepare after the root check, lock and config load (cfg with the overrides applied). */
 int gs_prepare(const struct gs_host *h, struct gs_config *cfg, const struct gs_prepare_opts *po);
+
+/*
+ * Laptop GPUs and D3cold (docs/laptops.md#d3cold). gs_laptop_gpus: the laptop rows (gs_device.laptop) among
+ * the n addresses of list, by each one's device attribute below sys (readable while the card is off), into
+ * out; returns how many. gs_d3cold_usage: --disable-d3cold without a laptop GPU selected, said on standard
+ * error; returns GS_EXIT_USAGE.
+ */
+unsigned int gs_laptop_gpus(const char *sys, const struct gs_addr *list, unsigned int n, struct gs_addr *out);
+int gs_d3cold_usage(void);
+/*
+ * Why prepare refuses the laptop GPUs laptops (n of them) while the config has no d3cold=off: the text after
+ * "refused, nothing changed: ", ending with the install command that keeps the selection sel and its grants rel.
+ * Each line after the first starts with indent. buf takes GS_D3COLD_WHY_SIZE bytes.
+ */
+#define GS_D3COLD_WHY_SIZE 1536
+void gs_d3cold_why(char *buf, size_t len, const struct gs_addr *laptops, unsigned int n, const struct gs_addr *sel,
+		   unsigned int nsel, const struct gs_addr *rel, unsigned int nrel, const char *indent);
 
 /*
  * Ada and Ampere CPU-RM host stack (docs/driver-patch.md#revisions). activate: enable the VFs of a
@@ -417,14 +442,36 @@ struct gs_install_opts {
 	const char *driver_file;   /* --driver-file PATH: NVIDIA's .run package (absolute, resolved) */
 	int accept_nvidia_license; /* --accept-nvidia-license: run NVIDIA's installer from driver_file */
 	int release_note_shown;    /* --release-note-shown: setup explained the console-release grant at its question */
+	int hold_nvidia;           /* --hold-nvidia: write GS_NVIDIA_HOLD (needs a console-release grant) */
+	int hold_note_shown;       /* --hold-note-shown: setup prints the hold notice itself after install */
+	int disable_d3cold;        /* --disable-d3cold: write d3cold=off (needs a laptop GPU selected) */
 };
 int gs_cmd_install(const struct gs_install_opts *opts);
 /*
+ * The framed notice that nvidia must not load at boot while a boot display GPU is granted a console
+ * release: what the release does, the file GS_NVIDIA_HOLD and its two lines, and how to revert it.
+ * by_hand: the file is not created for the user, so it is reverted by deleting it, not by uninstall.
+ * In red when gs_color(f).
+ */
+void gs_hold_notice(FILE *f, int by_hand);
+/* gs_hold_notice in red (ANSI escapes before and after) when color, else plain. */
+void gs_hold_notice_color(FILE *f, int by_hand, int color);
+/*
+ * The framed notice before setup's D3cold question for a laptop GPU: what D3cold does, what d3cold=off keeps
+ * powered and what it costs, what the user must configure, and how to revert. In red when gs_color(f);
+ * gs_d3cold_notice_color: in red when color, else plain.
+ */
+void gs_d3cold_notice(FILE *f);
+void gs_d3cold_notice_color(FILE *f, int color);
+/* Whether f takes colour: a terminal, NO_COLOR unset or empty, and TERM not "dumb". */
+int gs_color(FILE *f);
+/*
  * The end of a live install that enabled the boot units: the units, the console-release hold and
  * commands when cfg grants a release (the file that holds nvidia back when the modprobe.d directory
- * modprobe_dir has one), then the next step (doctor, the power cycle, what to run after it).
+ * modprobe_dir has one, else gs_hold_notice unless hold_shown: setup prints it after install), then
+ * the next step (doctor, the power cycle, what to run after it).
  */
-void gs_install_next(const char *bindir, const struct gs_config *cfg, const char *modprobe_dir);
+void gs_install_next(const char *bindir, const struct gs_config *cfg, const char *modprobe_dir, int hold_shown);
 int gs_cmd_uninstall(int unload);
 /* setup's questions: AUTO asks when standard input is a terminal, ON always (--interactive), OFF never (--no-prompt). */
 enum gs_prompt { GS_PROMPT_AUTO, GS_PROMPT_ON, GS_PROMPT_OFF };
@@ -432,9 +479,12 @@ enum gs_prompt { GS_PROMPT_AUTO, GS_PROMPT_ON, GS_PROMPT_OFF };
  * setup: from the host's state, the next steps of a first install (doctor, install) or of a
  * prepared boot (doctor, check, prepare when needed, activate, check), each run as a child
  * process of this binary; ends with the guest drivers of each selected card. o carries --device,
- * --boot-display-release, --vfs, --driver=skip, --nvidia-source, --driver-file and
- * --accept-nvidia-license, which only a first install takes (an installed host notes and ignores
- * them); on an installed host --device must name exactly the configured GPUs. When the config grants
+ * --boot-display-release, --vfs, --driver=skip, --nvidia-source, --driver-file,
+ * --accept-nvidia-license and --hold-nvidia, which only a first install takes (an installed host notes
+ * and ignores them); on an installed host --device must name exactly the configured GPUs. A first
+ * install that grants a console release, with no hold of nvidia in modprobe.d, asks after
+ * gs_hold_notice whether install creates GS_NVIDIA_HOLD (--hold-nvidia); without a yes or that option,
+ * it prints gs_hold_notice for a file created by hand after install. When the config grants
  * a console release, check is not ready and NVIDIA's driver is not loaded, it runs the commands of
  * gs_release_steps after a yes; without a question it refuses with them (GS_EXIT_REFUSED). With NVIDIA's
  * driver loaded it refuses before prepare (GS_EXIT_REFUSED): the console card cannot be released that boot.
@@ -442,6 +492,11 @@ enum gs_prompt { GS_PROMPT_AUTO, GS_PROMPT_ON, GS_PROMPT_OFF };
  * the commands after prepare (modprobe, activate, check) without asking again.
  * When check is not ready and the loaded nvidia module is not the installed build, it refuses before
  * prepare and activate (GS_EXIT_REFUSED).
+ * A selected laptop GPU without D3cold consent (d3cold=off in the config, or --disable-d3cold): after the
+ * other questions, gs_d3cold_notice and the question whether install writes d3cold=off. Yes passes
+ * --disable-d3cold to doctor and install (on an installed host, `install --driver=skip --disable-d3cold`
+ * ends the run); no, or no question, refuses before any step (GS_EXIT_REFUSED). --disable-d3cold without
+ * a selected laptop GPU is GS_EXIT_USAGE.
  */
 int gs_cmd_setup(const struct gs_install_opts *o, enum gs_prompt prompt);
 /*
@@ -449,7 +504,8 @@ int gs_cmd_setup(const struct gs_install_opts *o, enum gs_prompt prompt);
  * in is the descriptor the answers come from, -1 to ask nothing; driver_present: NVIDIA's kernel tree
  * or vGPU userspace is on the host; config: the config file of an installed host, NULL for
  * gs_config_path() (the steps read GS_CONFIG_PATH, so another path set in the environment refuses);
- * build: the driver build sources (NULL: the live host's, skipped on a fixture host).
+ * build: the driver build sources (NULL: the live host's, skipped on a fixture host); modprobe_dir:
+ * where a hold of nvidia is looked for (NULL: /etc/modprobe.d).
  */
 struct gs_setup_host {
 	const struct gs_host *h;
@@ -457,6 +513,7 @@ struct gs_setup_host {
 	int driver_present;
 	const char *config;
 	const struct gs_build_src *build;
+	const char *modprobe_dir;
 };
 int gs_setup(const struct gs_setup_host *s, const struct gs_install_opts *o);
 /* One manifest file: removed only while still the regular file with hash want (never through a
@@ -470,7 +527,8 @@ int gs_uninstall_file(const char *path, const char *want);
  * When --restore fails, the driver script, NVIDIA's backup and the record stay, the manifest keeps the
  * script, and the way back is printed. After a restore, the backups left in the manifest's directory
  * (other kernels) are named with the command that puts each back. A hold of nvidia in the modprobe.d
- * directory modprobe_dir is named either way. GS_EXIT_OK or GS_EXIT_FAIL.
+ * directory modprobe_dir is named either way, unless the manifest lists it (install --hold-nvidia wrote
+ * it, and it is removed with the other files or kept with them). GS_EXIT_OK or GS_EXIT_FAIL.
  */
 int gs_uninstall_files(const char *path, const char *modprobe_dir, const char *const keep[]);
 
@@ -509,13 +567,20 @@ int gs_unit_file_present(const char *name);
 int gs_driver_step(const char *const argv[], const char *log, char *why, size_t len);
 /*
  * install's DKMS step for GS_DKMS_NAME/GS_VERSION, each command run by run (gs_run; tests record them).
- * registered: DKMS holds this version already. Then the new tree is first built in a scratch DKMS tree
- * below the directory scratch (`dkms --dkmstree`), which leaves the registered module and its installed
- * copy alone; only when that succeeds is the old one removed (`dkms remove --all`) and the new one added,
+ * registered: DKMS holds this version already. status: the output of `dkms status -m GS_DKMS_NAME`
+ * (NULL or "": none), whose other versions of GS_DKMS_NAME (an upgrade) are replaced as well. When any
+ * is registered, the new tree is first built in a scratch DKMS tree below the directory scratch
+ * (`dkms --dkmstree`), which leaves the registered modules and their installed copies alone; only when
+ * that succeeds are they removed (`dkms remove --all`, the other versions first) and the new one added,
  * built and installed for the running kernel. When that fails after the removal, the boot units are
- * disabled. 0, or GS_EXIT_FAIL with what was removed and the way back printed.
+ * disabled. After a successful install, the source tree /usr/src/GS_DKMS_NAME-<v> of each other version v
+ * it removed goes too, but only when it is a real directory holding only files the install manifest at
+ * manifest records and install still owns; the manifest drops the entries that are gone. Paths on disk
+ * are below root ("" for the live system); a tree that stays is a warning only. 0, or GS_EXIT_FAIL with
+ * what was removed and the way back printed.
  */
-int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const char *scratch);
+int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const char *status, const char *scratch,
+		 const char *root, const char *manifest);
 
 /* What leads gs_release_steps wherever it lists what to run after each boot. */
 #define GS_RELEASE_STEPS_LEAD "After each boot, as root, in this order:"

@@ -35,45 +35,120 @@ static int checks;
 
 /*
  * Every row of the table, written out independently of it: ID, generation,
- * die and hardware TotalVFs. A wrong, missing or extra row fails.
+ * die, hardware TotalVFs and the laptop flag. A wrong, missing or extra row fails.
  */
 static const struct row {
 	unsigned short id;
 	unsigned char gen;	/* enum gs_generation */
 	const char *die;
 	unsigned short totalvfs;
+	unsigned char laptop;	/* a laptop row */
 } rows[] = {
-	{ 0x2203, GS_AMPERE, "GA102", 16 }, { 0x2204, GS_AMPERE, "GA102", 16 },
-	{ 0x2206, GS_AMPERE, "GA102", 16 }, { 0x2208, GS_AMPERE, "GA102", 16 },
-	{ 0x220a, GS_AMPERE, "GA102", 16 }, { 0x2216, GS_AMPERE, "GA102", 16 },
-	{ 0x2482, GS_AMPERE, "GA104", 16 }, { 0x2484, GS_AMPERE, "GA104", 16 },
-	{ 0x2486, GS_AMPERE, "GA104", 16 }, { 0x2487, GS_AMPERE, "GA104", 16 },
-	{ 0x2488, GS_AMPERE, "GA104", 16 }, { 0x2489, GS_AMPERE, "GA104", 16 },
-	{ 0x24b0, GS_AMPERE, "GA104", 16 },
-	{ 0x2503, GS_AMPERE, "GA106", 16 }, { 0x2504, GS_AMPERE, "GA106", 16 },
-	{ 0x2507, GS_AMPERE, "GA106", 16 }, { 0x2544, GS_AMPERE, "GA106", 16 },
-	{ 0x2571, GS_AMPERE, "GA106", 16 },
-	{ 0x2582, GS_AMPERE, "GA107", 16 }, { 0x2584, GS_AMPERE, "GA107", 16 },
-	{ 0x2684, GS_ADA, "AD102", 1 }, { 0x2685, GS_ADA, "AD102", 1 },
-	{ 0x2689, GS_ADA, "AD102", 1 },
-	{ 0x2702, GS_ADA, "AD103", 1 }, { 0x2704, GS_ADA, "AD103", 1 },
-	{ 0x2705, GS_ADA, "AD103", 1 }, { 0x2709, GS_ADA, "AD103", 1 },
-	{ 0x2782, GS_ADA, "AD104", 1 }, { 0x2783, GS_ADA, "AD104", 1 },
-	{ 0x2786, GS_ADA, "AD104", 1 }, { 0x2788, GS_ADA, "AD104", 1 },
-	{ 0x27b1, GS_ADA, "AD104", 1 }, { 0x27b2, GS_ADA, "AD104", 1 },
-	{ 0x2803, GS_ADA, "AD106", 1 }, { 0x2805, GS_ADA, "AD106", 1 },
-	{ 0x2882, GS_ADA, "AD107", 1 }, { 0x28b0, GS_ADA, "AD107", 16 },
+	{ 0x2203, GS_AMPERE, "GA102", 16, 0 }, { 0x2204, GS_AMPERE, "GA102", 16, 0 },
+	{ 0x2206, GS_AMPERE, "GA102", 16, 0 }, { 0x2208, GS_AMPERE, "GA102", 16, 0 },
+	{ 0x220a, GS_AMPERE, "GA102", 16, 0 }, { 0x2216, GS_AMPERE, "GA102", 16, 0 },
+	{ 0x2482, GS_AMPERE, "GA104", 16, 0 }, { 0x2484, GS_AMPERE, "GA104", 16, 0 },
+	{ 0x2486, GS_AMPERE, "GA104", 16, 0 }, { 0x2487, GS_AMPERE, "GA104", 16, 0 },
+	{ 0x2488, GS_AMPERE, "GA104", 16, 0 }, { 0x2489, GS_AMPERE, "GA104", 16, 0 },
+	{ 0x249c, GS_AMPERE, "GA104", 16, 1 }, { 0x249d, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24a0, GS_AMPERE, "GA104", 16, 1 }, { 0x24b0, GS_AMPERE, "GA104", 16, 0 },
+	{ 0x24b6, GS_AMPERE, "GA104", 16, 1 }, { 0x24dc, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24dd, GS_AMPERE, "GA104", 16, 1 }, { 0x24e0, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x2503, GS_AMPERE, "GA106", 16, 0 }, { 0x2504, GS_AMPERE, "GA106", 16, 0 },
+	{ 0x2507, GS_AMPERE, "GA106", 16, 0 }, { 0x2520, GS_AMPERE, "GA106", 16, 1 },
+	{ 0x2523, GS_AMPERE, "GA106", 16, 1 }, { 0x2544, GS_AMPERE, "GA106", 16, 0 },
+	{ 0x2560, GS_AMPERE, "GA106", 16, 1 }, { 0x2571, GS_AMPERE, "GA106", 16, 0 },
+	{ 0x2582, GS_AMPERE, "GA107", 16, 0 }, { 0x2584, GS_AMPERE, "GA107", 16, 0 },
+	{ 0x25a0, GS_AMPERE, "GA107", 16, 1 }, { 0x25a2, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25b9, GS_AMPERE, "GA107", 16, 1 }, { 0x25ba, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25ec, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x2684, GS_ADA, "AD102", 1, 0 }, { 0x2685, GS_ADA, "AD102", 1, 0 },
+	{ 0x2689, GS_ADA, "AD102", 1, 0 },
+	{ 0x2702, GS_ADA, "AD103", 1, 0 }, { 0x2704, GS_ADA, "AD103", 1, 0 },
+	{ 0x2705, GS_ADA, "AD103", 1, 0 }, { 0x2709, GS_ADA, "AD103", 1, 0 },
+	{ 0x2717, GS_ADA, "AD103", 1, 1 }, { 0x2757, GS_ADA, "AD103", 1, 1 },
+	{ 0x2782, GS_ADA, "AD104", 1, 0 }, { 0x2783, GS_ADA, "AD104", 1, 0 },
+	{ 0x2786, GS_ADA, "AD104", 1, 0 }, { 0x2788, GS_ADA, "AD104", 1, 0 },
+	{ 0x27b1, GS_ADA, "AD104", 1, 0 }, { 0x27b2, GS_ADA, "AD104", 1, 0 },
+	{ 0x27e0, GS_ADA, "AD104", 1, 1 },
+	{ 0x2803, GS_ADA, "AD106", 1, 0 }, { 0x2805, GS_ADA, "AD106", 1, 0 },
+	{ 0x2820, GS_ADA, "AD106", 1, 1 }, { 0x2860, GS_ADA, "AD106", 1, 1 },
+	{ 0x2882, GS_ADA, "AD107", 1, 0 }, { 0x28a0, GS_ADA, "AD107", 1, 1 },
+	{ 0x28a1, GS_ADA, "AD107", 1, 1 }, { 0x28b0, GS_ADA, "AD107", 16, 0 },
+	{ 0x28b8, GS_ADA, "AD107", 1, 1 }, { 0x28e0, GS_ADA, "AD107", 1, 1 },
+	{ 0x28e1, GS_ADA, "AD107", 1, 1 },
+	/* laptop and embedded IDs without a dump */
+	{ 0x24b7, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24b8, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24b9, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24ba, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x24bb, GS_AMPERE, "GA104", 16, 1 },
+	{ 0x2563, GS_AMPERE, "GA106", 16, 1 },
+	{ 0x25a5, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25a6, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25a7, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25a9, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25ab, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25ac, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25ad, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25b8, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25bb, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25bc, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25bd, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25e0, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25e2, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25e5, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25ed, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25f9, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25fa, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x25fb, GS_AMPERE, "GA107", 16, 1 },
+	{ 0x2730, GS_ADA, "AD103", 1, 1 },
+	{ 0x2770, GS_ADA, "AD103", 1, 1 },
+	{ 0x27a0, GS_ADA, "AD104", 1, 1 },
+	{ 0x27ba, GS_ADA, "AD104", 1, 1 },
+	{ 0x27bb, GS_ADA, "AD104", 1, 1 },
+	{ 0x27fb, GS_ADA, "AD104", 1, 1 },
+	{ 0x2838, GS_ADA, "AD106", 1, 1 },
+	{ 0x28b9, GS_ADA, "AD107", 1, 1 },
+	{ 0x28ba, GS_ADA, "AD107", 1, 1 },
+	{ 0x28bb, GS_ADA, "AD107", 1, 1 },
+	{ 0x28e3, GS_ADA, "AD107", 1, 1 },
 };
 #define NROWS (sizeof(rows) / sizeof(rows[0]))
 
-/* The workstation rows: the same hidden SR-IOV block as the GeForce cards of their generation. */
-static const unsigned short workstation[] = { 0x27b1, 0x27b2, 0x28b0, 0x24b0, 0x2571 };
+/*
+ * The workstation rows, the laptop ones (24b6, 25b9, 25ba, 28b8) included: the same hidden SR-IOV
+ * block as the GeForce cards of their generation.
+ */
+static const unsigned short workstation[] = { 0x27b1, 0x27b2, 0x28b0, 0x24b0, 0x2571,
+					      0x24b6, 0x25b9, 0x25ba, 0x28b8,
+					      0x24b7, 0x24b8, 0x24b9, 0x24ba, 0x24bb, 0x25b8, 0x25bb, 0x25bc, 0x25bd, 0x25f9, 0x25fa, 0x25fb, 0x2730, 0x2770, 0x27ba, 0x27bb, 0x27fb, 0x2838, 0x28b9, 0x28ba, 0x28bb };
+
+/* The 25 laptop rows and their names. */
+static const struct laptop_row {
+	unsigned short id;
+	const char *name;
+} laptop[] = {
+	{ 0x249c, "GeForce RTX 3080 Laptop GPU" },	{ 0x249d, "GeForce RTX 3070 Laptop GPU" },
+	{ 0x24a0, "GeForce RTX 3070 Ti Laptop GPU" },	{ 0x24b6, "RTX A5000 Laptop GPU" },
+	{ 0x24dc, "GeForce RTX 3080 Laptop GPU" },	{ 0x24dd, "GeForce RTX 3070 Laptop GPU" },
+	{ 0x24e0, "GeForce RTX 3070 Ti Laptop GPU" },	{ 0x2520, "GeForce RTX 3060 Laptop GPU" },
+	{ 0x2523, "GeForce RTX 3050 Ti Laptop GPU" },	{ 0x2560, "GeForce RTX 3060 Laptop GPU" },
+	{ 0x25a0, "GeForce RTX 3050 Ti Laptop GPU" },	{ 0x25a2, "GeForce RTX 3050 Laptop GPU" },
+	{ 0x25b9, "RTX A1000 Laptop GPU" },		{ 0x25ba, "RTX A2000 8GB Laptop GPU" },
+	{ 0x25ec, "GeForce RTX 3050 6GB Laptop GPU" },	{ 0x2717, "GeForce RTX 4090 Laptop GPU" },
+	{ 0x2757, "GeForce RTX 4090 Laptop GPU" },	{ 0x27e0, "GeForce RTX 4080 Laptop GPU" },
+	{ 0x2820, "GeForce RTX 4070 Laptop GPU" },	{ 0x2860, "GeForce RTX 4070 Laptop GPU" },
+	{ 0x28a0, "GeForce RTX 4060 Laptop GPU" },	{ 0x28a1, "GeForce RTX 4050 Laptop GPU" },
+	{ 0x28b8, "RTX 2000 Ada Laptop GPU" },		{ 0x28e0, "GeForce RTX 4060 Laptop GPU" },
+	{ 0x28e1, "GeForce RTX 4050 Laptop GPU" },
+};
 
 static void test_constants(void)
 {
 	CHECK(GS_DEFAULT_VFS == 4);
 	CHECK(GS_VFS_MAX == 16);
-	CHECK(strcmp(GS_VERSION, "0.2.0") == 0);
+	CHECK(strcmp(GS_VERSION, "0.2.1") == 0);
 	CHECK(GS_MAX_PFS == 8);
 	CHECK(GS_VENDOR_NVIDIA == 0x10de);
 	CHECK(GS_MSIX_HIDE_BIT == 29);
@@ -113,16 +188,16 @@ static void test_table_entries(void)
 
 	/* The independent list and the table hold the same rows: same count, each list row found. */
 	CHECK(GS_DEVICE_COUNT == NROWS);
-	CHECK(GS_DEVICE_COUNT == 37);
+	CHECK(GS_DEVICE_COUNT == 97);
 	for (i = 0; i < NROWS; i++) {
 		const struct gs_device *d = gs_device_lookup(rows[i].id);
 
 		checks++;
 		if (!d || d->generation != rows[i].gen || strcmp(d->die, rows[i].die) != 0 ||
-		    d->totalvfs != rows[i].totalvfs) {
+		    d->totalvfs != rows[i].totalvfs || d->laptop != rows[i].laptop) {
 			failures++;
-			fprintf(stderr, "FAIL: 10de:%04x is missing or not %s %s with TotalVFs %u\n", rows[i].id,
-				gs_generation_name(rows[i].gen), rows[i].die, rows[i].totalvfs);
+			fprintf(stderr, "FAIL: 10de:%04x is missing or not %s %s with TotalVFs %u, laptop %u\n", rows[i].id,
+				gs_generation_name(rows[i].gen), rows[i].die, rows[i].totalvfs, rows[i].laptop);
 		}
 	}
 	for (i = 0; i < GS_DEVICE_COUNT; i++) {
@@ -132,7 +207,7 @@ static void test_table_entries(void)
 			CHECK_DEV(d, gs_devices[j].device != d->device);
 
 		CHECK_DEV(d, d->die && d->die[0]);
-		CHECK_DEV(d, d->name && (strncmp(d->name, "GeForce RTX ", 12) == 0 ||
+		CHECK_DEV(d, d->name && (strncmp(d->name, "GeForce RTX ", 12) == 0 || strncmp(d->name, "GeForce MX", 10) == 0 ||
 					 strncmp(d->name, "RTX ", 4) == 0));
 		/* The configurable range covers every card's hardware default. */
 		CHECK_DEV(d, d->totalvfs >= 1 && d->totalvfs <= GS_VFS_MAX);
@@ -159,7 +234,7 @@ static void test_table_entries(void)
 			CHECK_DEV(d, !"generation out of range");
 		}
 	}
-	CHECK(ampere == 20 && ada == 17);
+	CHECK(ampere == 59 && ada == 38);
 }
 
 static void test_lookup(void)
@@ -174,8 +249,8 @@ static void test_lookup(void)
 		0x27b0, 0x27b3, 0x28b1, 0x24b1, 0x2570, 0x2572,
 		/* Blackwell GeForce */
 		0x2b85, 0x2c02, 0x2c05, 0x2d04, 0x2d05, 0x2f04,
-		/* laptop dies and IDs without reviewed evidence */
-		0x2520, 0x2560, 0x25a2, 0x2860, 0x28e0, 0x2757, 0x2c18, 0x2d19,
+		/* laptop IDs without a reviewed dump, and other IDs without reviewed evidence */
+		0x2c18, 0x2d19,
 		0x2f18, 0x2d98, 0x2b87, 0x2808, 0x2414, 0x24c9,
 		/* audio functions and nonsense */
 		0x228b, 0x0000, 0xffff, 0x10de,
@@ -208,6 +283,25 @@ static void test_lookup(void)
 	d = gs_device_lookup(0x2571);
 	CHECK(d && d->generation == GS_AMPERE && strcmp(d->die, "GA106") == 0 &&
 	      strcmp(d->name, "RTX A2000 12GB") == 0);
+
+	/* The laptop rows, each with the name of its row and the laptop flag; no other row has the flag. */
+	CHECK(sizeof(laptop) / sizeof(laptop[0]) == 25);
+	for (i = 0; i < sizeof(laptop) / sizeof(laptop[0]); i++) {
+		d = gs_device_lookup(laptop[i].id);
+		checks++;
+		if (!d || strcmp(d->name, laptop[i].name) != 0 || d->laptop != 1) {
+			failures++;
+			fprintf(stderr, "FAIL: 10de:%04x is missing, not named %s or not flagged laptop\n", laptop[i].id,
+				laptop[i].name);
+		}
+	}
+	{
+		unsigned int flagged = 0;
+
+		for (i = 0; i < GS_DEVICE_COUNT; i++)
+			flagged += gs_devices[i].laptop;
+		CHECK(flagged == 60);
+	}
 
 	for (i = 0; i < sizeof(absent) / sizeof(absent[0]); i++) {
 		checks++;
@@ -671,9 +765,10 @@ static void test_default_vf_count(void)
 }
 
 /*
- * The workstation rows: 27b1 and 27b2 report TotalVFs 1, 28b0, 24b0 and
- * 2571 report 16. With the default count each presents 4 VFs, on functions
- * 4-7 of the GA102/AD104 layout (first VF offset 4, stride 1).
+ * The workstation rows: 27b1, 27b2 and the laptop 28b8 report TotalVFs 1;
+ * 28b0, 24b0, 2571 and the laptop 24b6, 25b9 and 25ba report 16. With the
+ * default count each presents 4 VFs, on functions 4-7 of the GA102/AD104
+ * layout (first VF offset 4, stride 1).
  */
 static void test_workstation_vfs(void)
 {
@@ -685,7 +780,7 @@ static void test_workstation_vfs(void)
 		CHECK(d != NULL);
 		if (!d)
 			continue;
-		CHECK_DEV(d, d->totalvfs == (d->device == 0x27b1 || d->device == 0x27b2 ? 1 : 16));
+		CHECK_DEV(d, d->totalvfs == (d->generation == GS_ADA && d->device != 0x28b0 ? 1 : 16));
 		CHECK_DEV(d, d->sriov_pos == 0xbcc && d->ari_pos == 0xc14 && d->msix_pos == 0xc8);
 		limit = gs_vf_limit(d, d->totalvfs, GS_DEFAULT_VFS);
 		CHECK_DEV(d, limit == GS_DEFAULT_VFS);

@@ -50,8 +50,8 @@ Keep SSH access, and netconsole or a serial console if available, so you can rea
 | `Unit nvidia-vgpud.service not found` (or `nvidia-vgpu-mgr.service`) | NVIDIA's unit files are not installed | [NVIDIA's vGPU daemon units](installation.md#nvidias-vgpu-daemon-units) |
 | VFs exist but no vGPU types appear | `nvidia-vgpud` started before the VFs, or the hook is off | Run `activate`, which restarts both daemons in order. If the patched plugin copy is not installed, run `sudo geforce-sriov install` first. Then check `identity=on` and the hook log lines |
 | `nvidia-vgpud` fails with an assertion on `/run/geforce-sriov/deferred` | Boot-display grant: the cards are not prepared this boot | Run `geforce-sriov setup`, or its four commands by hand: `prepare --release-console=…`, `modprobe --ignore-install nvidia`, `activate`, `check` ([Boot display card](installation.md#boot-display-card)) |
-| `setup` exits 3: `NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. …` | Boot-display grant, and something loaded `nvidia` at boot, so it bound the console card before `prepare` | Create the hold ([Boot display card](installation.md#boot-display-card)), power the machine off and on, then run `setup` again |
-| `doctor`: `nvidia is held back at boot by <file>, and no console release is granted. activate will refuse. …`, or `activate --boot` refuses each boot because NVIDIA's driver is not loaded | The hold from [Boot display card](installation.md#boot-display-card) is still in `/etc/modprobe.d/` after the grant was removed, so nothing loads `nvidia` | Remove that file ([Returning to automatic preparation](installation.md#returning-to-automatic-preparation)), then power the machine off and on |
+| `setup` exits 3: `NVIDIA's driver is loaded, so the console GPU cannot be released in this boot. …` | Boot-display grant, and something loaded `nvidia` at boot, so it bound the console card before `prepare` | Create `/etc/modprobe.d/nvidia-manual-load.conf` with `blacklist nvidia` and `install nvidia /bin/false`, power the machine off and on, then run `setup` again |
+| `doctor`: `nvidia is held back at boot by <file>, and no console release is granted. activate will refuse. …`, or `activate --boot` refuses each boot because NVIDIA's driver is not loaded | The hold from [Boot display card](installation.md#boot-display-card) is still in `/etc/modprobe.d/` after the grant was removed, so nothing loads `nvidia` | Remove the file `doctor` names, then power the machine off and on |
 | `doctor`: `<file> sets LD_PRELOAD for nvidia-vgpud and overrides the geforce-sriov identity hook. …` (or `nvidia-vgpu-mgr`) | Another drop-in of that unit preloads its own library, and systemd keeps the last `LD_PRELOAD`, so the identity hook is not loaded | Remove that drop-in, or point its `LD_PRELOAD` at the hook path `doctor` names, then run `systemctl daemon-reload` and `activate` with no VM running |
 | VM does not start, or the start fails with an error about the vGPU type | The type does not fit the free memory, or the VFs or daemons are not ready. On an Ada card with a large type, the VF's framebuffer slot ends near the top of the card's memory; `activate` names such VFs after it sets the types | Run `geforce-sriov check`, put the VM on a lower VF or pick a smaller type ([Choosing a vGPU type](configuration.md#choosing-a-vgpu-type)), and make the daemons ready with `activate` (install the patched plugin copy first with `sudo geforce-sriov install`) |
 | `check` reports `NOT READY … type=<old> expected=<new>` after `type_ada` or `type_ampere` changed | The config names a new type and the VFs still carry the old one | Stop the VMs on that card, write `0` to `nvidia/current_vgpu_type` of each of its VFs while `nvidia-vgpu-mgr` runs, then run `activate` |
@@ -59,7 +59,7 @@ Keep SSH access, and netconsole or a serial console if available, so you can rea
 | `activate` refuses: `nvidia.ko for … is not the driver step's build …`, or `nvidia.ko for … is not known to be the driver step's build: … records kernel …` | The record does not name the installed `nvidia.ko` for the running kernel, for example because DKMS rebuilt the stock module after a kernel update, or the record was made on another kernel | Run `sudo geforce-sriov install` on this kernel, which rewrites the record when the installed module is this build, then power-cycle ([After a kernel or NVIDIA driver update](driver-patch.md#after-a-kernel-or-nvidia-driver-update)). With no record at all (`--driver=skip`), `activate` only warns |
 | `doctor`, `status`, `check` or `activate`: `the running nvidia module (build-id …) is not the installed one (…); power the machine off and on to load it` | The installed `nvidia.ko` is the driver step's build, and the running `nvidia` module is not, for example after `install` or the driver step put a new build in place without a power cycle | Cold power cycle, so the installed build is loaded. Until then `status` exits 1, and `activate` warns and continues on the loaded module |
 | `activate`: `type <N> is not in nvidia/creatable_vgpu_types …; nothing written. The driver keeps the vGPU types it registered first after a boot, so after a change of identity or target, power the machine off and on` | NVIDIA's `nvidia_vgpu_vfio` keeps the type table of each GPU's first registration until the next boot. Neither a PF re-probe nor a daemon restart refreshes it, so after a change of identity or target the old table stays | Cold power cycle, then run `activate` again |
-| `uninstall` exits 1 and prints `NVIDIA's module was not restored: …` | Restoring NVIDIA's `nvidia.ko`, plugin link or modprobe file did not complete | `uninstall` kept `geforce-sriov-driver` and every backup in `/var/lib/geforce-sriov/stock/`. The message gives the reason and the two ways to finish: fix the reason, then run `geforce-sriov-driver --restore`, or copy `/var/lib/geforce-sriov/stock/<kernel release>/nvidia.ko` over the installed `nvidia.ko` and run `depmod -a <kernel release>`; [Reverting](driver-patch.md#reverting) covers the plugin link and the modprobe file ([Remove the package](#remove-the-package)) |
+| `uninstall` exits 1 and prints `NVIDIA's module was not restored: …` | Restoring NVIDIA's `nvidia.ko`, plugin link or modprobe file did not complete, or `uninstall` refused to run `geforce-sriov-driver` because it changed since install | `uninstall` kept `geforce-sriov-driver` and every backup in `/var/lib/geforce-sriov/stock/`. The message gives the reason and the two ways to finish: fix the reason, then run `geforce-sriov-driver --restore`, or copy `/var/lib/geforce-sriov/stock/<kernel release>/nvidia.ko` over the installed `nvidia.ko` and run `depmod -a <kernel release>`; [Reverting](driver-patch.md#reverting) covers the plugin link and the modprobe file ([Remove the package](#remove-the-package)) |
 | Guest GPU work stalls | The stock `nvidia.ko` is loaded (DKMS rebuilt it after an update) | Run `install` again for this kernel ([After a kernel update](installation.md#after-a-kernel-update)); on the manual path re-apply the [driver patch](driver-patch.md#after-a-kernel-or-nvidia-driver-update) |
 
 `activate` and `check` act on every selected Ada or Ampere card.
@@ -150,7 +150,9 @@ Once `prepare --release-console` has released the card, its framebuffer console 
 
 While the boot unit has deferred (`/run/geforce-sriov/deferred` exists), `nvidia-vgpud` and the units that require it refuse to start.
 The record is removed once every selected GPU is prepared, and it does not survive a reboot.
-To stop deferring, run `geforce-sriov install --device BDF` for the other GPUs only (without `--boot-display-release`), and remove the hold `/etc/modprobe.d/nvidia-manual-load.conf` ([Returning to automatic preparation](installation.md#returning-to-automatic-preparation)).
+Run `install --device …` without `--boot-display-release`.
+This removes `/etc/modprobe.d/nvidia-manual-load.conf` if it was created by `setup` or `install --hold-nvidia` and remains unchanged.
+Remove a manually created hold yourself ([Returning to automatic preparation](installation.md#returning-to-automatic-preparation)).
 The next boot prepares them automatically and leaves the boot display and its console alone.
 
 ## Logs
@@ -198,7 +200,7 @@ Each switch below lives in `/etc/geforce-sriov/config` and is read by the next `
 | The kernel scans every slot below the port (`pci=pcie_scan_all`, or an x86 platform quirk) | Nothing. ARI stays off automatically, and SR-IOV and the VF count are unaffected |
 | PF interrupts misbehave, or after any PF reset or AER recovery | `msix=off`. A PF reset re-hides MSI-X and silently stops its interrupts until the next cold boot |
 | Ada card misbehaves with more than 1 VF | `vfs=1` (or `geforce-sriov install --vfs 1`), then a cold boot |
-| You want fewer VFs per card | `vfs=N` (1–4; or `geforce-sriov install --vfs N`), then a cold boot. `activate` then creates that count |
+| You want fewer VFs per card | Set `vfs=N` below the default of 4, or run `geforce-sriov install --vfs N`, then cold-boot. `activate` creates the configured count |
 | Stop the identity rewrite | `identity=off`. Every ioctl then passes through unchanged |
 | Undo the VF power setting | `echo auto > /sys/bus/pci/devices/<VF>/power/control`; no reboot needed. On Ada, re-attaching a VM after a stop then fails again in the guest with `RmInitAdapter failed! (0x11:0x45)` |
 | Undo the VF type | With the VM stopped: `echo 0 > /sys/bus/pci/devices/<VF>/nvidia/current_vgpu_type` |
@@ -233,16 +235,20 @@ sudo geforce-sriov uninstall
    Each is named with a `restore <kernel release>: cp … && depmod -a <kernel release>` line that puts NVIDIA's module back for that kernel.
 
    If restoration fails, `uninstall` removes the other installed files but keeps `geforce-sriov-driver` and every backup in `/var/lib/geforce-sriov/stock/`.
-   It prints `NVIDIA's module was not restored: <reason>` with the two ways to finish by hand, and exits 1.
+   It prints `NVIDIA's module was not restored: <reason>`, gives two ways to finish by hand, and exits 1.
+
+   `uninstall` runs `geforce-sriov-driver --restore` only if the script is unchanged since install.
+   If the script changed, `uninstall` keeps it but does not run it.
+   The message tells you to check the script, or restore the installed copy with `geforce-sriov install` and run `uninstall` again.
 4. Only installed files whose SHA-256 is unchanged are deleted.
    For the others, including an edited `/etc/geforce-sriov/config`, it prints `kept … (changed since install)`.
    The driver step's log `/var/lib/geforce-sriov/driver-step.log` is removed, as is `/var/lib/geforce-sriov/` itself when nothing is left in it.
 5. The guard `/var/lib/geforce-sriov/prepare-attempt`, if set, is kept, because an unfinished
    preparation still needs a cold power cycle. `geforce-sriov prepare --clear-guard` clears it
    afterwards, and a later `install` warns while it is set.
-6. A file in `/etc/modprobe.d/` that holds `nvidia` back (the hold from
-   [Boot display card](installation.md#boot-display-card)) is yours and stays. `uninstall` prints
-   `<file> still holds nvidia back at boot; remove it if nothing else needs it`.
+6. A hold created by `setup` or `install --hold-nvidia` is tracked as an installed file.
+   It is removed if unchanged and preserved if modified, as described in step 4.
+   A hold you created yourself is left in place, and `uninstall` reports it so you can remove it if nothing else needs it.
 
 ## What not to do
 

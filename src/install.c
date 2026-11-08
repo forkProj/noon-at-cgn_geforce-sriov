@@ -113,6 +113,20 @@ static int manifest_save(const char *file, const struct manifest *m)
 	return r;
 }
 
+/*
+ * Does install still own the file at path, recorded with hash want? Only while it is the regular file
+ * with that hash: gs_sha256_file never follows a link, so a link put in its place is not owned.
+ */
+enum owned { OWN_ABSENT, OWN_UNREADABLE, OWN_CHANGED, OWN_YES };
+static enum owned manifest_owns(const char *path, const char *want)
+{
+	char sha[65];
+
+	if (gs_sha256_file(path, sha))
+		return gs_exists(path) ? OWN_UNREADABLE : OWN_ABSENT;
+	return strcmp(sha, want) == 0 ? OWN_YES : OWN_CHANGED;
+}
+
 /* ---- install ------------------------------------------------------------ */
 
 /* Only characters that systemd passes through literally in ExecStart=/Environment=. */
@@ -320,11 +334,13 @@ overflow:
 }
 
 /*
- * The nvidia-vgpud drop-in, which preloads the hook, and the config: written last, once NVIDIA's
- * files are prepared. 0 or -errno, with the reason printed.
+ * The nvidia-vgpud drop-in, which preloads the hook, the config and, with --hold-nvidia, the hold:
+ * written last, once NVIDIA's files are prepared. held: NULL without --hold-nvidia, "" to write
+ * GS_NVIDIA_HOLD, else the files that hold nvidia back already, named instead. 0 or -errno, with the
+ * reason printed.
  */
 static int put_selection(struct ctx *x, const char *src, const char *const *subst, const struct gs_config *cfg,
-			 int config_changed, const char *cfgfile)
+			 int config_changed, const char *cfgfile, const char *held)
 {
 	char p[GS_PATH_MAX], text[GS_PATH_MAX + 1024];
 	int n, r;
@@ -336,13 +352,54 @@ static int put_selection(struct ctx *x, const char *src, const char *const *subs
 	}
 	if (!config_changed) {
 		printf("kept %s (unchanged)\n", cfgfile);
+	} else {
+		n = gs_config_render(cfg, text, sizeof(text));
+		r = n < 0 ? -EOVERFLOW : put(x, GS_CONFIG_PATH, text, (size_t)n, 0644);
+		if (r) {
+			fprintf(stderr, "geforce-sriov: installing %s failed: %s\n", GS_CONFIG_PATH, strerror(-r));
+			return r;
+		}
+	}
+	if (!held)
+		return 0;
+	if (held[0]) {
+		printf("%s already %s nvidia back at boot\n", held, strstr(held, " and ") ? "hold" : "holds");
 		return 0;
 	}
-	n = gs_config_render(cfg, text, sizeof(text));
-	r = n < 0 ? -EOVERFLOW : put(x, GS_CONFIG_PATH, text, (size_t)n, 0644);
+	r = put(x, GS_NVIDIA_HOLD, GS_NVIDIA_HOLD_TEXT, sizeof(GS_NVIDIA_HOLD_TEXT) - 1, 0644);
 	if (r)
-		fprintf(stderr, "geforce-sriov: installing %s failed: %s\n", GS_CONFIG_PATH, strerror(-r));
+		fprintf(stderr, "geforce-sriov: installing %s failed: %s\n", GS_NVIDIA_HOLD, strerror(-r));
 	return r;
+}
+
+/*
+ * After the config, when it no longer grants a console release that it granted before: the hold file an
+ * earlier --hold-nvidia wrote is removed while unchanged and leaves the manifest; any hold still in
+ * modprobe_dir (changed since install, or the user's own) is named, since nothing else says so now. 0, or
+ * -errno with the reason printed when the removal failed.
+ */
+static int drop_hold(struct ctx *x, const char *modprobe_dir)
+{
+	struct entry *e = manifest_find(&x->m, 'f', GS_NVIDIA_HOLD);
+	char full[GS_PATH_MAX], sha[65], files[2 * GS_PATH_MAX + 8];
+
+	if (gs_pathf(full, sizeof(full), "%s%s", x->destdir, GS_NVIDIA_HOLD))
+		return -ENAMETOOLONG;
+	if (e && gs_sha256_file(full, sha) == 0 && strcmp(sha, e->sha) == 0) {
+		if (unlink(full) < 0 && errno != ENOENT) {
+			int err = errno;
+
+			fprintf(stderr, "geforce-sriov: removing %s failed: %s\n", full, strerror(err));
+			return -err;
+		}
+		x->written = 1;
+		memmove(e, e + 1, (size_t)(&x->m.e[x->m.n] - (e + 1)) * sizeof(*e));
+		x->m.n--;
+		printf("removed %s: the console release is no longer granted, so nvidia loads at boot again\n", full);
+	}
+	if (!gs_nvidia_hold(modprobe_dir, files, sizeof(files)))
+		printf("%s still holds nvidia back at boot; remove it if nothing else needs it\n", files);
+	return 0;
 }
 
 static int self_dir(char *out, size_t len)
@@ -961,12 +1018,97 @@ static void print_live_steps(const char *bindir, int enable_unit, const struct g
 		       bindir, GS_UNIT_PREPARE, GS_UNIT_ACTIVATE, GS_CONFIG_PATH, GS_UNIT_PREPARE, GS_UNIT_ACTIVATE);
 }
 
+#define HOLD_RULE "========================================================================\n"
+
+int gs_color(FILE *f)
+{
+	const char *no_color = getenv("NO_COLOR"), *term = getenv("TERM");
+
+	return isatty(fileno(f)) && !(no_color && *no_color) && !(term && strcmp(term, "dumb") == 0);
+}
+
+void gs_hold_notice_color(FILE *f, int by_hand, int color)
+{
+	if (color)
+		fputs("\033[31m", f);
+	fputs(HOLD_RULE
+	      "IMPORTANT: This GPU is also used for the host display.\n"
+	      "\n"
+	      "When setup releases this GPU's Linux console, the monitor may go blank\n"
+	      "or freeze on the last frame. You will have no local text console until\n"
+	      "the next boot.\n"
+	      "\n"
+	      "Set up and test SSH or serial console access before proceeding.\n"
+	      "You will need it to manage the host after setup.\n"
+	      "\n"
+	      "This GPU requires manual setup after every boot.\n"
+	      "To keep NVIDIA's driver from loading before setup, create:\n"
+	      "\n"
+	      "  " GS_NVIDIA_HOLD "\n"
+	      "\n"
+	      "With the following contents:\n"
+	      "\n"
+	      "  blacklist nvidia\n"
+	      "  install nvidia /bin/false\n"
+	      "\n"
+	      "Without this file, NVIDIA's driver may load first and cause setup to fail.\n"
+	      "If that happens, another cold power cycle is required before you retry.\n", f);
+	/* uninstall removes the file only when install wrote it. */
+	fputs(by_hand ? "To revert, delete the file.\n" : "To revert, run `geforce-sriov uninstall`.\n", f);
+	fputs(HOLD_RULE, f);
+	if (color)
+		fputs("\033[0m", f);
+}
+
+void gs_hold_notice(FILE *f, int by_hand)
+{
+	gs_hold_notice_color(f, by_hand, gs_color(f));
+}
+
+void gs_d3cold_notice_color(FILE *f, int color)
+{
+	if (color)
+		fputs("\033[31m", f);
+	fputs(HOLD_RULE
+	      "IMPORTANT: This laptop GPU can power off when idle.\n"
+	      "\n"
+	      "This power state is called D3cold. When power returns, the GPU restarts,\n"
+	      "losing its SR-IOV setup and stopping every running vGPU. Its firmware\n"
+	      "resets too.\n"
+	      "\n"
+	      "setup can save your consent as d3cold=off in the config.\n"
+	      "prepare reapplies the power settings whenever it prepares the GPU.\n"
+	      "These runtime settings do not survive a reboot.\n"
+	      "\n"
+	      "This keeps the GPU and its parent bridge powered, even when idle.\n"
+	      "It means shorter battery life and a warmer laptop.\n"
+	      "\n"
+	      "You must also configure these yourself; setup does neither:\n"
+	      "  - Block suspend, including on lid close and when idle. Sleep powers\n"
+	      "    the GPU off.\n"
+	      "  - Disable NVIDIA's runtime power management. Run as root:\n"
+	      "      echo 'options nvidia NVreg_DynamicPowerManagement=0' > /etc/modprobe.d/nvidia-power.conf\n"
+	      "\n"
+	      "Without these safeguards, an idle GPU can power off and stop its vGPUs.\n"
+	      "To revert, run `geforce-sriov uninstall`.\n"
+	      "Restore any sleep or modprobe settings you changed yourself.\n"
+	      HOLD_RULE, f);
+	if (color)
+		fputs("\033[0m", f);
+}
+
+void gs_d3cold_notice(FILE *f)
+{
+	gs_d3cold_notice_color(f, gs_color(f));
+}
+
 /*
  * What a console-release grant needs: the same file, lines and commands as docs/installation.md#boot-display-card.
  * When the modprobe.d directory modprobe_dir already holds nvidia back, the file that does instead of the file to
- * create, named as on the target host (without destdir, "" for a live install).
+ * create, named as on the target host (without destdir, "" for a live install). hold_shown: setup prints the
+ * notice of the file to create after install, so it is left out here.
  */
-static void release_hold(const struct gs_config *cfg, const char *modprobe_dir, const char *destdir)
+static void release_hold(const struct gs_config *cfg, const char *modprobe_dir, const char *destdir, int hold_shown)
 {
 	char files[2 * GS_PATH_MAX + 8];
 
@@ -974,25 +1116,23 @@ static void release_hold(const struct gs_config *cfg, const char *modprobe_dir, 
 		size_t dl = strlen(destdir);
 		const char *s = files, *at;
 
-		printf("nvidia is already held back at boot by ");
+		printf("nvidia is held back at boot by ");
 		while (dl && (at = strstr(s, destdir))) {
 			printf("%.*s", (int)(at - s), s);
 			s = at + dl;
 		}
 		printf("%s.\n", s);
 	} else {
-		printf("Keep nvidia from loading at boot, so nothing binds the GPUs first: create\n"
-		       "/etc/modprobe.d/nvidia-manual-load.conf containing\n"
-		       "  blacklist nvidia\n"
-		       "  install nvidia /bin/false\n"
-		       "and keep nvidia-persistenced, nvidia-vgpu-mgr and similar services disabled.\n");
+		if (!hold_shown)
+			gs_hold_notice(stdout, 1);
+		printf("Keep nvidia-persistenced, nvidia-vgpu-mgr and similar services disabled.\n");
 	}
 	printf(GS_RELEASE_STEPS_LEAD "\n");
 	gs_release_steps(stdout, "  ", cfg, 1);
 	printf("Details: docs/installation.md#boot-display-card\n");
 }
 
-void gs_install_next(const char *bindir, const struct gs_config *cfg, const char *modprobe_dir)
+void gs_install_next(const char *bindir, const struct gs_config *cfg, const char *modprobe_dir, int hold_shown)
 {
 	printf("\n%s and %s are enabled for the next boot, not started.\n", GS_UNIT_PREPARE, GS_UNIT_ACTIVATE);
 	/* With a console release granted the boot unit prepares nothing, so there is nothing to skip. */
@@ -1001,7 +1141,7 @@ void gs_install_next(const char *bindir, const struct gs_config *cfg, const char
 		       "(docs/recovery.md#turn-features-off).\n");
 	} else {
 		printf("\n");
-		release_hold(cfg, modprobe_dir, "");
+		release_hold(cfg, modprobe_dir, "", hold_shown);
 	}
 	printf("\nNext: run `%s/geforce-sriov doctor`, then power the machine off and on. A restart is not\n"
 	       "enough: the card must come up with the new module.\n", bindir);
@@ -1012,16 +1152,248 @@ void gs_install_next(const char *bindir, const struct gs_config *cfg, const char
 		printf("After the boot, run `sudo geforce-sriov setup` again; it continues from there.\n");
 }
 
-int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const char *scratch)
+#define DKMS_OTHER_MAX 8
+#define DKMS_VER_LEN 64
+
+/* Does a line of status before line name the same GS_DKMS_NAME version as v (n bytes, ended by ',' or ':')? */
+static int dkms_seen_before(const char *status, const char *line, const char *v, size_t n)
+{
+	const size_t nl = strlen(GS_DKMS_NAME);
+
+	for (const char *l = status; l && l < line; l = strchr(l, '\n')) {
+		const char *w;
+
+		l += *l == '\n';
+		if (l >= line || strncmp(l, GS_DKMS_NAME, nl) != 0)
+			continue;
+		w = l + nl;
+		if (*w == '/')
+			w++;
+		else if (w[0] == ',' && w[1] == ' ')
+			w += 2;
+		else
+			continue;
+		if (strncmp(w, v, n) == 0 && strcspn(w, ",:\n") == n)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * The versions of GS_DKMS_NAME other than GS_VERSION in status, the output of `dkms status -m`: lines
+ * "geforce-sriov/0.2.0, <kernel>, <arch>: installed", "geforce-sriov/0.2.0: added" (DKMS 3) or
+ * "geforce-sriov, 0.2.0, <kernel>, <arch>: installed" (DKMS 2), each version once, at most max. A version
+ * past max or as long as DKMS_VER_LEN is not taken: one warning names it with the command that removes it
+ * by hand. A name with a character outside ok is not echoed: one warning says to look in `dkms status`.
+ */
+static unsigned int dkms_other_versions(const char *status, char ver[][DKMS_VER_LEN], unsigned int max)
+{
+	static const char ok[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._+~-";
+	const size_t nl = strlen(GS_DKMS_NAME);
+	unsigned int n = 0;
+	int bad_named = 0;
+
+	for (const char *line = status; line; line = strchr(line, '\n')) {
+		const char *v;
+		size_t len;
+		unsigned int i = 0;
+
+		line += *line == '\n';
+		if (strncmp(line, GS_DKMS_NAME, nl) != 0)
+			continue;
+		v = line + nl;
+		if (*v == '/')
+			v++;
+		else if (v[0] == ',' && v[1] == ' ')
+			v += 2;
+		else
+			continue;
+		len = strspn(v, ok);
+		if (len == strlen(GS_VERSION) && strncmp(v, GS_VERSION, len) == 0 && (v[len] == ',' || v[len] == ':'))
+			continue;
+		while (i < n && !(strlen(ver[i]) == len && strncmp(ver[i], v, len) == 0))
+			i++;
+		if (i < n && (v[len] == ',' || v[len] == ':'))
+			continue;
+		if (len == 0 || len >= DKMS_VER_LEN || (v[len] != ',' && v[len] != ':') || n == max) {
+			/* One line per version (DKMS lists it once per kernel); a name install does not accept is not echoed. */
+			if (len == 0 || (v[len] != ',' && v[len] != ':')) {
+				if (!bad_named++)
+					fprintf(stderr, "geforce-sriov: warning: DKMS also holds a %s version whose name install does "
+						"not accept, so install does not remove it; find it with `dkms status -m %s` and remove "
+						"it with `dkms remove %s/<version> --all`\n", GS_DKMS_NAME, GS_DKMS_NAME, GS_DKMS_NAME);
+			} else if (!dkms_seen_before(status, line, v, len)) {
+				fprintf(stderr, "geforce-sriov: warning: DKMS also holds %s version %.*s, which install does not "
+					"remove; remove it yourself: dkms remove %s/%.*s --all\n", GS_DKMS_NAME, (int)len, v,
+					GS_DKMS_NAME, (int)len, v);
+			}
+			continue;
+		}
+		memcpy(ver[n], v, len);
+		ver[n++][len] = '\0';
+	}
+	return n;
+}
+
+#define OLD_TREE_DEPTH 8
+
+/*
+ * 0 when everything below the directory path (manifest path; root + path on disk) is a directory or a
+ * file m records that install still owns (manifest_owns()); otherwise -1 with in why the first other entry.
+ */
+static int old_tree_owned(struct manifest *m, const char *root, const char *path, unsigned int depth, char *why,
+			  size_t len)
+{
+	char full[GS_PATH_MAX];
+	struct dirent *de;
+	DIR *d;
+	int r = 0;
+
+	if (gs_pathf(full, sizeof(full), "%s%s", root, path) || !(d = opendir(full)))
+		return snprintf(why, len, "%s%s cannot be read", root, path), -1;
+	while (!r && (de = readdir(d))) {
+		char sub[GS_PATH_MAX], subfull[GS_PATH_MAX];
+		const struct entry *e;
+		struct stat st;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		if (gs_pathf(sub, sizeof(sub), "%s/%s", path, de->d_name) ||
+		    gs_pathf(subfull, sizeof(subfull), "%s%s", root, sub) || lstat(subfull, &st)) {
+			snprintf(why, len, "an entry of %s cannot be read", full);
+			r = -1;
+		} else if (S_ISDIR(st.st_mode)) {
+			if (depth < OLD_TREE_DEPTH) {
+				r = old_tree_owned(m, root, sub, depth + 1, why, len);
+			} else {
+				snprintf(why, len, "%s is nested too deep", subfull);
+				r = -1;
+			}
+		} else if (!(e = manifest_find(m, 'f', sub))) {
+			snprintf(why, len, "%s was not installed by geforce-sriov", subfull);
+			r = -1;
+		} else if (manifest_owns(subfull, e->sha) != OWN_YES) {
+			snprintf(why, len, "%s changed since install", subfull);
+			r = -1;
+		}
+	}
+	closedir(d);
+	return r;
+}
+
+/* Remove the directory full and everything below it, which old_tree_owned() accepted. 0 or -errno. */
+static int old_tree_remove(const char *full, unsigned int depth)
+{
+	struct dirent *de;
+	DIR *d = opendir(full);
+	int r = 0;
+
+	if (!d)
+		return -errno;
+	while (!r && (de = readdir(d))) {
+		char sub[GS_PATH_MAX];
+		struct stat st;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		if (gs_pathf(sub, sizeof(sub), "%s/%s", full, de->d_name))
+			r = -ENAMETOOLONG;
+		else if (lstat(sub, &st))
+			r = -errno;
+		else if (S_ISDIR(st.st_mode))
+			r = depth >= OLD_TREE_DEPTH ? -ELOOP : old_tree_remove(sub, depth + 1);
+		else if (unlink(sub))
+			r = -errno;
+	}
+	closedir(d);
+	if (!r && rmdir(full))
+		r = -errno;
+	return r;
+}
+
+/*
+ * After the DKMS step installed this version: the source tree /usr/src/GS_DKMS_NAME-<v> (below root) of
+ * each version v it removed from DKMS goes too, when it is a real directory (not a link) that holds only
+ * directories and files the install manifest at manifest records and install still owns, as uninstall
+ * decides (manifest_owns()). Its manifest entries that are gone are dropped. One line per removed tree;
+ * any tree that stays is a warning, never a failure.
+ */
+static void dkms_old_trees(const char *root, const char *manifest, char ver[][DKMS_VER_LEN], unsigned int n)
+{
+	struct manifest *m;
+	unsigned int kept = 0;
+	int r, dropped = 0;
+
+	if (!n)
+		return;
+	m = calloc(1, sizeof(*m));
+	if (!m || manifest_load(manifest, m)) {
+		fprintf(stderr, "geforce-sriov: warning: %s cannot be read, so the source trees of the removed versions stay in "
+			"/usr/src\n", manifest);
+		free(m);
+		return;
+	}
+	for (unsigned int i = 0; i < n; i++) {
+		char path[GS_PATH_MAX], full[GS_PATH_MAX], why[GS_PATH_MAX + 64];
+		struct stat st;
+		size_t len;
+
+		if (gs_pathf(path, sizeof(path), "/usr/src/%s-%s", GS_DKMS_NAME, ver[i]) ||
+		    gs_pathf(full, sizeof(full), "%s%s", root, path))
+			continue;
+		len = strlen(path);
+		if (lstat(full, &st) != 0) {
+			/* Already gone: only its manifest entries go. */
+		} else if (!S_ISDIR(st.st_mode)) {
+			fprintf(stderr, "geforce-sriov: warning: kept %s: it is %s, not the directory install wrote\n", full,
+				S_ISLNK(st.st_mode) ? "a symbolic link" : "not a directory");
+		} else if (old_tree_owned(m, root, path, 0, why, sizeof(why))) {
+			fprintf(stderr, "geforce-sriov: warning: kept %s: %s\n", full, why);
+		} else if ((r = old_tree_remove(full, 0))) {
+			fprintf(stderr, "geforce-sriov: warning: removing %s failed: %s; remove it yourself\n", full,
+				strerror(-r));
+		} else {
+			printf("removed %s, the source of %s/%s, which DKMS no longer holds\n", full, GS_DKMS_NAME, ver[i]);
+		}
+		/* Its entries that are gone leave the manifest, so uninstall does not look for them. */
+		for (unsigned int j = 0; j < m->n; j++) {
+			char p[GS_PATH_MAX];
+			int below = strncmp(m->e[j].path, path, len) == 0 && (m->e[j].path[len] == '/' || !m->e[j].path[len]);
+
+			if (below && !gs_pathf(p, sizeof(p), "%s%s", root, m->e[j].path) && !gs_exists(p))
+				m->e[j].type = 0, dropped = 1;
+		}
+	}
+	if (dropped) {
+		for (unsigned int j = 0; j < m->n; j++)
+			if (m->e[j].type)
+				m->e[kept++] = m->e[j];
+		m->n = kept;
+		if ((r = manifest_save(manifest, m)))
+			fprintf(stderr, "geforce-sriov: warning: writing %s failed: %s\n", manifest, strerror(-r));
+	}
+	free(m);
+}
+
+int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const char *status, const char *scratch,
+		 const char *root, const char *manifest)
 {
 	const char *const add_argv[] = { "dkms", "add", "-m", GS_DKMS_NAME, "-v", GS_VERSION, NULL };
 	const char *const build_argv[] = { "dkms", "build", "-m", GS_DKMS_NAME, "-v", GS_VERSION, NULL };
 	const char *const inst_argv[] = { "dkms", "install", "-m", GS_DKMS_NAME, "-v", GS_VERSION, NULL };
-	const char *const rm_argv[] = { "dkms", "remove", DKMS_ID, "--all", NULL };
 	const char *const disable_argv[] = { "systemctl", "disable", GS_UNIT_PREPARE, GS_UNIT_ACTIVATE, NULL };
+	char other[DKMS_OTHER_MAX][DKMS_VER_LEN];
+	/* What install removes from DKMS before it adds this version: the other versions, then this one. */
+	char ids[DKMS_OTHER_MAX + 1][DKMS_VER_LEN + sizeof(GS_DKMS_NAME) + 1];
+	unsigned int nother = dkms_other_versions(status, other, DKMS_OTHER_MAX), nids = 0;
+	char removed[1024] = "";
 	int disabled;
 
-	if (registered) {
+	for (unsigned int i = 0; i < nother; i++)
+		gs_pathf(ids[nids++], sizeof(ids[0]), "%s/%s", GS_DKMS_NAME, other[i]);
+	if (registered)
+		gs_pathf(ids[nids++], sizeof(ids[0]), "%s", DKMS_ID);
+	if (nids) {
 		char tree[GS_PATH_MAX];
 		const char *const try_add[] = { "dkms", "add", "-m", GS_DKMS_NAME, "-v", GS_VERSION, "--dkmstree", tree, NULL };
 		const char *const try_build[] = { "dkms", "build", "-m", GS_DKMS_NAME, "-v", GS_VERSION, "--dkmstree", tree, NULL };
@@ -1030,11 +1402,16 @@ int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const cha
 
 		if (gs_pathf(tree, sizeof(tree), "%s/geforce-sriov-dkms.XXXXXX", scratch) || !mkdtemp(tree)) {
 			fprintf(stderr, "geforce-sriov: cannot create a scratch DKMS tree in %s; the installed %s module is unchanged\n",
-				scratch, DKMS_ID);
+				scratch, ids[0]);
 			return GS_EXIT_FAIL;
 		}
-		printf("\n== %s is registered: a trial build in %s first; the installed module stays until it succeeds\n",
-		       DKMS_ID, tree);
+		if (!nother)
+			printf("\n== %s is registered: a trial build in %s first; the installed module stays until it succeeds\n",
+			       DKMS_ID, tree);
+		else
+			printf("\n== %s%s registered: a trial build of %s in %s first; the installed module stays until it\n"
+			       "succeeds, then install replaces it\n",
+			       ids[0], nids > 1 ? " and others are" : " is", DKMS_ID, tree);
 		fflush(stdout);
 		built = run(try_add) == 0 && run(try_build) == 0;
 		if (run(clean_argv) != 0)
@@ -1045,15 +1422,23 @@ int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const cha
 				"units are unchanged. Fix the build, then run `geforce-sriov install` again.\n", DKMS_ID);
 			return GS_EXIT_FAIL;
 		}
-		if (run(rm_argv) != 0) {
-			fprintf(stderr, "geforce-sriov: dkms remove %s --all failed (DKMS's output is above), so the module installed\n"
-				"earlier may be gone. Fix the cause, then run `geforce-sriov install` again.\n", DKMS_ID);
-			return GS_EXIT_FAIL;
+		for (unsigned int i = 0; i < nids; i++) {
+			const char *const rm_argv[] = { "dkms", "remove", ids[i], "--all", NULL };
+			size_t at = strlen(removed);
+
+			if (run(rm_argv) != 0) {
+				fprintf(stderr, "geforce-sriov: dkms remove %s --all failed (DKMS's output is above), so the module installed\n"
+					"earlier may be gone. Fix the cause, then run `geforce-sriov install` again.\n", ids[i]);
+				return GS_EXIT_FAIL;
+			}
+			gs_pathf(removed + at, sizeof(removed) - at, "%s`dkms remove %s --all`", i ? " and " : "", ids[i]);
 		}
 	}
-	if (run(add_argv) == 0 && run(build_argv) == 0 && run(inst_argv) == 0)
+	if (run(add_argv) == 0 && run(build_argv) == 0 && run(inst_argv) == 0) {
+		dkms_old_trees(root, manifest, other, nother);
 		return GS_EXIT_OK;
-	if (!registered) {
+	}
+	if (!nids) {
 		fprintf(stderr, "geforce-sriov: DKMS could not add/build/install %s for the running kernel; files are installed, `geforce-sriov uninstall` removes them\n",
 			DKMS_ID);
 		return GS_EXIT_FAIL;
@@ -1061,9 +1446,9 @@ int gs_dkms_step(int (*run)(const char *const argv[]), int registered, const cha
 	/* The module installed earlier is gone: the next boot must not try to load it. */
 	disabled = run(disable_argv) == 0;
 	fprintf(stderr, "geforce-sriov: DKMS could not add, build or install %s for the running kernel although the trial\n"
-		"build succeeded, and `dkms remove %s --all` had already removed the module installed earlier.\n"
+		"build succeeded, and %s had already removed the module installed earlier.\n"
 		"%s\nFix the cause in DKMS's output above, then run `geforce-sriov install` again%s.\n",
-		DKMS_ID, DKMS_ID,
+		DKMS_ID, removed,
 		disabled ? "So that the next boot does not try to load it, " GS_UNIT_PREPARE " and " GS_UNIT_ACTIVATE
 			   " are disabled."
 			 : "Disabling " GS_UNIT_PREPARE " and " GS_UNIT_ACTIVATE " failed: the next boot's prepare fails to load "
@@ -1080,8 +1465,10 @@ int gs_cmd_install(const struct gs_install_opts *o)
 	char src[GS_PATH_MAX], p[GS_PATH_MAX], q[GS_PATH_MAX], bindir[GS_PATH_MAX], libdir[GS_PATH_MAX];
 	char hook[GS_PATH_MAX], sharedir[GS_PATH_MAX], cfgfile[GS_PATH_MAX], manifest[GS_PATH_MAX];
 	char err[512], prog[GS_PATH_MAX], pkgdir[GS_PATH_MAX], pkgkernel[GS_PATH_MAX] = "", modprobe_dir[GS_PATH_MAX];
+	char held[2 * GS_PATH_MAX + 8] = "";
+	const char *hold = NULL; /* put_selection's held: NULL without --hold-nvidia */
 	struct gs_config cfg;
-	int config_changed = 0, cfg_exists, r;
+	int config_changed = 0, cfg_exists, dropped = 0, d3cold_dropped, r;
 	struct ctx *x;
 	DIR *d;
 	struct dirent *de;
@@ -1184,6 +1571,8 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		free(x);
 		return GS_EXIT_REFUSED;
 	}
+	/* --device without --boot-display-release drops a grant the config had: the hold install wrote goes too. */
+	dropped = cfg.nrelease && o->ndevices && !o->nrelease;
 	if (o->ndevices) {
 		for (unsigned int i = 0; i < o->ndevices; i++)
 			cfg.bdfs[i] = o->devices[i];
@@ -1200,6 +1589,12 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		cfg.identity_force_host = GS_SW_ON;
 		config_changed = 1;
 	}
+	/* --device without --disable-d3cold drops the D3cold consent too; without --device the config's stays. */
+	d3cold_dropped = cfg.d3cold_off && o->ndevices && !o->disable_d3cold;
+	if (d3cold_dropped)
+		cfg.d3cold_off = 0;
+	if (o->disable_d3cold && !cfg.d3cold_off)
+		cfg.d3cold_off = 1, config_changed = 1;
 	if (o->ov.ari != GS_SW_UNSET && o->ov.ari != cfg.ari)
 		cfg.ari = o->ov.ari, config_changed = 1;
 	if (o->ov.msix != GS_SW_UNSET && o->ov.msix != cfg.msix)
@@ -1208,6 +1603,23 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		cfg.vfs = o->vfs, config_changed = 1;
 	if (!cfg_exists)
 		config_changed = 1;
+	if (o->hold_nvidia && !cfg.nrelease) {
+		fprintf(stderr, "geforce-sriov: --hold-nvidia requires a console-release grant.\n"
+			"Only a boot display GPU can use it. Supply --boot-display-release BDF,\n"
+			"or a boot_display_release= grant in %s.\n"
+			"Try 'geforce-sriov --help'.\n", cfgfile);
+		free(x);
+		return GS_EXIT_USAGE;
+	}
+	/* The consent needs a laptop GPU in the selection; staging reads no card, so it records the flag unchecked. */
+	if (o->disable_d3cold && live) {
+		struct gs_addr laptops[GS_CFG_MAX_BDFS];
+
+		if (!gs_laptop_gpus(GS_LIVE_SYSFS, cfg.bdfs, cfg.nbdfs, laptops)) {
+			free(x);
+			return gs_d3cold_usage();
+		}
+	}
 	/* Never take over a config this tool did not write. */
 	if (cfg_exists && config_changed && !manifest_find(&x->m, 'f', GS_CONFIG_PATH)) {
 		fprintf(stderr, "geforce-sriov: %s exists and was not written by geforce-sriov; edit it yourself (see config.example) or remove it, then rerun\n",
@@ -1221,6 +1633,40 @@ int gs_cmd_install(const struct gs_install_opts *o)
 			fprintf(stderr, "geforce-sriov: %s%s: %s\n", destdir, VGPUD_DROPIN, strerror(-r));
 		free(x);
 		return GS_EXIT_REFUSED;
+	}
+	/*
+	 * --hold-nvidia: a hold already in modprobe.d is named instead, unless it is the hold file an earlier install
+	 * wrote, unchanged since (an edited copy is the user's, as uninstall treats it). A hold file that is not this
+	 * tool's refuses now, as the drop-in does.
+	 */
+	if (o->hold_nvidia) {
+		hold = "";
+		if (!gs_nvidia_hold(modprobe_dir, held, sizeof(held))) {
+			struct entry *e = manifest_find(&x->m, 'f', GS_NVIDIA_HOLD);
+
+			if (!(e && !gs_pathf(p, sizeof(p), "%s%s", destdir, GS_NVIDIA_HOLD) && strcmp(held, p) == 0 &&
+			      manifest_owns(p, e->sha) == OWN_YES))
+				hold = held;
+		}
+		if (!hold[0]) {
+			struct entry *e = manifest_find(&x->m, 'f', GS_NVIDIA_HOLD);
+
+			/* The recorded file edited so that it no longer holds nvidia back: the user's, never overwritten. */
+			if (e && !gs_pathf(p, sizeof(p), "%s%s", destdir, GS_NVIDIA_HOLD) && gs_exists(p) &&
+			    manifest_owns(p, e->sha) != OWN_YES) {
+				fprintf(stderr, "geforce-sriov: %s was changed since install and no longer holds nvidia back (the "
+					"lines `blacklist nvidia` and `install nvidia /bin/false`); fix it or remove it, then run "
+					"install again. Nothing changed.\n", p);
+				free(x);
+				return GS_EXIT_REFUSED;
+			}
+		}
+		if (!hold[0] && (r = unowned(x, GS_NVIDIA_HOLD))) {
+			if (r != -EEXIST)
+				fprintf(stderr, "geforce-sriov: %s%s: %s\n", destdir, GS_NVIDIA_HOLD, strerror(-r));
+			free(x);
+			return GS_EXIT_REFUSED;
+		}
 	}
 
 	if (o->ndevices && live) {
@@ -1271,11 +1717,17 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		printf("boot_display_release=%s: the boot unit defers and prepares none of the selected GPUs, and\n"
 		       "nvidia-vgpud is held back.\n", rel);
 		if (!o->release_note_shown)
-			printf("Console release: granted; nothing is released now. After the power cycle, the commands\n"
-			       "below or `geforce-sriov setup`, which asks again first, release the console. That stops the\n"
-			       "local display on that GPU until the following boot, and the monitor may keep the last frame\n"
-			       "or lose signal. SSH keeps working. See docs/installation.md#what-the-opt-in-changes.\n");
+			printf("Console release: granted; nothing is released now.\n"
+			       "After the power cycle, run the commands below or `geforce-sriov setup`\n"
+			       "to release the console. `geforce-sriov setup` asks again before releasing it.\n"
+			       "The monitor may go blank or freeze on the last frame. You will have no\n"
+			       "local text console until the following boot.\n"
+			       "Set up and test SSH or a serial console before you power cycle.\n"
+			       "Without that access, you cannot see the result or fix a problem.\n"
+			       "See docs/installation.md#what-the-opt-in-changes.\n");
 	}
+	if (d3cold_dropped)
+		printf("--device without --disable-d3cold: the D3cold consent (d3cold=off) is removed from the config\n");
 
 	const char *const subst[] = { "@BINDIR@", bindir, "@HOOK@", hook, "@VERSION@", GS_VERSION, NULL };
 
@@ -1346,8 +1798,10 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		TRY(put_template(x, p, UNIT_DIR "/" GS_UNIT_ACTIVATE, subst), GS_UNIT_ACTIVATE);
 		TRY(make_dirs(x, GS_STATE_DIR), GS_STATE_DIR);
 #undef TRY
-		/* Staging has no driver step: the drop-in and the config follow the copies. */
-		if (!live && (r = put_selection(x, src, subst, &cfg, config_changed, cfgfile)))
+		/* Staging has no driver step: the drop-in, the config and the hold follow the copies. */
+		if (!live && (r = put_selection(x, src, subst, &cfg, config_changed, cfgfile, hold)))
+			goto fail;
+		if (!live && dropped && (r = drop_hold(x, modprobe_dir)))
 			goto fail;
 	}
 	if ((r = manifest_save(manifest, &x->m))) {
@@ -1362,7 +1816,7 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		print_live_steps(bindir, cfg.nbdfs > 0, o);
 		if (cfg.nrelease) {
 			printf("\n");
-			release_hold(&cfg, modprobe_dir, destdir);
+			release_hold(&cfg, modprobe_dir, destdir, o->hold_note_shown);
 		}
 		return GS_EXIT_OK;
 	}
@@ -1394,10 +1848,11 @@ int gs_cmd_install(const struct gs_install_opts *o)
 			fprintf(stderr, ": NVIDIA's module and plugin are not prepared%s.\n",
 				o->driver_file ? "; what --driver-file extracted and installed stays" : "");
 			/* The log's last lines, printed by gs_driver_step, already end with the cause. */
-			fprintf(stderr, "geforce-sriov's own files are installed (uninstall removes them); %s and\n"
+			fprintf(stderr, "geforce-sriov's own files are installed (uninstall removes them); %s%s and\n"
 				"%s are not written.\n"
 				"To install geforce-sriov alone, use --driver=skip (manual path: docs/driver-patch.md)\n",
-				VGPUD_DROPIN, GS_CONFIG_PATH);
+				VGPUD_DROPIN, hold && !hold[0] ? ", " GS_CONFIG_PATH : "",
+				hold && !hold[0] ? GS_NVIDIA_HOLD : GS_CONFIG_PATH);
 			r = x->written || dr != GS_EXIT_REFUSED ? GS_EXIT_FAIL : GS_EXIT_REFUSED;
 			free(x);
 			return r;
@@ -1405,7 +1860,9 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		/* The step may have replaced NVIDIA's module and plugin: a later refusal no longer changed nothing. */
 		x->written = 1;
 	}
-	if ((r = put_selection(x, src, subst, &cfg, config_changed, cfgfile)))
+	if ((r = put_selection(x, src, subst, &cfg, config_changed, cfgfile, hold)))
+		goto fail;
+	if (dropped && (r = drop_hold(x, modprobe_dir)))
 		goto fail;
 	if ((r = manifest_save(manifest, &x->m))) {
 		fprintf(stderr, "geforce-sriov: writing %s failed: %s\n", manifest, strerror(-r));
@@ -1418,8 +1875,18 @@ int gs_cmd_install(const struct gs_install_opts *o)
 		const char *reload_argv[] = { "systemctl", "daemon-reload", NULL };
 		const char *enable_argv[] = { "systemctl", "enable", GS_UNIT_PREPARE, NULL };
 		const char *disable_argv[] = { "systemctl", "disable", GS_UNIT_PREPARE, NULL };
+		const char *const status_argv[] = { "dkms", "status", "-m", GS_DKMS_NAME, NULL };
+		char status[4096] = "";
 
-		if ((r = gs_dkms_step(gs_run, gs_exists("/var/lib/dkms/" GS_DKMS_NAME "/" GS_VERSION), "/tmp")))
+		/* Another version registered (an upgrade) is replaced, not left to build next to this one. */
+		if (gs_exists("/var/lib/dkms/" GS_DKMS_NAME) && gs_run_capture(status_argv, status, sizeof(status)) != 0) {
+			fprintf(stderr, "geforce-sriov: `dkms status -m %s` failed; another version of %s registered in DKMS,\n"
+				"if any, stays there (`dkms status` lists it, `dkms remove %s/VERSION --all` removes it)\n",
+				GS_DKMS_NAME, GS_DKMS_NAME, GS_DKMS_NAME);
+			status[0] = '\0';
+		}
+		if ((r = gs_dkms_step(gs_run, gs_exists("/var/lib/dkms/" GS_DKMS_NAME "/" GS_VERSION), status, "/tmp", "",
+				      manifest)))
 			return r;
 		if (gs_run(reload_argv) != 0) {
 			fprintf(stderr, "geforce-sriov: systemctl daemon-reload failed\n");
@@ -1436,7 +1903,7 @@ int gs_cmd_install(const struct gs_install_opts *o)
 				fprintf(stderr, "geforce-sriov: systemctl enable %s failed\n", GS_UNIT_ACTIVATE);
 				return GS_EXIT_FAIL;
 			}
-			gs_install_next(bindir, &cfg, modprobe_dir);
+			gs_install_next(bindir, &cfg, modprobe_dir, o->hold_note_shown);
 		} else {
 			const char *disable_act[] = { "systemctl", "disable", GS_UNIT_ACTIVATE, NULL };
 			int dp = gs_run(disable_argv), da = gs_run(disable_act);
@@ -1567,23 +2034,23 @@ static int unload_module(void)
 }
 
 /*
- * Uninstall's removal of one manifest file: removed only while path is still the regular file with
- * the recorded hash. gs_sha256_file never follows a link, so a link put in its place is kept even
- * when it points at identical content. 1 removed; 0 kept (saying why) or absent; -errno when the
- * unlink failed.
+ * Uninstall's removal of one manifest file: removed only while install still owns it (manifest_owns()),
+ * so a link put in its place is kept even when it points at identical content. 1 removed; 0 kept
+ * (saying why) or absent; -errno when the unlink failed.
  */
 int gs_uninstall_file(const char *path, const char *want)
 {
-	char sha[65];
-
-	if (gs_sha256_file(path, sha)) {
-		if (gs_exists(path))
-			printf("kept %s (unreadable)\n", path);
+	switch (manifest_owns(path, want)) {
+	case OWN_ABSENT:
 		return 0;
-	}
-	if (strcmp(sha, want) != 0) {
+	case OWN_UNREADABLE:
+		printf("kept %s (unreadable)\n", path);
+		return 0;
+	case OWN_CHANGED:
 		printf("kept %s (changed since install)\n", path);
 		return 0;
+	case OWN_YES:
+		break;
 	}
 	if (unlink(path) < 0) {
 		int e = errno;
@@ -1641,12 +2108,15 @@ static void other_kernels(const char *state)
 		free(names);
 }
 
-/* The hold of nvidia in modprobe_dir, which is the user's file and stays. */
-static void hold_left(const char *modprobe_dir)
+/*
+ * The hold of nvidia in modprobe_dir, which is the user's file and stays. A hold file install wrote and
+ * uninstall kept (changed since install) is still listed in m, and its "kept" line already names it.
+ */
+static void hold_left(const char *modprobe_dir, struct manifest *m)
 {
 	char files[2 * GS_PATH_MAX + 8];
 
-	if (!gs_nvidia_hold(modprobe_dir, files, sizeof(files)))
+	if (!gs_nvidia_hold(modprobe_dir, files, sizeof(files)) && !manifest_find(m, 'f', files))
 		printf("%s still holds nvidia back at boot; remove it if nothing else needs it\n", files);
 }
 
@@ -1655,9 +2125,9 @@ int gs_uninstall_files(const char *path, const char *modprobe_dir, const char *c
 	static const char suffix[] = "/geforce-sriov-driver";
 	struct manifest *m = calloc(1, sizeof(*m));
 	const char *slash = strrchr(path, '/');
-	char driver[GS_PATH_MAX] = "", why[1024] = "", dir[GS_PATH_MAX] = "";
+	char driver[GS_PATH_MAX] = "", driver_sha[65] = "", why[1024] = "", dir[GS_PATH_MAX] = "";
 	unsigned int i, kept = 0, files = 0;
-	int r, rc = GS_EXIT_OK, restored = 1;
+	int r, rc = GS_EXIT_OK, restored = 1, changed = 0;
 
 	if (!m)
 		return GS_EXIT_FAIL;
@@ -1670,19 +2140,27 @@ int gs_uninstall_files(const char *path, const char *modprobe_dir, const char *c
 	 * The driver step keeps NVIDIA's backup and its own record outside the install manifest, so ask it
 	 * to put the stock module back. It restores only while the installed module is still the one it
 	 * installed, and reports when there is nothing to do. The path comes from the manifest, because
-	 * --prefix can put it anywhere. When it fails, it stays, so the user can run it again.
+	 * --prefix can put it anywhere, and the script runs as root only while it is still the file install
+	 * wrote (manifest_owns()). When it fails or is not run, it stays, so the user can run it again.
 	 */
 	for (i = 0; i < m->n && !driver[0]; i++) {
 		size_t len = strlen(m->e[i].path);
 
 		if (m->e[i].type == 'f' && len > sizeof(suffix) - 1 &&
-		    strcmp(m->e[i].path + len - (sizeof(suffix) - 1), suffix) == 0)
+		    strcmp(m->e[i].path + len - (sizeof(suffix) - 1), suffix) == 0) {
 			gs_copy(driver, sizeof(driver), m->e[i].path);
+			gs_copy(driver_sha, sizeof(driver_sha), m->e[i].sha);
+		}
 	}
-	if (driver[0] && !gs_exists(driver))
+	if (driver[0] && !gs_exists(driver)) {
 		printf("kept NVIDIA's files: %s is already gone\n", driver);
-	else if (driver[0] && run_restore(driver, why, sizeof(why)) != 0)
+	} else if (driver[0] && manifest_owns(driver, driver_sha) != OWN_YES) {
+		snprintf(why, sizeof(why), "%s changed since install, not run", driver);
 		restored = 0;
+		changed = 1;
+	} else if (driver[0] && run_restore(driver, why, sizeof(why)) != 0) {
+		restored = 0;
+	}
 	for (i = 0; i < m->n; i++) {
 		size_t k = 0;
 
@@ -1723,24 +2201,30 @@ int gs_uninstall_files(const char *path, const char *modprobe_dir, const char *c
 		}
 		if (dir[0])
 			other_kernels(dir);
-		hold_left(modprobe_dir);
+		hold_left(modprobe_dir, m);
 		free(m);
 		return rc;
 	}
 	if ((r = manifest_save(path, m)))
 		fprintf(stderr, "geforce-sriov: writing %s failed: %s\n", path, strerror(-r));
-	free(m);
 	{
 		struct utsname u;
 		char module[GS_PATH_MAX] = "";
 		const char *release = uname(&u) == 0 ? u.release : "<kernel>";
 
 		restore_target(release, module, sizeof(module));
-		fprintf(stderr, "NVIDIA's module was not restored: %s. Fix that, then run %s --restore, or as root: cp "
-			GS_STATE_DIR "/stock/%s/nvidia.ko %s && depmod -a %s. For the plugin link and the modprobe file, "
-			"see docs/driver-patch.md#reverting.\n", why, driver, release, module, release);
+		/* A script changed since install is not to be run as root: point at the reinstall instead. */
+		if (changed)
+			fprintf(stderr, "NVIDIA's module was not restored: %s. Check that file, or put the installed copy back "
+				"with `geforce-sriov install`, then run uninstall again; or as root: cp ", why);
+		else
+			fprintf(stderr, "NVIDIA's module was not restored: %s. Fix that, then run %s --restore, or as root: cp ",
+				why, driver);
+		fprintf(stderr, GS_STATE_DIR "/stock/%s/nvidia.ko %s && depmod -a %s. For the plugin link and the modprobe "
+			"file, see docs/driver-patch.md#reverting.\n", release, module, release);
 	}
-	hold_left(modprobe_dir);
+	hold_left(modprobe_dir, m);
+	free(m);
 	return GS_EXIT_FAIL;
 }
 

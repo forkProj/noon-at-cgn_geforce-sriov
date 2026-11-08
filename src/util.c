@@ -114,15 +114,30 @@ int gs_read_uint(const char *path, unsigned int *out)
 	return 0;
 }
 
-/* In-place write of a sysfs attribute: never creates or truncates. */
+/*
+ * In-place write of a sysfs attribute: never creates or truncates, never follows a link at the last
+ * component, and writes only a regular file (sysfs attributes are). The open never blocks: a FIFO
+ * without a reader fails there (-ENXIO); anything else that opens but is not a regular file is -EINVAL.
+ */
 int gs_write_attr(const char *path, const char *value)
 {
 	size_t len = strlen(value);
+	struct stat st;
 	ssize_t n;
-	int fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+	int fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
 
 	if (fd < 0)
 		return -errno;
+	if (fstat(fd, &st) < 0) {
+		int e = -errno;
+
+		close(fd);
+		return e;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		close(fd);
+		return -EINVAL;
+	}
 	do {
 		n = write(fd, value, len);
 	} while (n < 0 && errno == EINTR);

@@ -61,6 +61,15 @@ A preparation done by hand has none of that.
 For each selected card, the steps are:
 
 1. Check that the card is free.
+   If any selected card has a laptop row and the config lacks `d3cold=off`, `prepare` refuses the entire run before deferring, waking a GPU or writing anything (exit 3).
+   The refusal includes the `install` command needed to record D3cold consent ([Consent](laptops.md#consent)).
+   `prepare` wakes the card if it has a laptop row or its `power/runtime_status` reads `suspended`.
+   A laptop card that reports active must first answer a config read.
+   It sets `power/control` to `on` on both the card and the bridge above it.
+   On laptop rows only, it also writes `0` to the card's `d3cold_allowed`.
+   It then waits up to 5 seconds for a sysfs config read to return the card's ID in D0.
+   If the card does not answer, `prepare` refuses the entire run and restores the power settings it changed on every card.
+   When a card is refused or fails after the module loaded, `prepare` also restores power settings for any cards it did not remove.
    The card is refused unless all of these hold:
    - It is function `.0`, an NVIDIA display controller listed in `geforce-sriov devices`.
    - It is not the boot display, unless a console release is granted
@@ -86,7 +95,9 @@ For each selected card, the steps are:
    Every other function in the slot is removed, then the card itself, waiting up to 5 seconds for each to disappear.
    The rescan goes through the bridge above the card and covers only the card's own bus.
    The global `/sys/bus/pci/rescan` is never used, no other device is removed, and a bus shared with another device is refused.
-   `prepare` then waits up to 10 seconds for the card to return with the same vendor and device ID and for `sriov_totalvfs` to appear, and restores the bridge's saved setting.
+   `prepare` then waits up to 10 seconds for the card to return with the same vendor and device ID and for `sriov_totalvfs` to appear.
+   It restores the bridge's saved setting except on laptop rows, where the bridge stays at `on` for the session.
+   On a laptop row, it also writes `0` to the card's `d3cold_allowed` again.
    During the rescan the kernel may log `VF BAR … can't assign` messages before it settles; only the final state counts.
    A card that does not come back follows the rule in [recovery.md](recovery.md#the-one-rule): a cold power cycle (power the machine fully off and on, not a reboot), and no second rescan.
 6. Check what the card now offers:
@@ -140,7 +151,7 @@ A card that was rescanned keeps using the revealed capability until it is remove
 | Path | What it is | License |
 |---|---|---|
 | `geforce-sriov` (`src/`) | CLI: inspection, install, preparation, VF bring-up, uninstall | MIT |
-| `kernel/geforce_sriov.c` | Livepatch module (DKMS `geforce-sriov/0.2.0`) | GPL-2.0-only OR MIT |
+| `kernel/geforce_sriov.c` | Livepatch module (DKMS `geforce-sriov/0.2.1`) | GPL-2.0-only OR MIT |
 | `hook/libgeforce_sriov.so` | `LD_PRELOAD` identity hook for `nvidia-vgpud` only | MIT |
 | `driver/geforce-sriov-patch` | Patcher for the user's own `nv-kernel.o_binary` | MIT |
 | `systemd/` | `geforce-sriov-prepare.service`, `geforce-sriov-activate.service` and an `nvidia-vgpud` drop-in | MIT |
@@ -155,6 +166,7 @@ The module:
 - Returns the hidden SR-IOV capability (config offset `0xBCC`) from `pci_find_ext_capability()`.
 - Reports TotalVFs and InitialVFs as `vfs` (1–16, default 4), never more than the card's hardware TotalVFs.
   On an Ada card that reports 1 the ceiling is 4, from the VF-count revision of the host module.
+  NVIDIA's patched driver uses at most 4 VFs per card.
   NVIDIA's driver does not use these 16-bit reads; on Ada it reads through a BAR0 mirror that no config accessor sees.
 - With `ari=1` (default), presents the hidden ARI capability (`0xC14`, only if its Next Function Number
   is non-zero) and turns on ARI Forwarding in the GPU's immediate upstream bridge when it supports it.
@@ -222,7 +234,11 @@ The step-by-step sequence is in [What prepare does](#what-prepare-does).
 
 ## Install details
 
-A live install copies the binaries to `--prefix` (default `/usr/local`), the hook to `$PREFIX/lib/geforce-sriov/` and the module source to `/usr/src/geforce-sriov-0.2.0/`, then runs `dkms add/build/install` and installs the boot units.
+A live install copies the binaries to `--prefix` (default `/usr/local`), the hook to `$PREFIX/lib/geforce-sriov/` and the module source to `/usr/src/geforce-sriov-0.2.1/`, then runs `dkms add/build/install` and installs the boot units.
+If DKMS has other `geforce-sriov` versions, `install` builds this version as a trial before removing them from DKMS.
+After installing this version, it removes each old source tree under `/usr/src` only if it installed every file in that tree.
+After a successful cleanup, only this version remains registered.
+For each version it leaves in place, `install` prints one warning with instructions for removing it by hand.
 Every file is recorded with its SHA-256 in `/var/lib/geforce-sriov/installed-files`, and a rerun leaves identical files alone (`unchanged <path>`).
 
 - It refuses a `vfs` above a selected card's ceiling ([Configuration file](configuration.md#configuration-file)).
@@ -257,10 +273,12 @@ Unless `--driver=skip` is given, a live install then runs the driver step
   `geforce-sriov-driver --dry-run` prints the planned commands, including the `.text` comparison, and builds nothing.
 
 Only after the driver step succeeds (or with `--driver=skip`) does `install` write the `nvidia-vgpud`
-drop-in and `/etc/geforce-sriov/config` (`bdfs=`, `identity=on`, `identity_force_host=on`, and `vfs=N`
-with `--vfs N`), and enable the units for the next boot without starting them.
+drop-in and `/etc/geforce-sriov/config` (`bdfs=`, `identity=on`, `identity_force_host=on`, `vfs=N`
+with `--vfs N`, and `d3cold=off` with `--disable-d3cold`), and enable the units for the next boot without starting them.
+With `--hold-nvidia`, it also writes `/etc/modprobe.d/nvidia-manual-load.conf`.
+`install --device` without `--disable-d3cold` removes `d3cold=off` from the config and prints one line confirming the removal.
 
-`--driver-file PATH`, `--accept-nvidia-license` and `--nvidia-source DIR` are described in
+`--driver-file PATH`, `--accept-nvidia-license`, `--nvidia-source DIR`, `--hold-nvidia` and `--disable-d3cold` are described in
 [One command from a clean host](installation.md#one-command-from-a-clean-host).
 
 To stage into a directory instead, with nothing changed outside it:
@@ -291,7 +309,11 @@ The domain has 4–8 lowercase hex digits (more than 4 only without leading zero
 - a host driver version other than 580.159.01, which is not supported.
 
 For a `--device` the config does not select, `doctor` shows what the hook will do with the settings `install --device` writes.
-With `--nvidia-source DIR`, `--driver-file PATH` or `--boot-display-release BDF`, it assesses the host as `install` will leave it.
+With `--nvidia-source DIR`, `--driver-file PATH`, `--boot-display-release BDF`, `--hold-nvidia` or `--disable-d3cold`, it assesses the host as `install` will leave it.
+`--hold-nvidia` requires a console release already granted in the config or planned with `--boot-display-release`; otherwise, `doctor` exits 2.
+With this option, a missing hold file is reported as information rather than a warning, because `install` writes it.
+`--disable-d3cold` requires at least one laptop GPU among those assessed; otherwise, `doctor` exits 2.
+A laptop GPU without D3cold consent fails because `prepare` would refuse it; recorded consent or consent planned with `--disable-d3cold` is reported as information.
 `--config FILE` points `doctor` and `status` at another config file.
 Host checks (tools, guard, boot unit, module autoload) are skipped with `--sysfs-root`.
 Without a config file, the config line says the selected devices come from `--device` when one is given, and otherwise that defaults apply and no device is selected.
@@ -398,11 +420,12 @@ Its message starts `type <N> is not in nvidia/creatable_vgpu_types` and ends `Th
   or a PF did not come back to `nvidia`, and the guard stays set.
 
 `check` is the read-only gate before every VM start: no root, no lock.
+On a laptop GPU, its read of the PF and VF config space resumes a suspended device.
 It prints one `OK` or `NOT READY` line per VF.
 It is a point-in-time read: it does not read the plugin and does not stop a later re-probe or daemon restart.
 
-- Exit 0: every VF of every selected card is on `nvidia` with `power/control=on`,
-  `runtime_status=active` and the expected type, chosen as `activate` chooses it.
+- Exit 0: every VF of every selected card is on `nvidia` with `power/control=on`, `runtime_status=active` and the expected type, chosen as `activate` chooses it.
+  Each VF of a laptop GPU must also answer a config read at offset `0x08`.
 - Exit 1: anything else, or `/run/geforce-sriov/activating` or the guard exists.
 - Exit 3: an invalid or empty config, no selected card, a `--device` that is not selected, a card in
   scope that is missing or not in the device table, or `--type` on a mixed selection.
@@ -489,14 +512,16 @@ A remove and rescan can move those BARs, so every command refuses this GPU unles
 > may keep the last frame or lose signal. Logs continue in the journal and over SSH. See
 > docs/installation.md#what-the-opt-in-changes.
 
-A grant releases nothing by itself. `install --boot-display-release` records it and says so:
-
-> Console release: granted; nothing is released now. After the power cycle, the commands
-> above or `geforce-sriov setup`, which asks again first, release the console. That stops the
-> local display on that GPU until the following boot, and the monitor may keep the last frame
-> or lose signal. SSH keeps working. See docs/installation.md#what-the-opt-in-changes.
+A grant releases nothing by itself.
+`install --boot-display-release` records it and prints a note.
+The note explains that the manual commands or `setup` release the console after the power cycle, and that `setup` asks again first.
+It warns that the monitor may then go blank or freeze until the following boot, and asks you to set up and test SSH or a serial console before the power cycle.
 
 In a first install run by `setup`, its question `Allow releasing the console of <BDF> after the next boot? [y/N]` explains the grant instead, and `setup` passes `--release-note-shown` to `install`, which then leaves its note out.
+`setup` then asks whether `install` should create the hold file.
+Unless the user accepts or a file in `/etc/modprobe.d/` already holds `nvidia` back, it passes `--hold-note-shown` and displays the hold notice itself after installation.
+If a laptop GPU is selected, `setup` then shows the D3cold notice and asks for consent.
+Answering yes passes `--disable-d3cold` to `doctor` and `install`; declining stops `setup` before any step (exit 3).
 
 Grant it together with the other GPUs to prepare.
 `--boot-display-release` must name a GPU also given with `--device`, and the config then holds `boot_display_release=`:
@@ -514,7 +539,10 @@ The commands enforce these rules:
   It records the deferral in `/run/geforce-sriov/deferred` and exits 0.
   While that file exists, the `nvidia-vgpud` drop-in (`AssertPathExists=!/run/geforce-sriov/deferred`) makes `nvidia-vgpud` and units requiring it, such as `nvidia-vgpu-mgr`, fail to start.
   `status` exits 1 and prints `deferred` with the commands to run.
-- The package never changes module blacklists, services or the kernel command line.
+- The package keeps `nvidia` from loading at boot only with your permission.
+  Accepting the hold prompt in `setup`, or passing `install --hold-nvidia`, creates `/etc/modprobe.d/nvidia-manual-load.conf`.
+  Otherwise, you must prevent `nvidia` from loading at boot yourself.
+  The package does not change NVIDIA's services or the kernel command line.
   You keep `nvidia` from loading before `prepare` (for example `blacklist nvidia` and `install nvidia /bin/false` in a modprobe.d file, then `modprobe --ignore-install nvidia` afterwards), and keep `nvidia-persistenced`, `nvidia-vgpu-mgr` and similar services from starting.
   If something binds a selected GPU first, `prepare` refuses that card.
 - Reach the host over SSH or a serial console, and be able to cold power cycle it.
@@ -554,7 +582,9 @@ flowchart TD
 ```
 
 `activate` accepts the boot display GPU only with this boot's release record and the grant still in the config.
-To return to automatic preparation, run `install --device` with the other GPUs only, and remove the hold `/etc/modprobe.d/nvidia-manual-load.conf` ([Returning to automatic preparation](installation.md#returning-to-automatic-preparation)).
+To return to automatic preparation, run `install --device` with only the other GPUs selected.
+If `/etc/modprobe.d/nvidia-manual-load.conf` was created by `setup` or `install --hold-nvidia` and is unchanged, installation removes it.
+Any other hold is left in place and reported so you can remove it manually ([Returning to automatic preparation](installation.md#returning-to-automatic-preparation)).
 The next boot is then an ordinary one, and the console stays on the boot display.
 
 ## The identity hook

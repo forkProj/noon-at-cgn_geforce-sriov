@@ -7,7 +7,7 @@
  * unchanged in the kernel and in user space.
  *
  * Every entry is one exact, reviewed PCI device ID. There are no ranges: an ID
- * that is not listed (a laptop die, Turing, Blackwell, an unreleased part)
+ * that is not listed (Turing, Blackwell, an unreleased part, or any other ID)
  * gets nothing from any component.
  *
  * What an entry claims, and what it does not
@@ -18,8 +18,9 @@
  *   The kernel module re-reads and validates every header on the running card
  *   before it uses a position, and does nothing when the header does not match.
  * - An entry names a device ID the components act on; it does not certify
- *   every board with that ID. Every listed card is supported; the evidence is
- *   in docs/ampere.md and docs/ada.md (Status and testing).
+ *   every board with that ID. Every listed card is supported, the laptop rows
+ *   included (see the note above gs_devices[]); the evidence is in
+ *   docs/ampere.md and docs/ada.md (Status and testing).
  * - An Ada card whose hardware TotalVFs is 1 is presented with
  *   GS_DEFAULT_VFS VFs (gs_vf_ceiling()).
  * - The vGPU target presented to nvidia-vgpud depends on the generation only
@@ -36,12 +37,14 @@
  * totalvfs          hardware TotalVFs in the public dumps of this ID (the
  *                   card's own default; the module reads the real register)
  * generation        enum gs_generation; it decides the vGPU target
+ * laptop            1 on a laptop row (GS_AMPERE_LAPTOP_ENTRY, GS_ADA_LAPTOP_ENTRY):
+ *                   the CLI adds its laptop power guards (runtime D3cold) for it
  * die, name         display strings
  */
 #ifndef GS_DEVICES_H
 #define GS_DEVICES_H
 
-#define GS_VERSION		"0.2.0"
+#define GS_VERSION		"0.2.1"
 #define GS_VENDOR_NVIDIA	0x10deu
 
 /*
@@ -105,6 +108,7 @@ struct gs_device {
 	unsigned short msix_hide_pos;
 	unsigned short totalvfs;
 	unsigned char generation;
+	unsigned char laptop;
 	const char *die;
 	const char *name;
 };
@@ -119,20 +123,25 @@ struct gs_device {
  * reach distinct VFs, and functions >= 8 alias the PF and its audio function,
  * so gs_vf_geometry_check() refuses VFs there.
  */
-#define GS_AMPERE_ENTRY(dev, dname, pname) \
-	{ (dev), 0xbccu, 0xc14u, 0xc8u, 0x41cu, 16u, GS_AMPERE, (dname), (pname) }
+#define GS_AMPERE_ROW(dev, dname, pname, lap) \
+	{ (dev), 0xbccu, 0xc14u, 0xc8u, 0x41cu, 16u, GS_AMPERE, (lap), (dname), (pname) }
+#define GS_AMPERE_ENTRY(dev, dname, pname) GS_AMPERE_ROW(dev, dname, pname, 0)
+#define GS_AMPERE_LAPTOP_ENTRY(dev, dname, pname) GS_AMPERE_ROW(dev, dname, pname, 1)
 
 /*
  * Ada (AD10x): the same hidden SR-IOV (0xBCC) and ARI (0xC14) headers as
  * Ampere in every Ada dump checked. TotalVFs = InitialVFs = 1 on the GeForce
- * and the AD104 workstation cards, 16 on the AD107 RTX 2000 Ada (tvfs).
+ * cards, the AD104 workstation cards and the RTX 2000 Ada Laptop (28b8), 16
+ * on the AD107 RTX 2000 / 2000E Ada desktop card (28b0) (tvfs).
  * MSI-X is at 0xC8 and hidden by the same bit as on Ampere (0x41C bit 29; the
  * public config-space dumps record it set on every Ada GeForce row), so the
  * entry takes the same path as GS_AMPERE_ENTRY. NVIDIA's driver reads the ID
  * and TotalVFs of these chips through a BAR0 mirror, not config reads.
  */
-#define GS_ADA_ENTRY(dev, dname, pname, tvfs) \
-	{ (dev), 0xbccu, 0xc14u, 0xc8u, 0x41cu, (tvfs), GS_ADA, (dname), (pname) }
+#define GS_ADA_ROW(dev, dname, pname, tvfs, lap) \
+	{ (dev), 0xbccu, 0xc14u, 0xc8u, 0x41cu, (tvfs), GS_ADA, (lap), (dname), (pname) }
+#define GS_ADA_ENTRY(dev, dname, pname, tvfs) GS_ADA_ROW(dev, dname, pname, tvfs, 0)
+#define GS_ADA_LAPTOP_ENTRY(dev, dname, pname, tvfs) GS_ADA_ROW(dev, dname, pname, tvfs, 1)
 
 /*
  * The vGPU target of each generation: a <pgpu> devId of the stock
@@ -154,6 +163,17 @@ static const struct gs_target gs_targets[] = {
 
 #define GS_GENERATION_COUNT (sizeof(gs_targets) / sizeof(gs_targets[0]))
 
+/*
+ * Laptop rows (GS_*_LAPTOP_ENTRY, also named in each die's comment). They
+ * rest on public raw 4 KiB config-space dumps of at least two machines per
+ * ID, and of one machine only for 249d, 24dd, 24e0, 2523, 25a0 and 25ba.
+ * Every dump has the hidden SR-IOV, ARI and MSI-X capabilities at the same
+ * offsets as the desktop rows of its generation, with TotalVFs 16 on Ampere
+ * and 1 on Ada. They take the desktop path; the laptop flag only adds the
+ * CLI's power guards, because a laptop GPU can be powered off (D3cold). No
+ * laptop has been run in our lab. Laptop IDs without a dump are in their own
+ * block at the end of the table.
+ */
 static const struct gs_device gs_devices[] = {
 	/* GA102 */
 	GS_AMPERE_ENTRY(0x2203, "GA102", "GeForce RTX 3090 Ti"),
@@ -163,54 +183,121 @@ static const struct gs_device gs_devices[] = {
 	GS_AMPERE_ENTRY(0x220a, "GA102", "GeForce RTX 3080 12GB"),
 	GS_AMPERE_ENTRY(0x2216, "GA102", "GeForce RTX 3080 LHR"),
 
-	/* GA104 */
+	/* GA104. Laptop: 249c, 249d, 24a0, 24b6, 24dc, 24dd, 24e0. */
 	GS_AMPERE_ENTRY(0x2482, "GA104", "GeForce RTX 3070 Ti"),
 	GS_AMPERE_ENTRY(0x2484, "GA104", "GeForce RTX 3070"),
 	GS_AMPERE_ENTRY(0x2486, "GA104", "GeForce RTX 3060 Ti"),
 	GS_AMPERE_ENTRY(0x2487, "GA104", "GeForce RTX 3060"),
 	GS_AMPERE_ENTRY(0x2488, "GA104", "GeForce RTX 3070 LHR"),
 	GS_AMPERE_ENTRY(0x2489, "GA104", "GeForce RTX 3060 Ti LHR"),
+	GS_AMPERE_LAPTOP_ENTRY(0x249c, "GA104", "GeForce RTX 3080 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x249d, "GA104", "GeForce RTX 3070 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24a0, "GA104", "GeForce RTX 3070 Ti Laptop GPU"),
 	GS_AMPERE_ENTRY(0x24b0, "GA104", "RTX A4000"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24b6, "GA104", "RTX A5000 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24dc, "GA104", "GeForce RTX 3080 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24dd, "GA104", "GeForce RTX 3070 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24e0, "GA104", "GeForce RTX 3070 Ti Laptop GPU"),
 
-	/* GA106 */
+	/* GA106. Laptop: 2520, 2523, 2560. */
 	GS_AMPERE_ENTRY(0x2503, "GA106", "GeForce RTX 3060"),
 	GS_AMPERE_ENTRY(0x2504, "GA106", "GeForce RTX 3060 LHR"),
 	GS_AMPERE_ENTRY(0x2507, "GA106", "GeForce RTX 3050"),
+	GS_AMPERE_LAPTOP_ENTRY(0x2520, "GA106", "GeForce RTX 3060 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x2523, "GA106", "GeForce RTX 3050 Ti Laptop GPU"),
 	GS_AMPERE_ENTRY(0x2544, "GA106", "GeForce RTX 3060"),
+	GS_AMPERE_LAPTOP_ENTRY(0x2560, "GA106", "GeForce RTX 3060 Laptop GPU"),
 	GS_AMPERE_ENTRY(0x2571, "GA106", "RTX A2000 12GB"),
 
 	/*
-	 * GA107. No desktop GA107 GeForce dump was available; the hidden block
-	 * is shown on GA107 laptop parts (25a0, 25a2) and the GA107 RTX
-	 * A1000/A400. The die of 2582/2584 is from pci.ids.
+	 * GA107. Laptop: 25a0, 25a2, 25b9, 25ba, 25ec. No desktop GA107
+	 * GeForce dump was available; the hidden block is shown on GA107
+	 * laptop parts (25a0, 25a2) and the GA107 RTX A1000/A400. The die of
+	 * 2582/2584 is from pci.ids.
 	 */
 	GS_AMPERE_ENTRY(0x2582, "GA107", "GeForce RTX 3050 8GB"),
 	GS_AMPERE_ENTRY(0x2584, "GA107", "GeForce RTX 3050 6GB"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a0, "GA107", "GeForce RTX 3050 Ti Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a2, "GA107", "GeForce RTX 3050 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25b9, "GA107", "RTX A1000 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ba, "GA107", "RTX A2000 8GB Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ec, "GA107", "GeForce RTX 3050 6GB Laptop GPU"),
 
 	/* AD102 */
 	GS_ADA_ENTRY(0x2684, "AD102", "GeForce RTX 4090", 1u),
 	GS_ADA_ENTRY(0x2685, "AD102", "GeForce RTX 4090 D", 1u),
 	GS_ADA_ENTRY(0x2689, "AD102", "GeForce RTX 4070 Ti SUPER", 1u),
 
-	/* AD103 */
+	/* AD103. Laptop: 2717, 2757. */
 	GS_ADA_ENTRY(0x2702, "AD103", "GeForce RTX 4080 SUPER", 1u),
 	GS_ADA_ENTRY(0x2704, "AD103", "GeForce RTX 4080", 1u),
 	GS_ADA_ENTRY(0x2705, "AD103", "GeForce RTX 4070 Ti SUPER", 1u),
 	GS_ADA_ENTRY(0x2709, "AD103", "GeForce RTX 4070", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2717, "AD103", "GeForce RTX 4090 Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2757, "AD103", "GeForce RTX 4090 Laptop GPU", 1u),
 
-	/* AD104 */
+	/* AD104. Laptop: 27e0. */
 	GS_ADA_ENTRY(0x2782, "AD104", "GeForce RTX 4070 Ti", 1u),
 	GS_ADA_ENTRY(0x2783, "AD104", "GeForce RTX 4070 SUPER", 1u),
 	GS_ADA_ENTRY(0x2786, "AD104", "GeForce RTX 4070", 1u),
 	GS_ADA_ENTRY(0x2788, "AD104", "GeForce RTX 4060 Ti", 1u),
 	GS_ADA_ENTRY(0x27b1, "AD104", "RTX 4500 Ada Generation", 1u),
 	GS_ADA_ENTRY(0x27b2, "AD104", "RTX 4000 Ada Generation", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x27e0, "AD104", "GeForce RTX 4080 Laptop GPU", 1u),
 
-	/* AD106, AD107 */
+	/* AD106, AD107. Laptop: 2820, 2860, 28a0, 28a1, 28b8, 28e0, 28e1. */
 	GS_ADA_ENTRY(0x2803, "AD106", "GeForce RTX 4060 Ti", 1u),
 	GS_ADA_ENTRY(0x2805, "AD106", "GeForce RTX 4060 Ti 16GB", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2820, "AD106", "GeForce RTX 4070 Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2860, "AD106", "GeForce RTX 4070 Laptop GPU", 1u),
 	GS_ADA_ENTRY(0x2882, "AD107", "GeForce RTX 4060", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28a0, "AD107", "GeForce RTX 4060 Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28a1, "AD107", "GeForce RTX 4050 Laptop GPU", 1u),
 	GS_ADA_ENTRY(0x28b0, "AD107", "RTX 2000 / 2000E Ada Generation", 16u),
+	GS_ADA_LAPTOP_ENTRY(0x28b8, "AD107", "RTX 2000 Ada Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28e0, "AD107", "GeForce RTX 4060 Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28e1, "AD107", "GeForce RTX 4050 Laptop GPU", 1u),
+	/*
+	 * Laptop and embedded IDs with no config-space dump. No dump exists for these
+	 * IDs; they are listed because the laptop parts of a generation share the
+	 * layout of the dumped ones (the block above). Die and name are from
+	 * pci.ids. The kernel module still validates every header on the card.
+	 */
+	GS_AMPERE_LAPTOP_ENTRY(0x24b7, "GA104", "RTX A4000 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24b8, "GA104", "RTX A3000 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24b9, "GA104", "RTX A3000 12GB Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24ba, "GA104", "RTX A4500 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x24bb, "GA104", "RTX A3000 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x2563, "GA106", "GeForce RTX 3050 Ti Mobile / Max-Q"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a5, "GA107", "GeForce RTX 3050 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a6, "GA107", "GeForce MX570"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a7, "GA107", "GeForce MX570"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25a9, "GA107", "GeForce RTX 2050"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ab, "GA107", "GeForce RTX 3050 4GB Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ac, "GA107", "GeForce RTX 3050 6GB Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ad, "GA107", "GeForce RTX 2050"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25b8, "GA107", "RTX A2000 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25bb, "GA107", "RTX A500 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25bc, "GA107", "RTX A1000 6GB Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25bd, "GA107", "RTX A500 Laptop GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25e0, "GA107", "GeForce RTX 3050 Ti Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25e2, "GA107", "GeForce RTX 3050 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25e5, "GA107", "GeForce RTX 3050 Mobile"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25ed, "GA107", "GeForce RTX 2050"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25f9, "GA107", "RTX A1000 Embedded GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25fa, "GA107", "RTX A2000 Embedded GPU"),
+	GS_AMPERE_LAPTOP_ENTRY(0x25fb, "GA107", "RTX A500 Embedded GPU"),
+	GS_ADA_LAPTOP_ENTRY(0x2730, "AD103", "RTX 5000 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2770, "AD103", "RTX 5000 Ada Generation Embedded GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x27a0, "AD104", "GeForce RTX 4080 Max-Q / Mobile", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x27ba, "AD104", "RTX 4000 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x27bb, "AD104", "RTX 3500 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x27fb, "AD104", "RTX 3500 Ada Generation Embedded GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x2838, "AD106", "RTX 3000 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28b9, "AD107", "RTX 1000 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28ba, "AD107", "RTX 500 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28bb, "AD107", "RTX 500 Ada Generation Laptop GPU", 1u),
+	GS_ADA_LAPTOP_ENTRY(0x28e3, "AD107", "GeForce RTX 3050 A Laptop GPU", 1u),
 };
 
 #define GS_DEVICE_COUNT (sizeof(gs_devices) / sizeof(gs_devices[0]))

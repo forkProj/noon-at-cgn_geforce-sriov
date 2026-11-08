@@ -97,6 +97,8 @@ sudo ./geforce-sriov setup    # second run, after it
 - Acceptance of NVIDIA's licence.
 - The GPUs to use, when more than one qualifies.
 - Permission to release the console, if you select the boot display GPU.
+- Permission to create `/etc/modprobe.d/nvidia-manual-load.conf` to prevent `nvidia` from loading at boot when using the boot display GPU.
+- Consent to keep a laptop GPU powered when idle (D3cold off), if you select one ([Laptop support](docs/laptops.md#consent)).
 
 If a prerequisite is missing, `setup` stops and names the required action.
 For example, if `nouveau` is loaded, it tells you to blacklist it and cold power-cycle the host first.
@@ -186,14 +188,14 @@ flowchart TD
 ```
 
 - Standard path: follow the [installation guide](docs/installation.md#install).
-- Boot-display path: grant the console release at install time, then run `setup` after each boot,
-  which asks once and runs `prepare`, `modprobe`, `activate` and `check`
-  ([Boot display card](docs/installation.md#boot-display-card)).
+- Boot-display path: grant console release during installation and let `setup` or `install --hold-nvidia` create the file that prevents `nvidia` from loading at boot.
+  Then run `setup` manually after each boot ([Boot display card](docs/installation.md#boot-display-card)).
 - An integrated GPU or a second card for the console avoids the boot-display path entirely.
+- On a laptop, [Display](docs/laptops.md#display) says which display setups take the boot-display path.
 
 ## Supported cards and driver versions
 
-Ampere and Ada are supported, and so is every card in the device table.
+Ampere and Ada are supported, and so is every card in the device table, laptop GPUs included ([Laptop support](docs/laptops.md)).
 See [Supported cards](docs/devices.md#generations) for the full list and [Ampere](docs/ampere.md) and [Ada](docs/ada.md) for generation-specific details.
 
 ## Documentation
@@ -203,13 +205,14 @@ See [Supported cards](docs/devices.md#generations) for the full list and [Ampere
 | [Installation](docs/installation.md) | Everything from before you start to uninstall: doctor, install, the cold boot, creating a VM, and what doctor checks |
 | [Supported cards](docs/devices.md) | The supported device table |
 | [Ampere](docs/ampere.md), [Ada](docs/ada.md) | Generation-specific behavior, host stacks, guest drivers and limits |
+| [Laptop support](docs/laptops.md) | Laptop GPUs: the listed IDs, display wiring, D3cold power, MSI-X, ARI and VF counts |
 | [What install does to NVIDIA's files](docs/driver-patch.md) | The patches `install` makes to your copies of NVIDIA's files, with their digests, the manual path with `--driver=skip`, and what to do after an update |
 | [Configuration and commands](docs/configuration.md) | Config file keys, commands and exit codes, systemd units, module parameters |
 | [Boot display card](docs/installation.md#boot-display-card) | Sharing the card that shows the boot screen |
 | [Symptoms](docs/recovery.md#symptoms), [Recovery](docs/recovery.md) | Fixes for common problems, the one rule, the guard, and what not to do |
-| [Glossary](docs/glossary.md), [Technical reference](docs/technical-reference.md), [What prepare does](docs/technical-reference.md#what-prepare-does) | Terms, how each part works, and what the CLI does under the hood |
+| [Glossary](docs/glossary.md), [Technical reference](docs/technical-reference.md), [What prepare does](docs/technical-reference.md#what-prepare-does), [Identity hook](hook/README.md) | Terms, how each part works, how the hook works, and what the CLI does under the hood |
 | [Compatibility reports](docs/compatibility.md) | What to collect, what to remove, and what happens to a report |
-| [Identity hook](hook/README.md), [Changelog](CHANGELOG.md) | How the hook works, and the release notes |
+| [Changelog](CHANGELOG.md) | The release notes |
 
 ## Related projects
 
