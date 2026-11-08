@@ -1124,17 +1124,17 @@ static void test_dkms_step(void)
 	free(out);
 	free(log);
 
-	/* The full `dkms status` text of a host that has 0.2.0 installed (captured on a DKMS 3.4.3 host): only 0.2.0. */
-	rc = run_dkms_step(0, "arctic-fan-controller/1.0, 7.0.14-16-pve, x86_64: installed\n"
-			      "geforce-sriov/0.2.0, 7.0.14-16-pve, x86_64: installed\n"
-			      "gpu-unlock/1.0.0, 7.0.14-11-pve, x86_64: installed\n"
-			      "gpu-unlock/1.0.0, 7.0.14-16-pve, x86_64: installed\n"
-			      "nv-sriov-cap/1.0, 7.0.14-16-pve, x86_64: installed\n"
-			      "nvidia/580.159.01, 7.0.14-16-pve, x86_64: installed (Differences between built and installed modules)\n",
+	/* A multi-module `dkms status` text in DKMS 3 format, with unrelated modules, of a host that has 0.2.0 installed: only 0.2.0. */
+	rc = run_dkms_step(0, "module-a/1.0, 6.8.12-4-pve, x86_64: installed\n"
+			      "geforce-sriov/0.2.0, 6.8.12-4-pve, x86_64: installed\n"
+			      "module-b/2.0.0, 6.8.12-2-pve, x86_64: installed\n"
+			      "module-b/2.0.0, 6.8.12-4-pve, x86_64: installed\n"
+			      "module-c/1.0, 6.8.12-4-pve, x86_64: installed\n"
+			      "nvidia/580.159.01, 6.8.12-4-pve, x86_64: installed (Differences between built and installed modules)\n",
 		      &out, &log);
 	snprintf(want, sizeof(want), "%sdkms remove " GS_DKMS_NAME "/0.2.0 --all\n%s", trial, real);
 	CHECK(rc == 0 && log && strcmp(log, want) == 0,
-	      "real dkms status text: only the old geforce-sriov version is removed: %d\n%s\n%s", rc, out, log ? log : "");
+	      "multi-module dkms status text: only the old geforce-sriov version is removed: %d\n%s\n%s", rc, out, log ? log : "");
 	free(out);
 	free(log);
 
